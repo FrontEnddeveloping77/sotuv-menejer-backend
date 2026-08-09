@@ -20,9 +20,12 @@ app.use(cors({
 
 app.use(express.json());
 
-// PostgreSQL Baza Sozlamalari
+// DATABASE_URL dagi sslmode ziddiyatini tozalab, SSL ni o'chirish
+const rawDbUrl = process.env.DATABASE_URL || 'postgresql://postgres:a2012a@localhost:5432/mybot_db';
+const cleanDbUrl = rawDbUrl.replace(/\?sslmode=.*/, '');
+
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:a2012a@localhost:5432/mybot_db',
+    connectionString: cleanDbUrl,
     ssl: {
         rejectUnauthorized: false
     }
