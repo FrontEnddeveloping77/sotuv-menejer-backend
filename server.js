@@ -12,13 +12,10 @@ const JWT_SECRET = process.env.JWT_SECRET || 'super_maxfiy_kalit_123!';
 app.use(cors());
 app.use(express.json());
 
-// 1. PostgreSQL Baza Sozlamalari
+// 1. PostgreSQL Baza Sozlamalari (Render va Supabase uchun moslashtirildi)
 const pool = new Pool({
-    user: 'postgres',
-    host: 'localhost',
-    database: 'mybot_db',          // pgAdmin'dagi baza nomingiz
-    password: 'a2012a',            // PostgreSQL parolingiz
-    port: 5432,
+    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:a2012a@localhost:5432/mybot_db',
+    ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
 // App-ga pool ob'ektini ulash
@@ -53,10 +50,8 @@ const authenticateToken = (req, res, next) => {
 
 // ------------------- API MARSHRUTLARI ------------------- //
 
-// 2. LOGIN API (Frontend so'rovi uchun moslashtirildi)
-// Ikkala yo'ldan ham kirish imkoniyati qo'shildi: /api/login va /api/auth/login
+// 2. LOGIN API
 const handleLogin = async (req, res) => {
-    // Frontend 'username' yoki 'login' kaliti bilan yuborishi mumkin
     const loginInput = req.body.username || req.body.login;
     const passwordInput = req.body.password;
 
@@ -152,9 +147,8 @@ app.get('/api/me', authenticateToken, async (req, res) => {
     }
 });
 
-// 4. DASHBOARD API (Do'kon, tovarlar va sotuvlar analitikasi)
-// Faylingiz papkasiga qarab dashboard.js yoki dashboardRoutes.js tanlanadi:
-const dashboardRouter = require('./routes/dashboardRoutes'); // Yoki './routes/dashboard'
+// 4. DASHBOARD API
+const dashboardRouter = require('./routes/dashboardRoutes');
 app.use('/api/dashboard', authenticateToken, dashboardRouter);
 
 // Serverni ishga tushirish
