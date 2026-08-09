@@ -1,3 +1,33 @@
+// 1. Eng tepasiga qo'shing (SSL sertifikat tekshiruvini majburiy o'chirish)
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'super_maxfiy_kalit_123!';
+
+// Express Middleware va CORS
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+app.use(express.json());
+
+// PostgreSQL Baza Sozlamalari
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:a2012a@localhost:5432/mybot_db',
+    ssl: {
+        rejectUnauthorized: false
+    }
+});
+
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
