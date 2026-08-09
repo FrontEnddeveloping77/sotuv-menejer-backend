@@ -17,10 +17,12 @@ app.use(cors({
 
 app.use(express.json());
 
-// 1. PostgreSQL Baza Sozlamalari
+// 1. PostgreSQL Baza Sozlamalari (SSL xatosini tuzatish)
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL || 'postgresql://postgres:a2012a@localhost:5432/mybot_db',
-    ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+    ssl: {
+        rejectUnauthorized: false
+    }
 });
 
 // Baza ulanish xatosidan server o'chib qolmasligi uchun catch handler
@@ -132,9 +134,9 @@ const handleLogin = async (req, res) => {
 
     } catch (err) {
         console.error('Server xatosi (Login):', err);
-        return res.status(500).json({ 
+        return res.status(500).json({
             message: 'Serverda xatolik yuz berdi',
-            error: err.message 
+            error: err.message
         });
     }
 };
