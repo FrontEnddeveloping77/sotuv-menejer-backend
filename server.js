@@ -96,7 +96,18 @@ const handleLogin = async (req, res) => {
             return res.status(400).json({ message: 'Foydalanuvchida parol o‘rnatilmagan!' });
         }
 
-        const isPasswordValid = await bcrypt.compare(passwordInput, user.site_password_hash);
+        // Parolni tekshirish: Ham Bcrypt hash, ham Oddiy tekst uchun xavfsiz solishtirish
+        let isPasswordValid = false;
+        try {
+            if (user.site_password_hash.startsWith('$2b$') || user.site_password_hash.startsWith('$2a$')) {
+                isPasswordValid = await bcrypt.compare(passwordInput, user.site_password_hash);
+            } else {
+                isPasswordValid = (passwordInput === user.site_password_hash);
+            }
+        } catch (bcryptErr) {
+            console.error("Bcrypt solishtirish xatosi:", bcryptErr);
+            isPasswordValid = (passwordInput === user.site_password_hash);
+        }
 
         if (!isPasswordValid) {
             return res.status(400).json({ message: 'Login yoki parol noto‘g‘ri!' });
@@ -120,8 +131,11 @@ const handleLogin = async (req, res) => {
         });
 
     } catch (err) {
-        console.error('Server xatosi:', err);
-        return res.status(500).json({ message: 'Serverda xatolik yuz berdi' });
+        console.error('Server xatosi (Login):', err);
+        return res.status(500).json({ 
+            message: 'Serverda xatolik yuz berdi',
+            error: err.message 
+        });
     }
 };
 
