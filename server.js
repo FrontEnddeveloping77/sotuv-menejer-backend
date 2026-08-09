@@ -8,26 +8,33 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'super_maxfiy_kalit_123!';
 
-// Express Middleware
-app.use(cors());
+// Express Middleware va CORS ni to'liq ochiq qilish
+app.use(cors({
+    origin: '*', // Barcha domenlardan keladigan so'rovlarga ruxsat berish
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
 
-// 1. PostgreSQL Baza Sozlamalari (Render va Supabase uchun moslashtirildi)
+// 1. PostgreSQL Baza Sozlamalari
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL || 'postgresql://postgres:a2012a@localhost:5432/mybot_db',
     ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// App-ga pool ob'ektini ulash
+// Baza ulanish xatosidan server o'chib qolmasligi uchun catch handler
+pool.on('error', (err) => {
+    console.error('Kutilmagan PostgreSQL xatosi:', err);
+});
+
 app.set('pool', pool);
 
-// Bazaga ulanishni tekshirish
-pool.connect((err, client, release) => {
-    if (err) {
-        return console.error('PostgreSQL bazasiga ulanishda xatolik:', err.stack);
-    }
-    console.log('PostgreSQL bazasiga muvaffaqiyatli ulandi!');
-    release();
+// ------------------- API MARSHRUTLARI ------------------- //
+
+// Health check endpoint (Render va brauzer tekshiruvi uchun)
+app.get('/', (req, res) => {
+    res.send('Backend server muvaffaqiyatli ishlamoqda!');
 });
 
 // JWT Tokenni tekshirish uchun Middleware
@@ -48,8 +55,6 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-// ------------------- API MARSHRUTLARI ------------------- //
-
 // 2. LOGIN API
 const handleLogin = async (req, res) => {
     const loginInput = req.body.username || req.body.login;
@@ -65,19 +70,16 @@ const handleLogin = async (req, res) => {
             [loginInput]
         );
 
-        // 1-Tekshiruv: Foydalanuvchi mavjudligi
         if (userResult.rows.length === 0) {
             return res.status(400).json({ message: 'Login yoki parol noto‘g‘ri!' });
         }
 
         const user = userResult.rows[0];
 
-        // 2-Tekshiruv: Obuna faolligi (is_paid)
         if (!user.is_paid) {
             return res.status(403).json({ message: 'Obunangiz faol emas!' });
         }
 
-        // 3-Tekshiruv: Obuna muddati (expires_at)
         if (user.expires_at) {
             const currentDate = new Date();
             const expirationDate = new Date(user.expires_at);
@@ -90,7 +92,6 @@ const handleLogin = async (req, res) => {
             }
         }
 
-        // 4-Tekshiruv: Parol va bcryptjs solishtiruvi
         if (!user.site_password_hash) {
             return res.status(400).json({ message: 'Foydalanuvchida parol o‘rnatilmagan!' });
         }
@@ -101,7 +102,6 @@ const handleLogin = async (req, res) => {
             return res.status(400).json({ message: 'Login yoki parol noto‘g‘ri!' });
         }
 
-        // Muvaffaqiyatli avtorizatsiya — JWT Token taqdim etamiz
         const token = jwt.sign(
             { userId: user.id, telegramId: user.telegram_id, login: user.site_login },
             JWT_SECRET,
@@ -128,7 +128,7 @@ const handleLogin = async (req, res) => {
 app.post('/api/login', handleLogin);
 app.post('/api/auth/login', handleLogin);
 
-// 3. ME API (Profil ma'lumotlarini olish)
+// 3. ME API
 app.get('/api/me', authenticateToken, async (req, res) => {
     try {
         const userResult = await pool.query(
@@ -151,7 +151,6 @@ app.get('/api/me', authenticateToken, async (req, res) => {
 const dashboardRouter = require('./routes/dashboardRoutes');
 app.use('/api/dashboard', authenticateToken, dashboardRouter);
 
-// Serverni ishga tushirish
 app.listen(PORT, () => {
     console.log(`Backend Server ${PORT}-portda ishga tushdi`);
 });
