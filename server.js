@@ -1,4 +1,5 @@
 // 1. Eng tepasiga qo'shing (SSL sertifikat tekshiruvini majburiy o'chirish)
+// 1. SSL sertifikat tekshiruvini global o'chirish (Har doim eng tepada tursin)
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 const express = require('express');
@@ -20,9 +21,9 @@ app.use(cors({
 
 app.use(express.json());
 
-// DATABASE_URL dagi sslmode ziddiyatini tozalab, SSL ni o'chirish
+// DATABASE_URL dagi sslmode ziddiyatini tozalash va SSL sozlasi
 const rawDbUrl = process.env.DATABASE_URL || 'postgresql://postgres:a2012a@localhost:5432/mybot_db';
-const cleanDbUrl = rawDbUrl.replace(/\?sslmode=.*/, '');
+const cleanDbUrl = rawDbUrl.split('?')[0];
 
 const pool = new Pool({
     connectionString: cleanDbUrl,
@@ -30,6 +31,13 @@ const pool = new Pool({
         rejectUnauthorized: false
     }
 });
+
+// Baza ulanish xatosidan server o'chib qolmasligi uchun handler
+pool.on('error', (err) => {
+    console.error('Kutilmagan PostgreSQL xatosi:', err);
+});
+
+app.set('pool', pool);
 
 const express = require('express');
 const cors = require('cors');
