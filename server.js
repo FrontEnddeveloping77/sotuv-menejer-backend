@@ -1,10 +1,9 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const path = require('path'); // Static fayllar yo'lini aniqlash uchun
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
-const jwt = require('jwt-simple'); // yoki require('jsonwebtoken')
+const jwt = require('jwt-simple');
 
 const app = express();
 
@@ -28,6 +27,10 @@ const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_123';
 // ----------------------------------------------------
 // 1. HEALTH CHECK ENDPOINT
 // ----------------------------------------------------
+app.get('/', (req, res) => {
+    res.send('Backend Server muvaffaqiyatli ishlayapti!');
+});
+
 app.get('/api/health', (req, res) => {
     res.send('Backend Server muvaffaqiyatli ishlayapti!');
 });
@@ -161,14 +164,11 @@ app.get('/api/me', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 5. FRONTEND STATIC SERVE VA SPA FALLBACK (PAGE RELOAD FIX)
+// 5. SAFE ROUTE FALLBACK (Render Crash Fix)
 // ----------------------------------------------------
-// React loyihasidagi 'dist' papkasini ulaymiz
-app.use(express.static(path.join(__dirname, '../frontend/dist')));
-
-// Barcha boshqa so'rovlarni (masalan: /dashboard, /login) React index.html ga yo'naltiramiz
-app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../frontend/dist', 'index.html'));
+// Noto'g'ri so'rovlar kelganda server o'chib qolmasligi uchun xavfsiz 404 handler:
+app.use((req, res) => {
+    res.status(404).json({ message: "Bunday yo'nalish topilmadi" });
 });
 
 // ----------------------------------------------------
