@@ -173,3 +173,56 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
     console.log(`Backend Server ${PORT}-portda ishga tushdi`);
 });
+
+// ----------------------------------------------------
+// TOVAR QO'SHISH (POST /api/products)
+// ----------------------------------------------------
+app.post('/api/products', authenticateToken, async (req, res) => {
+    const { category, name, cost_price, color, size, quantity } = req.body;
+
+    if (!name || cost_price === undefined) {
+        return res.status(400).json({ message: "Tovar nomi va kelgan narxi kiritilishi shart!" });
+    }
+
+    try {
+        const newProduct = await pool.query(
+            `INSERT INTO public.products (user_id, category, name, cost_price, color, size, quantity)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING *`,
+            [
+                req.user.userId,
+                category || null,
+                name.trim(),
+                Number(cost_price),
+                color || null,
+                size || null,
+                Number(quantity) || 0
+            ]
+        );
+
+        return res.status(201).json({
+            message: "Tovar muvaffaqiyatli qo'shildi",
+            product: newProduct.rows[0]
+        });
+    } catch (err) {
+        console.error('Tovar qo\'shishda xatolik:', err);
+        return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
+    }
+});
+
+// ----------------------------------------------------
+// TOVARLAR RO'YXATINI OLISH (GET /api/products)
+// ----------------------------------------------------
+app.get('/api/products', authenticateToken, async (req, res) => {
+    try {
+        const products = await pool.query(
+            `SELECT * FROM public.products WHERE user_id = $1 ORDER BY id DESC`,
+            [req.user.userId]
+        );
+
+        return res.json({ products: products.rows });
+    } catch (err) {
+        console.error('Tovarlarni olishda xatolik:', err);
+        return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
+    }
+});
