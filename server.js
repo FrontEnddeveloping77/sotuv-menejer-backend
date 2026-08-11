@@ -403,20 +403,6 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
             [userId, product.id, product.name, qty, costPrice, price, profit]
         );
 
-        // Agar omborda qoldiq 0 yoki undan kam bo'lsa — tovarni butunlay o'chiramiz
-        if (newQuantity <= 0) {
-            await client.query(
-                `DELETE FROM public.products WHERE id = $1`,
-                [product.id]
-            );
-        } else {
-            // Aks holda qoldiqni yangilaymiz
-            await client.query(
-                `UPDATE public.products SET quantity = $1 WHERE id = $2`,
-                [newQuantity, product.id]
-            );
-        }
-
         // Ombordagi qoldiqni kamaytiramiz
         await client.query(
             `UPDATE public.products SET quantity = $1 WHERE id = $2`,
