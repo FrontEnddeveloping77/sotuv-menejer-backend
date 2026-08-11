@@ -1,4 +1,4 @@
-// 1. SSL sertifikat tekshiruvini global o'chirish (Har doim eng tepada tursin)
+// 1. SSL sertifikat tekshiruvini Node.js darajasida o'chirish (Eng tepada tursin)
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 const express = require('express');
@@ -20,14 +20,15 @@ app.use(cors({
 
 app.use(express.json());
 
-// 2. PostgreSQL Baza Sozlamalari (DATABASE_URL parametrlarini tozalash va SSL sozlamasi)
+// 2. PostgreSQL Baza Sozlamalari (Self-signed sertifikat xatosini bartaraf etish)
 const rawDbUrl = process.env.DATABASE_URL || 'postgresql://postgres:a2012a@localhost:5432/mybot_db';
 const cleanDbUrl = rawDbUrl.split('?')[0];
 
 const pool = new Pool({
     connectionString: cleanDbUrl,
     ssl: {
-        rejectUnauthorized: false
+        rejectUnauthorized: false,
+        checkServerIdentity: () => undefined
     }
 });
 
@@ -104,7 +105,7 @@ const handleLogin = async (req, res) => {
             return res.status(400).json({ message: 'Foydalanuvchida parol o‘rnatilmagan!' });
         }
 
-        // Parolni tekshirish (Bcrypt va Oddiy matn uchun xavfsiz solishtirish)
+        // Parolni tekshirish (Bcrypt va Oddiy matn uchun xavfsiz)
         let isPasswordValid = false;
         try {
             if (user.site_password_hash.startsWith('$2b$') || user.site_password_hash.startsWith('$2a$')) {
@@ -147,7 +148,7 @@ const handleLogin = async (req, res) => {
     }
 };
 
-// Har xil variantlardagi login so'rovlarini qabul qilish
+// Route'lar
 app.post('/login', handleLogin);
 app.post('/api/login', handleLogin);
 app.post('/api/auth/login', handleLogin);
