@@ -2,7 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
-const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const jwt = require('jwt-simple');
 
 const app = express();
 
@@ -10,32 +11,32 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// PostgreSQL (Supabase) DB Connection
+// SSL sertifikat tekshiruvini sozlash (Render + Supabase uchun)
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+// PostgreSQL (Supabase) ulanishi
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    ssl: {
+        rejectUnauthorized: false
+    }
 });
 
-// JWT Token tekshirish middleware
-const authenticateToken = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-
-    if (!token) {
-        return res.status(401).json({ message: "Token taqdim etilmadi!" });
-    }
-
-    jwt.verify(token, process.env.JWT_SECRET || 'secret_key', (err, user) => {
-        if (err) {
-            return res.status(403).json({ message: "Token yaroqsiz yoki muddati o'tgan!" });
-        }
-        req.user = user;
-        next();
-    });
-};
+const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_123';
 
 // ----------------------------------------------------
-// 1. LOGIN ENDPOINT (POST /api/login)
+// 1. HEALTH CHECK ENDPOINTS
+// ----------------------------------------------------
+app.get('/', (req, res) => {
+    res.send('Backend Server muvaffaqiyatli ishlayapti!');
+});
+
+app.get('/api/health', (req, res) => {
+    res.send('Backend Server muvaffaqiyatli ishlayapti!');
+});
+
+// ----------------------------------------------------
+// 2. LOGIN ENDPOINT (Bcrypt + PlainText xatosiz)
 // ----------------------------------------------------
 app.post('/api/login', async (req, res) => {
     const { login, password } = req.body;
@@ -56,30 +57,54 @@ app.post('/api/login', async (req, res) => {
 
         const user = userResult.rows[0];
 
-        if (password !== user.site_password_hash && password !== user.site_password) {
+        if (!user.is_paid) {
+            return res.status(403).json({
+                message: "Obunangiz faol emas! Iltimos, Telegram bot orqali obunani yangilang."
+            });
+        }
+
+        const cleanPassword = password.trim();
+        let isPasswordValid = false;
+
+        const dbPassword = user.site_password_hash || user.site_password || user.password;
+
+        if (dbPassword) {
+            if (dbPassword.startsWith('$2a$') || dbPassword.startsWith('$2b$')) {
+                try {
+                    isPasswordValid = await bcrypt.compare(cleanPassword, dbPassword);
+                } catch (e) {
+                    isPasswordValid = false;
+                }
+            } else {
+                if (cleanPassword === dbPassword.trim()) {
+                    isPasswordValid = true;
+                }
+            }
+        }
+
+        if (!isPasswordValid) {
             return res.status(400).json({ message: "Login yoki parol noto‘g‘ri!" });
         }
 
-        if (!user.is_paid) {
-            return res.status(403).json({ message: "Hisobingiz faollashtirilmagan yoki obuna muddati tugagan!" });
-        }
+        const payload = {
+            userId: user.id,
+            telegramId: user.telegram_id,
+            login: user.site_login,
+            exp: Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60)
+        };
 
-        const token = jwt.sign(
-            { userId: user.id, site_login: user.site_login },
-            process.env.JWT_SECRET || 'secret_key',
-            { expiresIn: '24h' }
-        );
+        const token = jwt.encode(payload, JWT_SECRET);
 
         return res.json({
-            message: "Tizimga muvaffaqiyatli kirildi!",
+            message: "Tizimga muvaffaqiyatli kirildi",
             token,
             user: {
                 id: user.id,
-                full_name: user.full_name,
-                username: user.username,
-                site_login: user.site_login
+                telegram_id: user.telegram_id,
+                login: user.site_login
             }
         });
+
     } catch (err) {
         console.error('Login xatosi:', err);
         return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
@@ -87,7 +112,27 @@ app.post('/api/login', async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 2. USER PROFILE ENDPOINT (GET /api/me)
+// 3. AUTH MIDDLEWARE
+// ----------------------------------------------------
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+        return res.status(401).json({ message: "Avtorizatsiyadan o'tilmagan!" });
+    }
+
+    try {
+        const decoded = jwt.decode(token, JWT_SECRET);
+        req.user = decoded;
+        next();
+    } catch (err) {
+        return res.status(403).json({ message: "Yaroqsiz yoki muddati o'tgan token!" });
+    }
+};
+
+// ----------------------------------------------------
+// 4. USER PROFILE / ME ENDPOINT
 // ----------------------------------------------------
 app.get('/api/me', authenticateToken, async (req, res) => {
     try {
@@ -104,13 +149,13 @@ app.get('/api/me', authenticateToken, async (req, res) => {
 
         return res.json({ user: userResult.rows[0] });
     } catch (err) {
-        console.error('User profile xatosi (/api/me):', err);
+        console.error('Server xatosi (/api/me):', err);
         return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
     }
 });
 
 // ----------------------------------------------------
-// 3. STATISTIKA ENDPOINTI (GET /api/stats)
+// 5. STATISTIKA ENDPOINTI (GET /api/stats)
 // ----------------------------------------------------
 app.get('/api/stats', authenticateToken, async (req, res) => {
     try {
@@ -135,7 +180,7 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 4. TOVAR QO'SHISH ENDPOINTI (POST /api/products)
+// 6. TOVAR QO'SHISH (POST /api/products)
 // ----------------------------------------------------
 app.post('/api/products', authenticateToken, async (req, res) => {
     const { category, name, cost_price, color, size, quantity } = req.body;
@@ -171,7 +216,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 5. TOVARLAR RO'YXATINI OLISH (GET /api/products)
+// 7. TOVARLAR RO'YXATINI OLISH (GET /api/products)
 // ----------------------------------------------------
 app.get('/api/products', authenticateToken, async (req, res) => {
     try {
@@ -188,7 +233,7 @@ app.get('/api/products', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 6. SAFE ROUTE FALLBACK (404 Error handler)
+// 8. SAFE ROUTE FALLBACK (Faqat barcha API lardan keyin!)
 // ----------------------------------------------------
 app.use((req, res) => {
     res.status(404).json({ message: "Bunday yo'nalish topilmadi" });
