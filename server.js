@@ -155,9 +155,9 @@ app.get('/api/me', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 5. STATISTIKA ENDPOINTI (GET /api/stats)
+// 5. STATISTIKA ENDPOINTI (GET /api/dashboard/stats)
 // ----------------------------------------------------
-app.get('/api/stats', authenticateToken, async (req, res) => {
+app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     try {
         const stats = await pool.query(
             `SELECT 
