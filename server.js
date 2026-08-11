@@ -74,7 +74,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // ----------------------------------------------------
-// 2. LOGIN ENDPOINT (Bcrypt + PlainText xatosiz)
+// 2. LOGIN ENDPOINT (Obuna va muddat tekshiruvi bilan)
 // ----------------------------------------------------
 app.post('/api/login', async (req, res) => {
     const { login, password } = req.body;
@@ -95,9 +95,17 @@ app.post('/api/login', async (req, res) => {
 
         const user = userResult.rows[0];
 
+        // 1. is_paid false bo'lsa
         if (!user.is_paid) {
             return res.status(403).json({
-                message: "Obunangiz faol emas! Iltimos, Telegram bot orqali obunani yangilang."
+                message: "To'lov qilganingizdan so'ng saytdan foydalana olasiz. Obunangiz faol emas!"
+            });
+        }
+
+        // 2. expires_at (muddati) tugagan bo'lsa
+        if (user.expires_at && new Date(user.expires_at) < new Date()) {
+            return res.status(403).json({
+                message: "To'lov muddati tugagan! Iltimos, obunani yangilang, shundan so'ng saytdan foydalana olasiz."
             });
         }
 
@@ -150,9 +158,9 @@ app.post('/api/login', async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 3. AUTH MIDDLEWARE
+// 3. AUTH MIDDLEWARE (Token + Har bir so'rovda obuna va muddatni tekshirish)
 // ----------------------------------------------------
-const authenticateToken = (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
 
@@ -162,6 +170,26 @@ const authenticateToken = (req, res, next) => {
 
     try {
         const decoded = jwt.decode(token, JWT_SECRET);
+
+        // Bazadan foydalanuvchining oxirgi holatini tekshiramiz (muddat o'tib ketgan bo'lishi mumkin)
+        const userCheck = await pool.query(
+            `SELECT is_paid, expires_at FROM public.users WHERE id = $1`,
+            [decoded.userId]
+        );
+
+        if (userCheck.rows.length === 0) {
+            return res.status(403).json({ message: "Foydalanuvchi topilmadi!" });
+        }
+
+        const currentUser = userCheck.rows[0];
+
+        // Agar to'lov qilinmagan yoki muddati o'tib ketgan bo'lsa, saytdan foydalanishni to'xtatamiz
+        if (!currentUser.is_paid || (currentUser.expires_at && new Date(currentUser.expires_at) < new Date())) {
+            return res.status(403).json({
+                message: "To'lov muddati tugagan! To'lov qilganingizdan so'nggina saytdan foydalana olasiz."
+            });
+        }
+
         req.user = decoded;
         next();
     } catch (err) {
@@ -199,7 +227,6 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId;
 
-        // Do'kon nomi (users jadvalidan)
         let storeName = '';
         try {
             const userRow = await pool.query(
@@ -213,7 +240,6 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
             storeName = '';
         }
 
-        // Ombordagi tovarlar
         const productStats = await pool.query(
             `SELECT 
                 COUNT(*) as "totalProducts",
@@ -223,7 +249,6 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
             [userId]
         );
 
-        // Yordamchi funksiya: berilgan davr uchun sotuv va rasxod statistikasini olish
         const getPeriodStats = async (salesDateFilter, expenseDateFilter) => {
             const salesResult = await pool.query(
                 `SELECT 
@@ -396,14 +421,12 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
         const profit = (price - costPrice) * qty;
         const newQuantity = Number(product.quantity) - qty;
 
-        // Sotuvni yozib qo'yamiz
         await client.query(
             `INSERT INTO public.sales (user_id, product_id, title, quantity, cost_price, selling_price, profit)
              VALUES ($1, $2, $3, $4, $5, $6, $7)`,
             [userId, product.id, product.name, qty, costPrice, price, profit]
         );
 
-        // Ombordagi qoldiqni kamaytiramiz
         await client.query(
             `UPDATE public.products SET quantity = $1 WHERE id = $2`,
             [newQuantity, product.id]
@@ -520,7 +543,7 @@ app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 11. SAFE ROUTE FALLBACK (Faqat barcha API lardan keyin!)
+// 11. SAFE ROUTE FALLBACK
 // ----------------------------------------------------
 app.use((req, res) => {
     res.status(404).json({ message: "Bunday yo'nalish topilmadi" });
