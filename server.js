@@ -43,9 +43,8 @@ app.post('/api/login', async (req, res) => {
     }
 
     try {
-        // Bazadan foydalanuvchini site_login bo'yicha qidiramiz
         const userResult = await pool.query(
-            `SELECT id, telegram_id, site_login, site_password_hash, is_paid, expires_at 
+            `SELECT id, telegram_id, site_login, site_password_hash, site_password_encrypted, is_paid 
              FROM public.users 
              WHERE site_login = $1`,
             [login.trim()]
@@ -57,30 +56,47 @@ app.post('/api/login', async (req, res) => {
 
         const user = userResult.rows[0];
 
-        // 1. Obuna holatini tekshirish
         if (!user.is_paid) {
             return res.status(403).json({
                 message: "Obunangiz faol emas! Iltimos, Telegram bot orqali obunani yangilang."
             });
         }
 
-        // 2. Parolni tekshirish (site_password_hash / bcrypt)
-        if (!user.site_password_hash) {
-            return res.status(400).json({ message: "Login yoki parol noto‘g‘ri!" });
+        const cleanPassword = password.trim();
+        let isPasswordValid = false;
+
+        // 1. Avval bcrypt orqali tekshirib ko'ramiz
+        if (user.site_password_hash) {
+            try {
+                isPasswordValid = await bcrypt.compare(cleanPassword, user.site_password_hash);
+            } catch (err) {
+                isPasswordValid = false;
+            }
         }
 
-        const isPasswordValid = await bcrypt.compare(password, user.site_password_hash);
+        // 2. Agar bcrypt o'xshamasa, ochiq matn (plain text/encrypted) bo'yicha tekshiramiz
+        if (!isPasswordValid && user.site_password_encrypted) {
+            if (cleanPassword === user.site_password_encrypted.trim()) {
+                isPasswordValid = true;
+            }
+        }
+
+        if (!isPasswordValid && user.site_password_hash) {
+            if (cleanPassword === user.site_password_hash.trim()) {
+                isPasswordValid = true;
+            }
+        }
 
         if (!isPasswordValid) {
             return res.status(400).json({ message: "Login yoki parol noto‘g‘ri!" });
         }
 
-        // 3. Autentifikatsiya tokeni yaratish (JWT)
+        // Token yaratish
         const payload = {
             userId: user.id,
             telegramId: user.telegram_id,
             login: user.site_login,
-            exp: Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60) // 7 kun
+            exp: Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60)
         };
 
         const token = jwt.encode(payload, JWT_SECRET);
@@ -96,7 +112,7 @@ app.post('/api/login', async (req, res) => {
         });
 
     } catch (err) {
-        console.error('Server xatosi (Login):', err);
+        console.error('Login xatosi:', err);
         return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
     }
 });
