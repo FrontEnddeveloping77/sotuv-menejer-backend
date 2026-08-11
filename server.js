@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const path = require('path'); // Static fayllar yo'lini aniqlash uchun
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jwt-simple'); // yoki require('jsonwebtoken')
@@ -27,7 +28,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_123';
 // ----------------------------------------------------
 // 1. HEALTH CHECK ENDPOINT
 // ----------------------------------------------------
-app.get('/', (req, res) => {
+app.get('/api/health', (req, res) => {
     res.send('Backend Server muvaffaqiyatli ishlayapti!');
 });
 
@@ -58,8 +59,8 @@ app.post('/api/login', async (req, res) => {
 
         // 1. Obuna holatini tekshirish
         if (!user.is_paid) {
-            return res.status(403).json({ 
-                message: "Obunangiz faol emas! Iltimos, Telegram bot orqali obunani yangilang." 
+            return res.status(403).json({
+                message: "Obunangiz faol emas! Iltimos, Telegram bot orqali obunani yangilang."
             });
         }
 
@@ -144,9 +145,20 @@ app.get('/api/me', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// SERVERNI ISHGA TUSHRISH
+// 5. FRONTEND STATIC SERVE VA SPA FALLBACK (PAGE RELOAD FIX)
+// ----------------------------------------------------
+// React loyihasidagi 'dist' papkasini ulaymiz
+app.use(express.static(path.join(__dirname, '../frontend/dist')));
+
+// Barcha boshqa so'rovlarni (masalan: /dashboard, /login) React index.html ga yo'naltiramiz
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, '../frontend/dist', 'index.html'));
+});
+
+// ----------------------------------------------------
+// SERVERNI ISHGA TUSHIRISH
 // ----------------------------------------------------
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
     console.log(`Backend Server ${PORT}-portda ishga tushdi`);
-});F
+});
