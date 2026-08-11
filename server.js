@@ -36,44 +36,29 @@ app.get('/api/health', (req, res) => {
 });
 
 // ----------------------------------------------------
-// 2. LOGIN ENDPOINT (Saytga kirish)
+// 2. LOGIN ENDPOINT (Xatosiz variant)
 // ----------------------------------------------------
 app.post('/api/login', async (req, res) => {
     const { login, password } = req.body;
-
-    console.log("================ LOGIN LOG ================");
-    console.log("1. Kirishga urinish - Login:", login, "| Parol:", password);
 
     if (!login || !password) {
         return res.status(400).json({ message: "Login va parol kiritilishi shart!" });
     }
 
     try {
+        // SELECT * orqali barcha mavjud ustunlarni olamiz (yo'q ustun bo'yicha xato bermaydi)
         const userResult = await pool.query(
-            `SELECT id, telegram_id, site_login, site_password_hash, site_password_encrypted, is_paid 
-             FROM public.users 
-             WHERE site_login = $1`,
+            `SELECT * FROM public.users WHERE site_login = $1`,
             [login.trim()]
         );
 
-        console.log("2. Baza natijasi (Topilgan userlar soni):", userResult.rows.length);
-
         if (userResult.rows.length === 0) {
-            console.log("❌ MUAMMO: Kiritilgan login bazada umuman topilmadi!");
             return res.status(400).json({ message: "Login yoki parol noto‘g‘ri!" });
         }
 
         const user = userResult.rows[0];
-        console.log("3. Bazadagi User ma'lumotlari:", {
-            id: user.id,
-            site_login: user.site_login,
-            is_paid: user.is_paid,
-            site_password_hash: user.site_password_hash,
-            site_password_encrypted: user.site_password_encrypted
-        });
 
         if (!user.is_paid) {
-            console.log("❌ MUAMMO: User obunasi faol emas (is_paid = false)");
             return res.status(403).json({
                 message: "Obunangiz faol emas! Iltimos, Telegram bot orqali obunani yangilang."
             });
@@ -82,38 +67,28 @@ app.post('/api/login', async (req, res) => {
         const cleanPassword = password.trim();
         let isPasswordValid = false;
 
-        // 1. Bcrypt tekshiruvi
-        if (user.site_password_hash) {
-            try {
-                isPasswordValid = await bcrypt.compare(cleanPassword, user.site_password_hash);
-                console.log("4. Bcrypt tekshiruv natijasi:", isPasswordValid);
-            } catch (err) {
-                console.log("Bcrypt xatosi:", err.message);
-                isPasswordValid = false;
-            }
-        }
+        // Bazada qaysi parol ustuni mavjud bo'lsa, o'shani avtomatik aniqlaymiz
+        const dbPassword = user.site_password_hash || user.site_password || user.password;
 
-        // 2. Ochiq/Shifrlangan parol bo'yicha tekshirish
-        if (!isPasswordValid && user.site_password_encrypted) {
-            if (cleanPassword === user.site_password_encrypted.trim()) {
-                isPasswordValid = true;
-                console.log("4. Encrypted parol to'g'ri keldi!");
-            }
-        }
-
-        if (!isPasswordValid && user.site_password_hash) {
-            if (cleanPassword === user.site_password_hash.trim()) {
-                isPasswordValid = true;
-                console.log("4. Plain hash parol to'g'ri keldi!");
+        if (dbPassword) {
+            // 1. Bcrypt hash bo'lsa
+            if (dbPassword.startsWith('$2a$') || dbPassword.startsWith('$2b$')) {
+                try {
+                    isPasswordValid = await bcrypt.compare(cleanPassword, dbPassword);
+                } catch (e) {
+                    isPasswordValid = false;
+                }
+            } else {
+                // 2. Oddiy matn (plain text) bo'lsa
+                if (cleanPassword === dbPassword.trim()) {
+                    isPasswordValid = true;
+                }
             }
         }
 
         if (!isPasswordValid) {
-            console.log("❌ MUAMMO: Parollar mos kelmadi! Kiritildi:", cleanPassword);
             return res.status(400).json({ message: "Login yoki parol noto‘g‘ri!" });
         }
-
-        console.log("✅ MUVAFFAQIYAT: Login va parol to'g'ri!");
 
         // Token yaratish
         const payload = {
@@ -187,7 +162,6 @@ app.get('/api/me', authenticateToken, async (req, res) => {
 // ----------------------------------------------------
 // 5. SAFE ROUTE FALLBACK (Render Crash Fix)
 // ----------------------------------------------------
-// Noto'g'ri so'rovlar kelganda server o'chib qolmasligi uchun xavfsiz 404 handler:
 app.use((req, res) => {
     res.status(404).json({ message: "Bunday yo'nalish topilmadi" });
 });
