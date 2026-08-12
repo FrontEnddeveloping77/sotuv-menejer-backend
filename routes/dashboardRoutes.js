@@ -140,7 +140,7 @@ router.get('/products', checkAuthAndSubscription, async (req, res) => {
     }
 });
 
-// 3. TOVAR QO'SHISH
+// 3. TOVAR QO'SHISH (Razmersiz / Rang bilan - Avtomatik ID va Birlashtirish)
 router.post('/products', checkAuthAndSubscription, async (req, res) => {
     try {
         const pool = req.app.get('pool');
@@ -148,42 +148,77 @@ router.post('/products', checkAuthAndSubscription, async (req, res) => {
 
         if (!userId) return res.status(401).json({ message: 'Foydalanuvchi aniqlanmadi!' });
 
-        const { title, category, cost_price, color, size, quantity, description } = req.body;
+        const { title, name, category, cost_price, color, quantity, description } = req.body;
 
-        if (!title || cost_price === undefined || cost_price === null || cost_price === '') {
+        const productTitle = (title || name || '').trim();
+        if (!productTitle || cost_price === undefined || cost_price === null || cost_price === '') {
             return res.status(400).json({ message: 'Tovar nomi va kelgan narxi kiritilishi shart!' });
         }
 
         const parsedCostPrice = parseFloat(cost_price) || 0;
+        const prodCategory = (category || 'Umumiy').trim();
+        const prodColor = color ? String(color).trim() : null; // Rang kiritilgan bo'lsa saqlaydi
+        const qtyToAdd = parseInt(quantity) || 1;
 
-        const insertQuery = `
-      INSERT INTO products (user_id, title, category, cost_price, price, color, size, quantity, description)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      RETURNING *;
-    `;
+        // Razmersiz: Faqat Nomi, Kategoriyasi, Rangi va Tannarxi bo'yicha bazani tekshiramiz
+        const existingProductRes = await pool.query(
+            `SELECT id, quantity FROM products 
+             WHERE user_id = $1 
+               AND LOWER(title) = LOWER($2) 
+               AND LOWER(category) = LOWER($3) 
+               AND COALESCE(LOWER(color), '') = COALESCE(LOWER($4), '') 
+               AND cost_price = $5`,
+            [userId, productTitle, prodCategory, prodColor, parsedCostPrice]
+        );
 
-        const values = [
-            userId,
-            title,
-            category || 'Umumiy',
-            parsedCostPrice,
-            parsedCostPrice,
-            color ? String(color) : null,
-            size ? String(size) : null,
-            parseInt(quantity) || 1,
-            description || '',
-        ];
+        if (existingProductRes.rows.length > 0) {
+            // Bir xil nom va rangdagi tovar bo'lsa, mavjud ID'dagi tovar sonini oshiramiz
+            const existingId = existingProductRes.rows[0].id;
+            const updatedProduct = await pool.query(
+                `UPDATE products 
+                 SET quantity = quantity + $1 
+                 WHERE id = $2 AND user_id = $3 
+                 RETURNING *`,
+                [qtyToAdd, existingId, userId]
+            );
 
-        const newProduct = await pool.query(insertQuery, values);
+            return res.status(200).json({
+                success: true,
+                message: 'Mavjud tovar soni oshirildi',
+                product_id: existingId,
+                product: updatedProduct.rows[0],
+            });
+        } else {
+            // Yangi nom yoki yangi rang bo'lsa, PostgreSQL avtomatik yangi unikal ID beradi
+            const insertQuery = `
+                INSERT INTO products (user_id, title, category, cost_price, price, color, quantity, description)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING *;
+            `;
 
-        res.status(201).json({
-            success: true,
-            message: 'Tovar muvaffaqiyatli saqlandi',
-            product: newProduct.rows[0],
-        });
+            const values = [
+                userId,
+                productTitle,
+                prodCategory,
+                parsedCostPrice,
+                parsedCostPrice,
+                prodColor,
+                qtyToAdd,
+                description || '',
+            ];
+
+            const newProduct = await pool.query(insertQuery, values);
+
+            return res.status(201).json({
+                success: true,
+                message: 'Yangi tovar saqlandi va unikal ID berildi',
+                product_id: newProduct.rows[0].id,
+                product: newProduct.rows[0],
+            });
+        }
     } catch (err) {
-        console.error('Baza bilan bog‘liq xatolik:', err.message);
-        res.status(500).json({ message: `Baza yoki serverda xatolik: ${err.message}` });
+        console.error('Tovar qo‘shishda xatolik:', err.message);
+        res.status(500).json({ message: `Serverda xatolik: ${err.message}` });
     }
 });
 
@@ -195,14 +230,15 @@ router.post('/sell', checkAuthAndSubscription, async (req, res) => {
 
         if (!userId) return res.status(401).json({ message: 'Foydalanuvchi aniqlanmadi!' });
 
-        const { product_id, sell_quantity, selling_price } = req.body;
-        const qty = parseInt(sell_quantity) || 1;
-        const sPrice = parseFloat(selling_price) || 0;
+        const { product_id, sell_quantity, selling_price, quantity, sellPrice } = req.body;
+        const targetProductId = parseInt(product_id);
+        const qty = parseInt(sell_quantity || quantity) || 1;
+        const sPrice = parseFloat(selling_price || sellPrice) || 0;
         const totalAmount = qty * sPrice;
 
         const productRes = await pool.query(
             'SELECT id, quantity, cost_price FROM products WHERE id = $1 AND user_id = $2',
-            [product_id, userId]
+            [targetProductId, userId]
         );
 
         if (productRes.rows.length === 0) {
@@ -212,15 +248,15 @@ router.post('/sell', checkAuthAndSubscription, async (req, res) => {
         const product = productRes.rows[0];
 
         if (parseInt(product.quantity) < qty) {
-            return res.status(400).json({ message: 'Omborda yetarli tovar yo‘q!' });
+            return res.status(400).json({ message: `Omborda yetarli tovar yo‘q! Qoldiq: ${product.quantity} ta` });
         }
 
         await pool.query(
             `INSERT INTO sales (user_id, product_id, quantity, sell_quantity, sale_price, selling_price, total_amount, cost_price, created_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
             [
                 userId,
-                parseInt(product_id),
+                targetProductId,
                 qty,
                 qty,
                 sPrice,
@@ -231,8 +267,8 @@ router.post('/sell', checkAuthAndSubscription, async (req, res) => {
         );
 
         await pool.query(
-            'UPDATE products SET quantity = quantity - $1 WHERE id = $2',
-            [qty, parseInt(product_id)]
+            'UPDATE products SET quantity = quantity - $1 WHERE id = $2 AND user_id = $3',
+            [qty, targetProductId, userId]
         );
 
         res.json({ success: true, message: 'Sotuv amalga oshirildi' });
@@ -250,15 +286,16 @@ router.post('/delete-product', checkAuthAndSubscription, async (req, res) => {
 
         if (!userId) return res.status(401).json({ message: 'Foydalanuvchi aniqlanmadi!' });
 
-        const { product_id, remove_all, quantity_to_remove } = req.body;
+        const { product_id, remove_all, quantity_to_remove, quantityToRemove } = req.body;
+        const targetProductId = parseInt(product_id);
 
-        if (!product_id) {
+        if (!targetProductId) {
             return res.status(400).json({ message: 'Tovar tanlanmagan!' });
         }
 
         const productRes = await pool.query(
             'SELECT id, quantity FROM products WHERE id = $1 AND user_id = $2',
-            [product_id, userId]
+            [targetProductId, userId]
         );
 
         if (productRes.rows.length === 0) {
@@ -266,17 +303,17 @@ router.post('/delete-product', checkAuthAndSubscription, async (req, res) => {
         }
 
         const currentQty = parseInt(productRes.rows[0].quantity) || 0;
-        const qtyToRemove = parseInt(quantity_to_remove) || 0;
+        const qtyToRemove = parseInt(quantity_to_remove || quantityToRemove) || 0;
 
-        await pool.query('UPDATE sales SET product_id = NULL WHERE product_id = $1 AND user_id = $2', [product_id, userId]);
+        await pool.query('UPDATE sales SET product_id = NULL WHERE product_id = $1 AND user_id = $2', [targetProductId, userId]);
 
         if (remove_all || qtyToRemove >= currentQty) {
-            await pool.query('DELETE FROM products WHERE id = $1 AND user_id = $2', [product_id, userId]);
+            await pool.query('DELETE FROM products WHERE id = $1 AND user_id = $2', [targetProductId, userId]);
             return res.json({ success: true, message: "Tovar ombordan to'liq o'chirildi!" });
         } else {
             await pool.query(
                 'UPDATE products SET quantity = quantity - $1 WHERE id = $2 AND user_id = $3',
-                [qtyToRemove, product_id, userId]
+                [qtyToRemove, targetProductId, userId]
             );
             return res.json({ success: true, message: `${qtyToRemove} ta tovar ombordan olib tashlandi!` });
         }
@@ -302,7 +339,7 @@ router.post('/expenses', checkAuthAndSubscription, async (req, res) => {
 
         await pool.query(
             `INSERT INTO expenses (user_id, title, amount, expense_type, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
+             VALUES ($1, $2, $3, $4, NOW())`,
             [userId, title, parseFloat(amount), expense_type]
         );
 
