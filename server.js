@@ -358,7 +358,6 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 
         const product = newProduct.rows[0];
 
-        // Bildirishnomani to'liq formatda notifications jadvaliga yozish
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [req.user.userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
@@ -446,19 +445,28 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
             [userId, product.id, product.name, qty, costPrice, price, profit]
         );
 
-        await client.query(
-            `UPDATE public.products SET quantity = $1 WHERE id = $2`,
-            [newQuantity, product.id]
-        );
-
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
-        if (userRow.rows.length > 0) {
-            const siteLogin = userRow.rows[0].site_login;
+        const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
+
+        let sellMessage = `💰 Tovar sotildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${price} so'm\n📈 Qolgan foyda: ${profit} so'm`;
+
+        if (newQuantity === 0) {
             await client.query(
-                `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
-                [siteLogin, `💰 Tovar sotildi: ${product.name} (${qty} ta)`]
+                `DELETE FROM public.products WHERE id = $1`,
+                [product.id]
+            );
+            sellMessage = `🗑 Tovar sotilib tugadi va o'chirildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${price} so'm\n📈 Qolgan foyda: ${profit} so'm`;
+        } else {
+            await client.query(
+                `UPDATE public.products SET quantity = $1 WHERE id = $2`,
+                [newQuantity, product.id]
             );
         }
+
+        await client.query(
+            `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
+            [siteLogin, sellMessage]
+        );
 
         await client.query('COMMIT');
 
@@ -508,8 +516,7 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
                 [product_id, userId]
             );
 
-            // Mahsulot o'chirilganda to'liq format
-            const message = `🗑 Mahsulot o'chirildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}`;
+            const message = `🗑 Mahsulot o'chirildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}`;
             await pool.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
                 [siteLogin, message]
@@ -530,7 +537,7 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
                 [product_id, userId]
             );
 
-            const message = `🗑 Mahsulot o'chirildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}`;
+            const message = `🗑 Mahsulot o'chirildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}`;
             await pool.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
                 [siteLogin, message]
@@ -585,7 +592,6 @@ app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
 
         const expense = newExpense.rows[0];
 
-        // Rasxod qo'shilganda to'liq format
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
@@ -603,6 +609,73 @@ app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
         });
     } catch (err) {
         console.error('Rasxod qo\'shishda xatolik:', err);
+        return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
+    }
+});
+
+// ----------------------------------------------------
+// 12. BOT UCHUN DAVRLI FOYDANI HISOoblash ENDPOINTI (/api/bot/users_login)
+// ----------------------------------------------------
+app.get('/api/bot/users_login', async (req, res) => {
+    const { login, period } = req.query;
+
+    if (!login || !period) {
+        return res.status(400).json({ message: "Login va period parametrlari kiritilishi shart!" });
+    }
+
+    try {
+        const userResult = await pool.query(
+            `SELECT id FROM public.users WHERE site_login = $1`,
+            [login.trim()]
+        );
+
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({ message: "Foydalanuvchi topilmadi!" });
+        }
+
+        const userId = userResult.rows[0].id;
+
+        let salesDateFilter = `TRUE`;
+        let expenseDateFilter = `TRUE`;
+
+        if (period === 'daily') {
+            salesDateFilter = `sold_at::date = CURRENT_DATE`;
+            expenseDateFilter = `created_at::date = CURRENT_DATE`;
+        } else if (period === 'weekly') {
+            salesDateFilter = `sold_at >= date_trunc('week', CURRENT_DATE)`;
+            expenseDateFilter = `created_at >= date_trunc('week', CURRENT_DATE)`;
+        } else if (period === 'monthly') {
+            salesDateFilter = `date_trunc('month', sold_at) = date_trunc('month', CURRENT_DATE)`;
+            expenseDateFilter = `date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)`;
+        } else if (period === 'yearly') {
+            salesDateFilter = `date_trunc('year', sold_at) = date_trunc('year', CURRENT_DATE)`;
+            expenseDateFilter = `date_trunc('year', created_at) = date_trunc('year', CURRENT_DATE)`;
+        } else {
+            return res.status(400).json({ message: "Noto'g'ri period turi kiritildi! (daily, weekly, monthly, yearly)" });
+        }
+
+        const salesResult = await pool.query(
+            `SELECT COALESCE(SUM(profit), 0) as "grossProfit"
+             FROM public.sales
+             WHERE user_id = $1 AND ${salesDateFilter}`,
+            [userId]
+        );
+
+        const expenseResult = await pool.query(
+            `SELECT COALESCE(SUM(amount), 0) as "expense"
+             FROM public.expenses
+             WHERE user_id = $1 AND ${expenseDateFilter}`,
+            [userId]
+        );
+
+        const grossProfit = Number(salesResult.rows[0].grossProfit || 0);
+        const expense = Number(expenseResult.rows[0].expense || 0);
+        const netProfit = grossProfit - expense;
+
+        return res.json({ profit: netProfit });
+
+    } catch (err) {
+        console.error('Bot profit xatosi:', err);
         return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
     }
 });
