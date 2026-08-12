@@ -5,13 +5,15 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jwt-simple');
 
-const TelegramBot = require('node-telegram-bot-api');
-
 const app = express();
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 
-// App ichida bot obyektini biriktirib qo'yamiz:
-app.set('bot', bot);
+// MUHIM: Bu yerda o'z Telegram botini ishga tushirish OLIB TASHLANDI.
+// Sabab: 1) 'node-telegram-bot-api' package.json'da yo'q edi - bu deploy paytida
+//        serverni butunlay qulatib yuborardi.
+//        2) Bu Python Telegram bot bilan bir xil tokenda ikkinchi 'polling'
+//        mijozi bo'lib, Telegram tomonidan konflikt xatosiga sabab bo'lardi.
+// Bildirishnomalar endi FAQAT 'notifications' jadvaliga yozish orqali ishlaydi -
+// buni Python bot alohida (har 10 soniyada) tekshirib, tegishli guruhga yuboradi.
 
 // Middleware
 app.use(cors());
