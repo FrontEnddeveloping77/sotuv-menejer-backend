@@ -25,7 +25,7 @@ const pool = new Pool({
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_123';
 
 // ----------------------------------------------------
-// 0. KERAKLI JADVALLARNI AVTOMATIK YARATISH (sales, expenses, notifications)
+// 0. KERAKLI JADVALLARNI AVTOMATIK YARATISH
 // ----------------------------------------------------
 const ensureTables = async () => {
     try {
@@ -35,6 +35,9 @@ const ensureTables = async () => {
                 user_id INTEGER NOT NULL,
                 product_id INTEGER NOT NULL,
                 title TEXT,
+                size TEXT,
+                color TEXT,
+                category TEXT,
                 quantity INTEGER NOT NULL,
                 cost_price NUMERIC NOT NULL DEFAULT 0,
                 selling_price NUMERIC NOT NULL DEFAULT 0,
@@ -83,7 +86,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // ----------------------------------------------------
-// 2. LOGIN ENDPOINT (Obuna va muddat tekshiruvi bilan)
+// 2. LOGIN ENDPOINT
 // ----------------------------------------------------
 app.post('/api/login', async (req, res) => {
     const { login, password } = req.body;
@@ -118,7 +121,6 @@ app.post('/api/login', async (req, res) => {
 
         const cleanPassword = password.trim();
         let isPasswordValid = false;
-
         const dbPassword = user.site_password_hash || user.site_password || user.password;
 
         if (dbPassword) {
@@ -177,7 +179,6 @@ const authenticateToken = async (req, res, next) => {
 
     try {
         const decoded = jwt.decode(token, JWT_SECRET);
-
         const userCheck = await pool.query(
             `SELECT is_paid, expires_at FROM public.users WHERE id = $1`,
             [decoded.userId]
@@ -188,11 +189,8 @@ const authenticateToken = async (req, res, next) => {
         }
 
         const currentUser = userCheck.rows[0];
-
         if (!currentUser.is_paid || (currentUser.expires_at && new Date(currentUser.expires_at) < new Date())) {
-            return res.status(403).json({
-                message: "To'lov muddati tugagan! To'lov qilganingizdan so'nggina saytdan foydalana olasiz."
-            });
+            return res.status(403).json({ message: "To'lov muddati tugagan! To'lov qilganingizdan so'nggina saytdan foydalana olasiz." });
         }
 
         req.user = decoded;
@@ -209,8 +207,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
     try {
         const userResult = await pool.query(
             `SELECT id, telegram_id, full_name, username, site_login, is_paid, expires_at 
-             FROM public.users 
-             WHERE id = $1`,
+             FROM public.users WHERE id = $1`,
             [req.user.userId]
         );
 
@@ -226,12 +223,11 @@ app.get('/api/me', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 5. STATISTIKA ENDPOINTI (GET /api/dashboard/stats)
+// 5. STATISTIKA ENDPOINTI
 // ----------------------------------------------------
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId;
-
         let storeName = '';
         try {
             const userRow = await pool.query(
@@ -246,29 +242,23 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
         }
 
         const productStats = await pool.query(
-            `SELECT 
-                COUNT(*) as "totalProducts",
-                COALESCE(SUM(quantity), 0) as "totalStock"
-             FROM public.products 
-             WHERE user_id = $1`,
+            `SELECT COUNT(*) as "totalProducts", COALESCE(SUM(quantity), 0) as "totalStock"
+             FROM public.products WHERE user_id = $1`,
             [userId]
         );
 
         const getPeriodStats = async (salesDateFilter, expenseDateFilter) => {
             const salesResult = await pool.query(
-                `SELECT 
-                    COALESCE(SUM(quantity), 0) as "sold",
-                    COALESCE(SUM(quantity * selling_price), 0) as "revenue",
-                    COALESCE(SUM(profit), 0) as "grossProfit"
-                 FROM public.sales
-                 WHERE user_id = $1 AND ${salesDateFilter}`,
+                `SELECT COALESCE(SUM(quantity), 0) as "sold",
+                        COALESCE(SUM(quantity * selling_price), 0) as "revenue",
+                        COALESCE(SUM(profit), 0) as "grossProfit"
+                 FROM public.sales WHERE user_id = $1 AND ${salesDateFilter}`,
                 [userId]
             );
 
             const expenseResult = await pool.query(
                 `SELECT COALESCE(SUM(amount), 0) as "expense"
-                 FROM public.expenses
-                 WHERE user_id = $1 AND ${expenseDateFilter}`,
+                 FROM public.expenses WHERE user_id = $1 AND ${expenseDateFilter}`,
                 [userId]
             );
 
@@ -277,48 +267,30 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
             const grossProfit = Number(salesResult.rows[0].grossProfit || 0);
             const expense = Number(expenseResult.rows[0].expense || 0);
 
-            return {
-                sold,
-                revenue,
-                expense,
-                profit: grossProfit - expense
-            };
+            return { sold, revenue, expense, profit: grossProfit - expense };
         };
 
-        const daily = await getPeriodStats(
-            `sold_at::date = CURRENT_DATE`,
-            `created_at::date = CURRENT_DATE`
-        );
-        const monthly = await getPeriodStats(
-            `date_trunc('month', sold_at) = date_trunc('month', CURRENT_DATE)`,
-            `date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)`
-        );
-        const yearly = await getPeriodStats(
-            `date_trunc('year', sold_at) = date_trunc('year', CURRENT_DATE)`,
-            `date_trunc('year', created_at) = date_trunc('year', CURRENT_DATE)`
-        );
+        const daily = await getPeriodStats(`sold_at::date = CURRENT_DATE`, `created_at::date = CURRENT_DATE`);
+        const monthly = await getPeriodStats(`date_trunc('month', sold_at) = date_trunc('month', CURRENT_DATE)`, `date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)`);
+        const yearly = await getPeriodStats(`date_trunc('year', sold_at) = date_trunc('year', CURRENT_DATE)`, `date_trunc('year', created_at) = date_trunc('year', CURRENT_DATE)`);
         const total = await getPeriodStats(`TRUE`, `TRUE`);
 
         return res.json({
             storeName,
             totalProducts: Number(productStats.rows[0].totalProducts || 0),
             totalStock: Number(productStats.rows[0].totalStock || 0),
-
             totalSold: total.sold,
             totalRevenue: total.revenue,
             totalProfit: total.profit,
             totalExpense: total.expense,
-
             dailySold: daily.sold,
             dailyRevenue: daily.revenue,
             dailyProfit: daily.profit,
             dailyExpense: daily.expense,
-
             monthlySold: monthly.sold,
             monthlyRevenue: monthly.revenue,
             monthlyProfit: monthly.profit,
             monthlyExpense: monthly.expense,
-
             yearlySold: yearly.sold,
             yearlyRevenue: yearly.revenue,
             yearlyProfit: yearly.profit,
@@ -331,7 +303,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 6. TOVAR QO'SHISH (POST /api/products)
+// 6. TOVAR QO'SHISH
 // ----------------------------------------------------
 app.post('/api/products', authenticateToken, async (req, res) => {
     const { category, name, cost_price, color, size, quantity } = req.body;
@@ -343,22 +315,21 @@ app.post('/api/products', authenticateToken, async (req, res) => {
     try {
         const newProduct = await pool.query(
             `INSERT INTO public.products (user_id, category, name, cost_price, color, size, quantity)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             RETURNING *`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
             [
                 req.user.userId,
                 category || null,
                 name.trim(),
                 Number(cost_price),
                 color || null,
-                size || null,
+                size ? size.toString().trim() : null,
                 Number(quantity) || 0
             ]
         );
 
         const product = newProduct.rows[0];
-
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [req.user.userId]);
+
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
             const message = `🆕 Yangi mahsulot qo'shildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n💰 Narxi: ${product.cost_price} so'm\n📊 Miqdori: ${product.quantity} dona`;
@@ -369,10 +340,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
             );
         }
 
-        return res.status(201).json({
-            message: "Tovar muvaffaqiyatli qo'shildi",
-            product: product
-        });
+        return res.status(201).json({ message: "Tovar muvaffaqiyatli qo'shildi", product });
     } catch (err) {
         console.error('Tovar qo\'shishda xatolik:', err);
         return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
@@ -380,7 +348,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 7. TOVARLAR RO'YXATINI OLISH (GET /api/products)
+// 7. TOVARLAR RO'YXATINI OLISH
 // ----------------------------------------------------
 app.get('/api/products', authenticateToken, async (req, res) => {
     try {
@@ -389,7 +357,6 @@ app.get('/api/products', authenticateToken, async (req, res) => {
              FROM public.products WHERE user_id = $1 ORDER BY id DESC`,
             [req.user.userId]
         );
-
         return res.json({ products: products.rows });
     } catch (err) {
         console.error('Tovarlarni olishda xatolik:', err);
@@ -398,11 +365,11 @@ app.get('/api/products', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 8. TOVARNI SOTISH (POST /api/dashboard/sell)
+// 8. TOVARNI SOTISH (Aniq o'lcham va qoldiqni boshqarish bilan)
 // ----------------------------------------------------
 app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
-    const { product_id, sell_quantity, selling_price } = req.body;
+    const { product_id, sell_quantity, selling_price, size } = req.body;
 
     const qty = parseInt(sell_quantity);
     const price = parseFloat(selling_price);
@@ -429,6 +396,7 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
         }
 
         const product = productResult.rows[0];
+        const selectedSize = size ? size.toString().trim() : (product.size || 'Yo\'q');
 
         if (Number(product.quantity) < qty) {
             await client.query('ROLLBACK');
@@ -440,27 +408,21 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
         const newQuantity = Number(product.quantity) - qty;
 
         await client.query(
-            `INSERT INTO public.sales (user_id, product_id, title, quantity, cost_price, selling_price, profit)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-            [userId, product.id, product.name, qty, costPrice, price, profit]
+            `INSERT INTO public.sales (user_id, product_id, title, size, color, category, quantity, cost_price, selling_price, profit)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+            [userId, product.id, product.name, selectedSize, product.color, product.category, qty, costPrice, price, profit]
         );
 
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
-        let sellMessage = `💰 Tovar sotildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${price} so'm\n📈 Qolgan foyda: ${profit} so'm`;
+        let sellMessage = `💰 Tovar sotildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${selectedSize}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${price} so'm\n📈 Qolgan foyda: ${profit} so'm`;
 
         if (newQuantity === 0) {
-            await client.query(
-                `DELETE FROM public.products WHERE id = $1`,
-                [product.id]
-            );
-            sellMessage = `🗑 Tovar sotilib tugadi va o'chirildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${price} so'm\n📈 Qolgan foyda: ${profit} so'm`;
+            await client.query(`DELETE FROM public.products WHERE id = $1`, [product.id]);
+            sellMessage = `🗑 Tovar sotilib tugadi va o'chirildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${selectedSize}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${price} so'm\n📈 Qolgan foyda: ${profit} so'm`;
         } else {
-            await client.query(
-                `UPDATE public.products SET quantity = $1 WHERE id = $2`,
-                [newQuantity, product.id]
-            );
+            await client.query(`UPDATE public.products SET quantity = $1 WHERE id = $2`, [newQuantity, product.id]);
         }
 
         await client.query(
@@ -469,12 +431,8 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
         );
 
         await client.query('COMMIT');
+        return res.json({ message: "Tovar muvaffaqiyatli sotildi", newQuantity, profit });
 
-        return res.json({
-            message: "Tovar muvaffaqiyatli sotildi",
-            newQuantity,
-            profit
-        });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Sotishda xatolik:', err);
@@ -485,11 +443,11 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 9. TOVARNI OLIB TASHLASH / O'CHIRISH (POST /api/dashboard/delete-product)
+// 9. TOVARni OLIB TASHLASH / O'CHIRISH
 // ----------------------------------------------------
 app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
-    const { product_id, remove_all, quantity_to_remove } = req.body;
+    const { product_id, remove_all, quantity_to_remove, size } = req.body;
 
     if (!product_id) {
         return res.status(400).json({ message: "Tovar tanlanishi shart!" });
@@ -506,55 +464,40 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
         }
 
         const product = productResult.rows[0];
+        const selectedSize = size ? size.toString().trim() : (product.size || 'Yo\'q');
 
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
         if (remove_all) {
-            await pool.query(
-                `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
-                [product_id, userId]
-            );
+            await pool.query(`DELETE FROM public.products WHERE id = $1 AND user_id = $2`, [product_id, userId]);
 
-            const message = `🗑 Mahsulot o'chirildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}`;
-            await pool.query(
-                `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
-                [siteLogin, message]
-            );
+            const message = `🗑 Mahsulot o'chirildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${selectedSize}`;
+            await pool.query(`INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`, [siteLogin, message]);
 
             return res.json({ message: "Tovar to'liq o'chirildi" });
         }
 
         const removeQty = parseInt(quantity_to_remove) || 1;
-
         if (removeQty <= 0) {
             return res.status(400).json({ message: "Olib tashlanadigan son to'g'ri kiritilishi shart!" });
         }
 
         if (removeQty >= Number(product.quantity)) {
-            await pool.query(
-                `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
-                [product_id, userId]
-            );
+            await pool.query(`DELETE FROM public.products WHERE id = $1 AND user_id = $2`, [product_id, userId]);
 
-            const message = `🗑 Mahsulot o'chirildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}`;
-            await pool.query(
-                `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
-                [siteLogin, message]
-            );
+            const message = `🗑 Mahsulot o'chirildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${selectedSize}`;
+            await pool.query(`INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`, [siteLogin, message]);
 
             return res.json({ message: "Tovar to'liq o'chirildi" });
         }
 
         const newQuantity = Number(product.quantity) - removeQty;
-        await pool.query(
-            `UPDATE public.products SET quantity = $1 WHERE id = $2 AND user_id = $3`,
-            [newQuantity, product_id, userId]
-        );
+        await pool.query(`UPDATE public.products SET quantity = $1 WHERE id = $2 AND user_id = $3`, [newQuantity, product_id, userId]);
 
         await pool.query(
             `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
-            [siteLogin, `📉 Tovar miqdori kamaytirildi: ${product.name} (${removeQty} ta olib tashlandi)`]
+            [siteLogin, `📉 Tovar miqdori kamaytirildi:\n📦 Nomi: ${product.name}\n📏 O'lchami: ${selectedSize}\n📊 ${removeQty} ta olib tashlandi (Qoldi: ${newQuantity} ta)`]
         );
 
         return res.json({ message: "Tovar miqdori kamaytirildi", newQuantity });
@@ -565,12 +508,11 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
 });
 
 // ----------------------------------------------------
-// 10. RASXOD QO'SHISH (POST /api/dashboard/expenses)
+// 10. RASXOD QO'SHISH
 // ----------------------------------------------------
 app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { title, amount, expense_type } = req.body;
-
     const parsedAmount = parseFloat(amount);
 
     if (!title || !title.trim()) {
@@ -585,14 +527,13 @@ app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
     try {
         const newExpense = await pool.query(
             `INSERT INTO public.expenses (user_id, title, amount, expense_type)
-             VALUES ($1, $2, $3, $4)
-             RETURNING *`,
+             VALUES ($1, $2, $3, $4) RETURNING *`,
             [userId, title.trim(), parsedAmount, type]
         );
 
         const expense = newExpense.rows[0];
-
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
+
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
             const message = `💸 Yangi rasxod qo'shildi:\n📝 Tavsifi: ${expense.title}\n💰 Summasi: ${expense.amount} so'm\n📅 Sanasi: ${new Date(expense.created_at).toISOString().split('T')[0]}`;
@@ -603,10 +544,7 @@ app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
             );
         }
 
-        return res.status(201).json({
-            message: "Rasxod muvaffaqiyatli qo'shildi",
-            expense: expense
-        });
+        return res.status(201).json({ message: "Rasxod muvaffaqiyatli qo'shildi", expense });
     } catch (err) {
         console.error('Rasxod qo\'shishda xatolik:', err);
         return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
@@ -614,7 +552,7 @@ app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 12. BOT UCHUN DAVRLI FOYDANI HISOoblash ENDPOINTI (/api/bot/users_login)
+// 11. BOT UCHUN DAVRLI FOYDANI HISOBLASH ENDPOINTI
 // ----------------------------------------------------
 app.get('/api/bot/users_login', async (req, res) => {
     const { login, period } = req.query;
@@ -624,17 +562,12 @@ app.get('/api/bot/users_login', async (req, res) => {
     }
 
     try {
-        const userResult = await pool.query(
-            `SELECT id FROM public.users WHERE site_login = $1`,
-            [login.trim()]
-        );
-
+        const userResult = await pool.query(`SELECT id FROM public.users WHERE site_login = $1`, [login.trim()]);
         if (userResult.rows.length === 0) {
             return res.status(404).json({ message: "Foydalanuvchi topilmadi!" });
         }
 
         const userId = userResult.rows[0].id;
-
         let salesDateFilter = `TRUE`;
         let expenseDateFilter = `TRUE`;
 
@@ -655,16 +588,11 @@ app.get('/api/bot/users_login', async (req, res) => {
         }
 
         const salesResult = await pool.query(
-            `SELECT COALESCE(SUM(profit), 0) as "grossProfit"
-             FROM public.sales
-             WHERE user_id = $1 AND ${salesDateFilter}`,
+            `SELECT COALESCE(SUM(profit), 0) as "grossProfit" FROM public.sales WHERE user_id = $1 AND ${salesDateFilter}`,
             [userId]
         );
-
         const expenseResult = await pool.query(
-            `SELECT COALESCE(SUM(amount), 0) as "expense"
-             FROM public.expenses
-             WHERE user_id = $1 AND ${expenseDateFilter}`,
+            `SELECT COALESCE(SUM(amount), 0) as "expense" FROM public.expenses WHERE user_id = $1 AND ${expenseDateFilter}`,
             [userId]
         );
 
@@ -673,7 +601,6 @@ app.get('/api/bot/users_login', async (req, res) => {
         const netProfit = grossProfit - expense;
 
         return res.json({ profit: netProfit });
-
     } catch (err) {
         console.error('Bot profit xatosi:', err);
         return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
@@ -681,7 +608,7 @@ app.get('/api/bot/users_login', async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 11. SAFE ROUTE FALLBACK
+// 12. SAFE ROUTE FALLBACK
 // ----------------------------------------------------
 app.use((req, res) => {
     res.status(404).json({ message: "Bunday yo'nalish topilmadi" });
