@@ -386,7 +386,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
     }
 
     const sizeValue = size ? String(size).trim() : 'Standart';
-    const qtyValue = parseInt(quantity) || 0;
+    const qtyValue = parseInt(quantity) || 0; // Miqdorni aniq o'qib olamiz
 
     const client = await pool.connect();
     try {
@@ -401,6 +401,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 
         const product = newProduct.rows[0];
 
+        // Miqdorni product_sizes jadvaliga to'g'ri yozamiz
         await client.query(
             `INSERT INTO public.product_sizes (product_id, size, quantity) VALUES ($1, $2, $3)`,
             [product.id, sizeValue, qtyValue]
@@ -408,13 +409,10 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 
         await client.query('COMMIT');
 
-        // Foydalanuvchining site_login ni topib, telegramga ketadigan xabarnomani yozish
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [req.user.userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
-
-            // Siz xohlagan aniq shablon bo'yicha xabar matni
-            const message = `🆕 Yangi mahsulot qo'shildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${sizeValue}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n💰 Narxi: ${formatSum(product.cost_price)} so'm\n📊 Miqdori: ${qtyValue} dona`;
+            const message = `🆕 Yangi mahsulot qo'shildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${sizeValue}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n💰 Narxi: ${product.cost_price} so'm\n📊 Miqdori: ${qtyValue} dona`;
 
             await pool.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
@@ -422,18 +420,64 @@ app.post('/api/products', authenticateToken, async (req, res) => {
             );
         }
 
-        return res.status(201).json({
-            message: "Tovar muvaffaqiyatli qo'shildi",
-            product: product
-        });
+        return res.status(201).json({ message: "Tovar muvaffaqiyatli qo'shildi" });
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error('Tovar qo\'shishda xatolik:', err);
+        console.error('Xatolik:', err);
         return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
     } finally {
         client.release();
     }
 });
+
+const sizeValue = size ? String(size).trim() : 'Standart';
+const qtyValue = parseInt(quantity) || 0;
+
+const client = await pool.connect();
+try {
+    await client.query('BEGIN');
+
+    const newProduct = await client.query(
+        `INSERT INTO public.products (user_id, category, name, cost_price, color)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING *`,
+        [req.user.userId, category || null, name.trim(), Number(cost_price), color || null]
+    );
+
+    const product = newProduct.rows[0];
+
+    await client.query(
+        `INSERT INTO public.product_sizes (product_id, size, quantity) VALUES ($1, $2, $3)`,
+        [product.id, sizeValue, qtyValue]
+    );
+
+    await client.query('COMMIT');
+
+    // Foydalanuvchining site_login ni topib, telegramga ketadigan xabarnomani yozish
+    const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [req.user.userId]);
+    if (userRow.rows.length > 0) {
+        const siteLogin = userRow.rows[0].site_login;
+
+        // Siz xohlagan aniq shablon bo'yicha xabar matni
+        const message = `🆕 Yangi mahsulot qo'shildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${sizeValue}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n💰 Narxi: ${formatSum(product.cost_price)} so'm\n📊 Miqdori: ${qtyValue} dona`;
+
+        await pool.query(
+            `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
+            [siteLogin, message]
+        );
+    }
+
+    return res.status(201).json({
+        message: "Tovar muvaffaqiyatli qo'shildi",
+        product: product
+    });
+} catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Tovar qo\'shishda xatolik:', err);
+    return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
+} finally {
+    client.release();
+}
 
 // ----------------------------------------------------
 // 7. TOVARLAR RO'YXATINI OLISH (GET /api/products)
