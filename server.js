@@ -379,28 +379,19 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 // Endi 'sizes' massivi qabul qilinadi: [{ size: "40", quantity: 5 }, { size: "41", quantity: 3 }, ...]
 // ----------------------------------------------------
 app.post('/api/products', authenticateToken, async (req, res) => {
-    // Fronteddan kelayotgan ma'lumotlar
     const { category, name, cost_price, color, size, quantity } = req.body;
 
-    // 1. Asosiy validatsiya
     if (!name || cost_price === undefined) {
         return res.status(400).json({ message: "Tovar nomi va kelgan narxi kiritilishi shart!" });
     }
 
-    // 2. O'lchamni matn sifatida qabul qilamiz (5 metr, XL, 40 va h.k.)
     const sizeValue = size ? String(size).trim() : 'Standart';
-    // 3. Miqdorni raqamga o'giramiz, agar noto'g'ri bo'lsa 0 deb olamiz
     const qtyValue = parseInt(quantity) || 0;
-
-    if (qtyValue <= 0) {
-        return res.status(400).json({ message: "Tovar soni musbat bo'lishi kerak!" });
-    }
 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
 
-        // Tovar qo'shish
         const newProduct = await client.query(
             `INSERT INTO public.products (user_id, category, name, cost_price, color)
              VALUES ($1, $2, $3, $4, $5)
@@ -410,7 +401,6 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 
         const product = newProduct.rows[0];
 
-        // O'lchamni va sonini saqlash
         await client.query(
             `INSERT INTO public.product_sizes (product_id, size, quantity) VALUES ($1, $2, $3)`,
             [product.id, sizeValue, qtyValue]
@@ -418,11 +408,13 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 
         await client.query('COMMIT');
 
-        // Xabarnoma yuborish
+        // Foydalanuvchining site_login ni topib, telegramga ketadigan xabarnomani yozish
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [req.user.userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
-            const message = `🆕 Yangi mahsulot:\n📦 ${product.name}\n📏 O'lcham: ${sizeValue}\n🔢 Soni: ${qtyValue} ta`;
+
+            // Siz xohlagan aniq shablon bo'yicha xabar matni
+            const message = `🆕 Yangi mahsulot qo'shildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${sizeValue}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n💰 Narxi: ${formatSum(product.cost_price)} so'm\n📊 Miqdori: ${qtyValue} dona`;
 
             await pool.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
@@ -430,10 +422,13 @@ app.post('/api/products', authenticateToken, async (req, res) => {
             );
         }
 
-        return res.status(201).json({ message: "Tovar muvaffaqiyatli qo'shildi" });
+        return res.status(201).json({
+            message: "Tovar muvaffaqiyatli qo'shildi",
+            product: product
+        });
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error('Xatolik:', err);
+        console.error('Tovar qo\'shishda xatolik:', err);
         return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
     } finally {
         client.release();
