@@ -7,14 +7,6 @@ const jwt = require('jwt-simple');
 
 const app = express();
 
-// MUHIM: Bu yerda o'z Telegram botini ishga tushirish OLIB TASHLANDI.
-// Sabab: 1) 'node-telegram-bot-api' package.json'da yo'q edi - bu deploy paytida
-//        serverni butunlay qulatib yuborardi.
-//        2) Bu Python Telegram bot bilan bir xil tokenda ikkinchi 'polling'
-//        mijozi bo'lib, Telegram tomonidan konflikt xatosiga sabab bo'lardi.
-// Bildirishnomalar endi FAQAT 'notifications' jadvaliga yozish orqali ishlaydi -
-// buni Python bot alohida (har 10 soniyada) tekshirib, tegishli guruhga yuboradi.
-
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -36,6 +28,60 @@ const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_123';
 const formatSum = (val) => {
     if (val === undefined || val === null) return '0';
     return Number(val).toLocaleString('uz-UZ');
+};
+
+// ----------------------------------------------------
+// TELEGRAM GURUHGA TO'G'RIDAN-TO'G'RI XABAR YUBORISH
+// ----------------------------------------------------
+// MUHIM: Ilgari bu yerda Telegram botini ishga tushirish OLIB TASHLANGAN edi va
+// bildirishnomalar faqat 'notifications' jadvaliga yozib qo'yilardi. G'oya shu ediki,
+// alohida bir Python bot bu jadvalni har 10 soniyada tekshirib, xabarlarni guruhga
+// yuborishi kerak edi. LEKIN loyihada bunday Python bot umuman yo'q (na kodda,
+// na deploy sozlamalarida) - shuning uchun 'notifications' jadvaliga yozilgan
+// xabarlar hech qachon guruhga yetib bormagan. Aynan shu ASOSIY MUAMMO edi.
+//
+// Yechim: alohida pollingchi bot shart emas, chunki Telegramning oddiy
+// "sendMessage" HTTP so'rovi orqali xabar yuborish getUpdates() bilan polling
+// qiluvchi boshqa bot bilan HECH QANDAY konflikt keltirib chiqarmaydi (konflikt
+// faqat ikkita bot bir vaqtda getUpdates() chaqirsa yuzaga keladi). Shu sababli
+// bu yerda to'g'ridan-to'g'ri, ishonchli tarzda Telegram Bot API chaqiriladi.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_GROUP_ID = process.env.TELEGRAM_GROUP_ID || process.env.GROUP_CHAT_ID;
+
+const sendTelegramMessage = async (message) => {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_GROUP_ID) {
+        console.error(
+            "Telegramga xabar yuborilmadi: TELEGRAM_BOT_TOKEN va/yoki TELEGRAM_GROUP_ID " +
+            ".env faylida (yoki hosting muhitida) topilmadi!"
+        );
+        return false;
+    }
+
+    try {
+        const response = await fetch(
+            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    chat_id: TELEGRAM_GROUP_ID,
+                    text: message
+                })
+            }
+        );
+
+        const data = await response.json();
+
+        if (!data.ok) {
+            console.error('Telegram API xatolik qaytardi:', data);
+            return false;
+        }
+
+        return true;
+    } catch (err) {
+        console.error('Telegramga ulanishda xatolik:', err.message);
+        return false;
+    }
 };
 
 // ----------------------------------------------------
@@ -388,9 +434,10 @@ app.post('/api/products', authenticateToken, async (req, res) => {
             const siteLogin = userRow.rows[0].site_login;
             const message = `🆕 Yangi mahsulot qo'shildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n💰 Narxi: ${formatSum(product.cost_price)} so'm\n📊 Miqdori: ${product.quantity} dona`;
 
+            const sent = await sendTelegramMessage(message);
             await pool.query(
-                `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
-                [siteLogin, message]
+                `INSERT INTO public.notifications (site_login, message, is_sent) VALUES ($1, $2, $3)`,
+                [siteLogin, message, sent]
             );
         }
 
@@ -492,9 +539,10 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
             sellMessage = `🗑 Tovar sotilib butunlay tugadi va o'chirildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${formatSum(price)} so'm\n📈 Foyda: ${formatSum(profit)} so'm`;
         }
 
+        const sellSent = await sendTelegramMessage(sellMessage);
         await client.query(
-            `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
-            [siteLogin, sellMessage]
+            `INSERT INTO public.notifications (site_login, message, is_sent) VALUES ($1, $2, $3)`,
+            [siteLogin, sellMessage, sellSent]
         );
 
         await client.query('COMMIT');
@@ -563,9 +611,10 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
 
         const message = `📉 Mahsulot kamaytirildi/o'chirildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📊 Olib tashlandi: ${removeQty} dona\n📋 Qolgan soni: ${newQty} dona`;
 
+        const removeSent = await sendTelegramMessage(message);
         await client.query(
-            `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
-            [siteLogin, message]
+            `INSERT INTO public.notifications (site_login, message, is_sent) VALUES ($1, $2, $3)`,
+            [siteLogin, message, removeSent]
         );
 
         await client.query('COMMIT');
@@ -617,9 +666,10 @@ app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
             const siteLogin = userRow.rows[0].site_login;
             const message = `💸 Yangi rasxod qo'shildi:\n📝 Tavsifi: ${expense.title}\n💰 Summasi: ${formatSum(expense.amount)} so'm\n📅 Sanasi: ${new Date(expense.created_at).toISOString().split('T')[0]}`;
 
+            const expenseSent = await sendTelegramMessage(message);
             await pool.query(
-                `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
-                [siteLogin, message]
+                `INSERT INTO public.notifications (site_login, message, is_sent) VALUES ($1, $2, $3)`,
+                [siteLogin, message, expenseSent]
             );
         }
 
