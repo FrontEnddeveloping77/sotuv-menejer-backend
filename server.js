@@ -379,19 +379,28 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 // Endi 'sizes' massivi qabul qilinadi: [{ size: "40", quantity: 5 }, { size: "41", quantity: 3 }, ...]
 // ----------------------------------------------------
 app.post('/api/products', authenticateToken, async (req, res) => {
-    const { category, name, cost_price, color, sizes } = req.body;
+    // Fronteddan kelayotgan ma'lumotlar
+    const { category, name, cost_price, color, size, quantity } = req.body;
 
+    // 1. Asosiy validatsiya
     if (!name || cost_price === undefined) {
         return res.status(400).json({ message: "Tovar nomi va kelgan narxi kiritilishi shart!" });
     }
-    if (!Array.isArray(sizes) || sizes.length === 0) {
-        return res.status(400).json({ message: "Kamida bitta o'lcham va uning soni kiritilishi shart!" });
+
+    // 2. O'lchamni matn sifatida qabul qilamiz (5 metr, XL, 40 va h.k.)
+    const sizeValue = size ? String(size).trim() : 'Standart';
+    // 3. Miqdorni raqamga o'giramiz, agar noto'g'ri bo'lsa 0 deb olamiz
+    const qtyValue = parseInt(quantity) || 0;
+
+    if (qtyValue <= 0) {
+        return res.status(400).json({ message: "Tovar soni musbat bo'lishi kerak!" });
     }
 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
 
+        // Tovar qo'shish
         const newProduct = await client.query(
             `INSERT INTO public.products (user_id, category, name, cost_price, color)
              VALUES ($1, $2, $3, $4, $5)
@@ -401,25 +410,19 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 
         const product = newProduct.rows[0];
 
-        for (const item of sizes) {
-            const sizeValue = String(item.size).trim();
-            const qtyValue = parseInt(item.quantity) || 0;
-            if (!sizeValue || qtyValue <= 0) continue;
-
-            await client.query(
-                `INSERT INTO public.product_sizes (product_id, size, quantity) VALUES ($1, $2, $3)`,
-                [product.id, sizeValue, qtyValue]
-            );
-        }
+        // O'lchamni va sonini saqlash
+        await client.query(
+            `INSERT INTO public.product_sizes (product_id, size, quantity) VALUES ($1, $2, $3)`,
+            [product.id, sizeValue, qtyValue]
+        );
 
         await client.query('COMMIT');
 
-        const sizesText = sizes.map(s => `${s.size}: ${s.quantity} dona`).join(', ');
-
+        // Xabarnoma yuborish
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [req.user.userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
-            const message = `🆕 Yangi mahsulot qo'shildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n💰 Narxi: ${product.cost_price} so'm\n📏 O'lchamlar: ${sizesText}`;
+            const message = `🆕 Yangi mahsulot:\n📦 ${product.name}\n📏 O'lcham: ${sizeValue}\n🔢 Soni: ${qtyValue} ta`;
 
             await pool.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
@@ -427,13 +430,10 @@ app.post('/api/products', authenticateToken, async (req, res) => {
             );
         }
 
-        return res.status(201).json({
-            message: "Tovar muvaffaqiyatli qo'shildi",
-            product: product
-        });
+        return res.status(201).json({ message: "Tovar muvaffaqiyatli qo'shildi" });
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error('Tovar qo\'shishda xatolik:', err);
+        console.error('Xatolik:', err);
         return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
     } finally {
         client.release();
