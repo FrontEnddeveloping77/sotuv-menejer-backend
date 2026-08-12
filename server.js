@@ -104,14 +104,12 @@ app.post('/api/login', async (req, res) => {
 
         const user = userResult.rows[0];
 
-        // 1. is_paid false bo'lsa
         if (!user.is_paid) {
             return res.status(403).json({
                 message: "To'lov qilganingizdan so'ng saytdan foydalana olasiz. Obunangiz faol emas!"
             });
         }
 
-        // 2. expires_at (muddati) tugagan bo'lsa
         if (user.expires_at && new Date(user.expires_at) < new Date()) {
             return res.status(403).json({
                 message: "To'lov muddati tugagan! Iltimos, obunani yangilang, shundan so'ng saytdan foydalana olasiz."
@@ -167,7 +165,7 @@ app.post('/api/login', async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 3. AUTH MIDDLEWARE (Token + Har bir so'rovda obuna va muddatni tekshirish)
+// 3. AUTH MIDDLEWARE
 // ----------------------------------------------------
 const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
@@ -358,19 +356,23 @@ app.post('/api/products', authenticateToken, async (req, res) => {
             ]
         );
 
-        // Bildirishnomani notifications jadvaliga yozish
+        const product = newProduct.rows[0];
+
+        // Bildirishnomani to'liq formatda notifications jadvaliga yozish
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [req.user.userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
+            const message = `🆕 Yangi mahsulot qo'shildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n💰 Narxi: ${product.cost_price} so'm\n📊 Miqdori: ${product.quantity} dona`;
+
             await pool.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
-                [siteLogin, "🆕 Yangi mahsulot qo'shildi: " + name.trim()]
+                [siteLogin, message]
             );
         }
 
         return res.status(201).json({
             message: "Tovar muvaffaqiyatli qo'shildi",
-            product: newProduct.rows[0]
+            product: product
         });
     } catch (err) {
         console.error('Tovar qo\'shishda xatolik:', err);
@@ -449,7 +451,6 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
             [newQuantity, product.id]
         );
 
-        // Bildirishnomani notifications jadvaliga yozish
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
@@ -498,7 +499,6 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
 
         const product = productResult.rows[0];
 
-        // site_login ni topish
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
@@ -508,9 +508,11 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
                 [product_id, userId]
             );
 
+            // Mahsulot o'chirilganda to'liq format
+            const message = `🗑 Mahsulot o'chirildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}`;
             await pool.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
-                [siteLogin, `🗑 Tovar to'liq o'chirildi: ${product.name}`]
+                [siteLogin, message]
             );
 
             return res.json({ message: "Tovar to'liq o'chirildi" });
@@ -528,9 +530,10 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
                 [product_id, userId]
             );
 
+            const message = `🗑 Mahsulot o'chirildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${product.size || 'Yo\'q'}`;
             await pool.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
-                [siteLogin, `🗑 Tovar to'liq o'chirildi: ${product.name}`]
+                [siteLogin, message]
             );
 
             return res.json({ message: "Tovar to'liq o'chirildi" });
@@ -580,19 +583,23 @@ app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
             [userId, title.trim(), parsedAmount, type]
         );
 
-        // Bildirishnomani notifications jadvaliga yozish
+        const expense = newExpense.rows[0];
+
+        // Rasxod qo'shilganda to'liq format
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
+            const message = `💸 Yangi rasxod qo'shildi:\n📝 Tavsifi: ${expense.title}\n💰 Summasi: ${expense.amount} so'm\n📅 Sanasi: ${new Date(expense.created_at).toISOString().split('T')[0]}`;
+
             await pool.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
-                [siteLogin, `📉 Yangi rasxod qo'shildi: ${title.trim()} — ${parsedAmount} so'm`]
+                [siteLogin, message]
             );
         }
 
         return res.status(201).json({
             message: "Rasxod muvaffaqiyatli qo'shildi",
-            expense: newExpense.rows[0]
+            expense: expense
         });
     } catch (err) {
         console.error('Rasxod qo\'shishda xatolik:', err);
