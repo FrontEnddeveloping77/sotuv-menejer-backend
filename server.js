@@ -43,18 +43,13 @@ const ensureTables = async () => {
                 name TEXT NOT NULL,
                 cost_price NUMERIC NOT NULL DEFAULT 0,
                 color TEXT,
+                quantity INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
         `);
 
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS public.product_sizes (
-                id SERIAL PRIMARY KEY,
-                product_id INTEGER NOT NULL REFERENCES public.products(id) ON DELETE CASCADE,
-                size TEXT NOT NULL,
-                quantity INTEGER NOT NULL DEFAULT 0
-            );
-        `);
+        // Agar jadval avval bor bo'lsa va 'quantity' ustuni bo'lmasa, qo'shish
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 0;`);
 
         await pool.query(`
             CREATE TABLE IF NOT EXISTS public.sales (
@@ -62,7 +57,6 @@ const ensureTables = async () => {
                 user_id INTEGER NOT NULL,
                 product_id INTEGER NOT NULL,
                 title TEXT,
-                size TEXT,
                 quantity INTEGER NOT NULL,
                 cost_price NUMERIC NOT NULL DEFAULT 0,
                 selling_price NUMERIC NOT NULL DEFAULT 0,
@@ -70,8 +64,6 @@ const ensureTables = async () => {
                 sold_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
         `);
-        // Eski sales jadvalida 'size' ustuni bo'lmasligi mumkin - qo'shib qo'yamiz
-        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS size TEXT;`);
 
         await pool.query(`
             CREATE TABLE IF NOT EXISTS public.expenses (
@@ -94,27 +86,13 @@ const ensureTables = async () => {
             );
         `);
 
-        console.log('Barcha jadvallar tayyor (products, product_sizes, sales, expenses, notifications).');
+        console.log('Barcha jadvallar tayyor (products, sales, expenses, notifications).');
     } catch (err) {
         console.error('Jadvallarni yaratishda xatolik:', err);
     }
 };
 
 ensureTables();
-
-// ----------------------------------------------------
-// Yordamchi: mahsulotning qolgan o'lchamlarini matn ko'rinishida qaytaradi
-// ----------------------------------------------------
-async function getRemainingSizesText(productId) {
-    const result = await pool.query(
-        `SELECT size, quantity FROM public.product_sizes WHERE product_id = $1 ORDER BY size`,
-        [productId]
-    );
-    if (result.rows.length === 0) {
-        return "Qolmadi (barcha o'lchamlar tugadi)";
-    }
-    return result.rows.map(r => `${r.size}: ${r.quantity} dona`).join(', ');
-}
 
 // ----------------------------------------------------
 // 1. HEALTH CHECK ENDPOINTS
@@ -128,7 +106,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // ----------------------------------------------------
-// 2. LOGIN ENDPOINT (Obuna va muddat tekshiruvi bilan)
+// 2. LOGIN ENDPOINT
 // ----------------------------------------------------
 app.post('/api/login', async (req, res) => {
     const { login, password } = req.body;
@@ -292,11 +270,10 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 
         const productStats = await pool.query(
             `SELECT 
-                COUNT(DISTINCT p.id) as "totalProducts",
-                COALESCE(SUM(ps.quantity), 0) as "totalStock"
-             FROM public.products p
-             LEFT JOIN public.product_sizes ps ON ps.product_id = p.id
-             WHERE p.user_id = $1`,
+                COUNT(id) as "totalProducts",
+                COALESCE(SUM(quantity), 0) as "totalStock"
+             FROM public.products
+             WHERE user_id = $1`,
             [userId]
         );
 
@@ -380,39 +357,28 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 // 6. TOVAR QO'SHISH (POST /api/products)
 // ----------------------------------------------------
 app.post('/api/products', authenticateToken, async (req, res) => {
-    const { category, name, cost_price, color, size, quantity } = req.body;
+    const { category, name, cost_price, color, quantity } = req.body;
 
     if (!name || cost_price === undefined) {
         return res.status(400).json({ message: "Tovar nomi va kelgan narxi kiritilishi shart!" });
     }
 
-    const sizeValue = size ? String(size).trim() : 'Standart';
     const qtyValue = parseInt(quantity) || 0;
 
-    const client = await pool.connect();
     try {
-        await client.query('BEGIN');
-
-        const newProduct = await client.query(
-            `INSERT INTO public.products (user_id, category, name, cost_price, color)
-             VALUES ($1, $2, $3, $4, $5)
+        const newProduct = await pool.query(
+            `INSERT INTO public.products (user_id, category, name, cost_price, color, quantity)
+             VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING *`,
-            [req.user.userId, category || null, name.trim(), Number(cost_price), color || null]
+            [req.user.userId, category || null, name.trim(), Number(cost_price), color || null, qtyValue]
         );
 
         const product = newProduct.rows[0];
 
-        await client.query(
-            `INSERT INTO public.product_sizes (product_id, size, quantity) VALUES ($1, $2, $3)`,
-            [product.id, sizeValue, qtyValue]
-        );
-
-        await client.query('COMMIT');
-
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [req.user.userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
-            const message = `🆕 Yangi mahsulot qo'shildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lchami: ${sizeValue}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n💰 Narxi: ${formatSum(product.cost_price)} so'm\n📊 Miqdori: ${qtyValue} dona`;
+            const message = `🆕 Yangi mahsulot qo'shildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n💰 Narxi: ${formatSum(product.cost_price)} so'm\n📊 Miqdori: ${product.quantity} dona`;
 
             await pool.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
@@ -425,11 +391,8 @@ app.post('/api/products', authenticateToken, async (req, res) => {
             product: product
         });
     } catch (err) {
-        await client.query('ROLLBACK');
         console.error('Tovar qo\'shishda xatolik:', err);
         return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
-    } finally {
-        client.release();
     }
 });
 
@@ -439,20 +402,10 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 app.get('/api/products', authenticateToken, async (req, res) => {
     try {
         const products = await pool.query(
-            `SELECT 
-                p.id, p.user_id, p.category, p.name, p.name AS title, p.cost_price, p.color,
-                COALESCE(
-                    json_agg(
-                        json_build_object('size', ps.size, 'quantity', ps.quantity)
-                    ) FILTER (WHERE ps.id IS NOT NULL),
-                    '[]'
-                ) AS sizes,
-                COALESCE(SUM(ps.quantity), 0) AS total_quantity
-             FROM public.products p
-             LEFT JOIN public.product_sizes ps ON ps.product_id = p.id
-             WHERE p.user_id = $1
-             GROUP BY p.id
-             ORDER BY p.id DESC`,
+            `SELECT id, user_id, category, name, name AS title, cost_price, color, quantity
+             FROM public.products
+             WHERE user_id = $1
+             ORDER BY id DESC`,
             [req.user.userId]
         );
 
@@ -468,13 +421,13 @@ app.get('/api/products', authenticateToken, async (req, res) => {
 // ----------------------------------------------------
 app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
-    const { product_id, size, sell_quantity, selling_price } = req.body;
+    const { product_id, sell_quantity, selling_price } = req.body;
 
     const qty = parseInt(sell_quantity);
     const price = parseFloat(selling_price);
 
-    if (!product_id || !size) {
-        return res.status(400).json({ message: "Tovar va o'lchami tanlanishi shart!" });
+    if (!product_id) {
+        return res.status(400).json({ message: "Tovar tanlanishi shart!" });
     }
     if (!qty || qty <= 0) {
         return res.status(400).json({ message: "Sotuv soni to'g'ri kiritilishi shart!" });
@@ -488,7 +441,7 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
         await client.query('BEGIN');
 
         const productResult = await client.query(
-            `SELECT * FROM public.products WHERE id = $1 AND user_id = $2`,
+            `SELECT * FROM public.products WHERE id = $1 AND user_id = $2 FOR UPDATE`,
             [product_id, userId]
         );
 
@@ -499,63 +452,36 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
 
         const product = productResult.rows[0];
 
-        const sizeResult = await client.query(
-            `SELECT * FROM public.product_sizes WHERE product_id = $1 AND size = $2 FOR UPDATE`,
-            [product_id, size]
-        );
-
-        if (sizeResult.rows.length === 0) {
+        if (Number(product.quantity) < qty) {
             await client.query('ROLLBACK');
-            return res.status(404).json({ message: "Bu tovarda tanlangan o'lcham topilmadi!" });
-        }
-
-        const sizeRow = sizeResult.rows[0];
-
-        if (Number(sizeRow.quantity) < qty) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: "Omborda bu o'lchamdan yetarli tovar yo'q!" });
+            return res.status(400).json({ message: "Omborda yetarli tovar yo'q!" });
         }
 
         const costPrice = Number(product.cost_price) || 0;
         const profit = (price - costPrice) * qty;
-        const newSizeQuantity = Number(sizeRow.quantity) - qty;
+        const newQuantity = Number(product.quantity) - qty;
 
         await client.query(
-            `INSERT INTO public.sales (user_id, product_id, title, size, quantity, cost_price, selling_price, profit)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-            [userId, product.id, product.name, size, qty, costPrice, price, profit]
-        );
-
-        let sizeSoldOut = false;
-        if (newSizeQuantity === 0) {
-            await client.query(`DELETE FROM public.product_sizes WHERE id = $1`, [sizeRow.id]);
-            sizeSoldOut = true;
-        } else {
-            await client.query(`UPDATE public.product_sizes SET quantity = $1 WHERE id = $2`, [newSizeQuantity, sizeRow.id]);
-        }
-
-        const remainingSizesResult = await client.query(
-            `SELECT size, quantity FROM public.product_sizes WHERE product_id = $1 ORDER BY size`,
-            [product_id]
+            `INSERT INTO public.sales (user_id, product_id, title, quantity, cost_price, selling_price, profit)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [userId, product.id, product.name, qty, costPrice, price, profit]
         );
 
         let productFullySoldOut = false;
-        if (remainingSizesResult.rows.length === 0) {
+        if (newQuantity === 0) {
             await client.query(`DELETE FROM public.products WHERE id = $1`, [product_id]);
             productFullySoldOut = true;
+        } else {
+            await client.query(`UPDATE public.products SET quantity = $1 WHERE id = $2`, [newQuantity, product_id]);
         }
 
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
-        const remainingSizesText = remainingSizesResult.rows.length > 0
-            ? remainingSizesResult.rows.map(r => `${r.size}: ${r.quantity} dona`).join(', ')
-            : "Qolmadi (barcha o'lchamlar tugadi)";
-
-        let sellMessage = `💰 Tovar sotildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 Sotilgan o'lcham: ${size}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${formatSum(price)} so'm\n📈 Foyda: ${formatSum(profit)} so'm\n\n📋 Qolgan o'lchamlar: ${remainingSizesText}`;
+        let sellMessage = `💰 Tovar sotildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${formatSum(price)} so'm\n📈 Foyda: ${formatSum(profit)} so'm\n\n📋 Qolgan soni: ${newQuantity} dona`;
 
         if (productFullySoldOut) {
-            sellMessage = `🗑 Tovar sotilib butunlay tugadi va o'chirildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 Sotilgan o'lcham: ${size}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${formatSum(price)} so'm\n📈 Foyda: ${formatSum(profit)} so'm`;
+            sellMessage = `🗑 Tovar sotilib butunlay tugadi va o'chirildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${formatSum(price)} so'm\n📈 Foyda: ${formatSum(profit)} so'm`;
         }
 
         await client.query(
@@ -567,9 +493,7 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
 
         return res.json({
             message: "Tovar muvaffaqiyatli sotildi",
-            size,
-            newSizeQuantity: sizeSoldOut ? 0 : newSizeQuantity,
-            remainingSizes: remainingSizesResult.rows,
+            newQuantity: productFullySoldOut ? 0 : newQuantity,
             productFullySoldOut,
             profit
         });
@@ -587,10 +511,10 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
 // ----------------------------------------------------
 app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
-    const { product_id, size, remove_all, quantity_to_remove } = req.body;
+    const { product_id, remove_all, quantity_to_remove } = req.body;
 
-    if (!product_id || !size) {
-        return res.status(400).json({ message: "Tovar va o'lchami tanlanishi shart!" });
+    if (!product_id) {
+        return res.status(400).json({ message: "Tovar tanlanishi shart!" });
     }
 
     const client = await pool.connect();
@@ -598,7 +522,7 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
         await client.query('BEGIN');
 
         const productResult = await client.query(
-            `SELECT * FROM public.products WHERE id = $1 AND user_id = $2`,
+            `SELECT * FROM public.products WHERE id = $1 AND user_id = $2 FOR UPDATE`,
             [product_id, userId]
         );
 
@@ -608,53 +532,28 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
         }
 
         const product = productResult.rows[0];
-
-        const sizeResult = await client.query(
-            `SELECT * FROM public.product_sizes WHERE product_id = $1 AND size = $2 FOR UPDATE`,
-            [product_id, size]
-        );
-
-        if (sizeResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ message: "Bu tovarda tanlangan o'lcham topilmadi!" });
-        }
-
-        const sizeRow = sizeResult.rows[0];
-        const removeQty = remove_all ? Number(sizeRow.quantity) : (parseInt(quantity_to_remove) || 1);
+        const removeQty = remove_all ? Number(product.quantity) : (parseInt(quantity_to_remove) || 1);
 
         if (removeQty <= 0) {
             await client.query('ROLLBACK');
             return res.status(400).json({ message: "Olib tashlanadigan son to'g'ri kiritilishi shart!" });
         }
 
-        if (removeQty >= Number(sizeRow.quantity)) {
-            await client.query(`DELETE FROM public.product_sizes WHERE id = $1`, [sizeRow.id]);
-        } else {
-            await client.query(
-                `UPDATE public.product_sizes SET quantity = $1 WHERE id = $2`,
-                [Number(sizeRow.quantity) - removeQty, sizeRow.id]
-            );
-        }
-
-        const remainingSizesResult = await client.query(
-            `SELECT size, quantity FROM public.product_sizes WHERE product_id = $1 ORDER BY size`,
-            [product_id]
-        );
-
         let productFullySoldOut = false;
-        if (remainingSizesResult.rows.length === 0) {
+        let newQty = Number(product.quantity) - removeQty;
+
+        if (removeQty >= Number(product.quantity) || newQty <= 0) {
             await client.query(`DELETE FROM public.products WHERE id = $1`, [product_id]);
             productFullySoldOut = true;
+            newQty = 0;
+        } else {
+            await client.query(`UPDATE public.products SET quantity = $1 WHERE id = $2`, [newQty, product_id]);
         }
 
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
-        const remainingSizesText = remainingSizesResult.rows.length > 0
-            ? remainingSizesResult.rows.map(r => `${r.size}: ${r.quantity} dona`).join(', ')
-            : "Qolmadi (barcha o'lchamlar tugadi)";
-
-        const message = `📉 Mahsulotdan o'lcham olib tashlandi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📏 O'lcham: ${size} (${removeQty} dona olib tashlandi)\n\n📋 Qolgan o'lchamlar: ${remainingSizesText}`;
+        const message = `📉 Mahsulot kamaytirildi/o'chirildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📊 Olib tashlandi: ${removeQty} dona\n📋 Qolgan soni: ${newQty} dona`;
 
         await client.query(
             `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
@@ -666,7 +565,7 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
         return res.json({
             message: "Amal bajarildi",
             productFullySoldOut,
-            remainingSizes: remainingSizesResult.rows
+            remainingQuantity: newQty
         });
     } catch (err) {
         await client.query('ROLLBACK');
