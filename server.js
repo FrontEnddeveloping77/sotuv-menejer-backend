@@ -25,7 +25,7 @@ const pool = new Pool({
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_123';
 
 // ----------------------------------------------------
-// 0. KERAKLI JADVALLARNI AVTOMATIK YARATISH (sales, expenses)
+// 0. KERAKLI JADVALLARNI AVTOMATIK YARATISH (sales, expenses, notifications)
 // ----------------------------------------------------
 const ensureTables = async () => {
     try {
@@ -54,7 +54,16 @@ const ensureTables = async () => {
             );
         `);
 
-        console.log('sales va expenses jadvallari tayyor.');
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS public.notifications (
+                id SERIAL PRIMARY KEY,
+                site_login TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        `);
+
+        console.log('sales, expenses va notifications jadvallari tayyor.');
     } catch (err) {
         console.error('Jadvallarni yaratishda xatolik:', err);
     }
@@ -171,7 +180,6 @@ const authenticateToken = async (req, res, next) => {
     try {
         const decoded = jwt.decode(token, JWT_SECRET);
 
-        // Bazadan foydalanuvchining oxirgi holatini tekshiramiz (muddat o'tib ketgan bo'lishi mumkin)
         const userCheck = await pool.query(
             `SELECT is_paid, expires_at FROM public.users WHERE id = $1`,
             [decoded.userId]
@@ -183,7 +191,6 @@ const authenticateToken = async (req, res, next) => {
 
         const currentUser = userCheck.rows[0];
 
-        // Agar to'lov qilinmagan yoki muddati o'tib ketgan bo'lsa, saytdan foydalanishni to'xtatamiz
         if (!currentUser.is_paid || (currentUser.expires_at && new Date(currentUser.expires_at) < new Date())) {
             return res.status(403).json({
                 message: "To'lov muddati tugagan! To'lov qilganingizdan so'nggina saytdan foydalana olasiz."
@@ -351,6 +358,16 @@ app.post('/api/products', authenticateToken, async (req, res) => {
             ]
         );
 
+        // Bildirishnomani notifications jadvaliga yozish
+        const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [req.user.userId]);
+        if (userRow.rows.length > 0) {
+            const siteLogin = userRow.rows[0].site_login;
+            await pool.query(
+                `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
+                [siteLogin, "🆕 Yangi mahsulot qo'shildi: " + name.trim()]
+            );
+        }
+
         return res.status(201).json({
             message: "Tovar muvaffaqiyatli qo'shildi",
             product: newProduct.rows[0]
@@ -432,6 +449,16 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
             [newQuantity, product.id]
         );
 
+        // Bildirishnomani notifications jadvaliga yozish
+        const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
+        if (userRow.rows.length > 0) {
+            const siteLogin = userRow.rows[0].site_login;
+            await client.query(
+                `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
+                [siteLogin, `💰 Tovar sotildi: ${product.name} (${qty} ta)`]
+            );
+        }
+
         await client.query('COMMIT');
 
         return res.json({
@@ -471,11 +498,21 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
 
         const product = productResult.rows[0];
 
+        // site_login ni topish
+        const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
+        const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
+
         if (remove_all) {
             await pool.query(
                 `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
                 [product_id, userId]
             );
+
+            await pool.query(
+                `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
+                [siteLogin, `🗑 Tovar to'liq o'chirildi: ${product.name}`]
+            );
+
             return res.json({ message: "Tovar to'liq o'chirildi" });
         }
 
@@ -490,6 +527,12 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
                 `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
                 [product_id, userId]
             );
+
+            await pool.query(
+                `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
+                [siteLogin, `🗑 Tovar to'liq o'chirildi: ${product.name}`]
+            );
+
             return res.json({ message: "Tovar to'liq o'chirildi" });
         }
 
@@ -497,6 +540,11 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
         await pool.query(
             `UPDATE public.products SET quantity = $1 WHERE id = $2 AND user_id = $3`,
             [newQuantity, product_id, userId]
+        );
+
+        await pool.query(
+            `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
+            [siteLogin, `📉 Tovar miqdori kamaytirildi: ${product.name} (${removeQty} ta olib tashlandi)`]
         );
 
         return res.json({ message: "Tovar miqdori kamaytirildi", newQuantity });
@@ -531,6 +579,16 @@ app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
              RETURNING *`,
             [userId, title.trim(), parsedAmount, type]
         );
+
+        // Bildirishnomani notifications jadvaliga yozish
+        const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
+        if (userRow.rows.length > 0) {
+            const siteLogin = userRow.rows[0].site_login;
+            await pool.query(
+                `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
+                [siteLogin, `📉 Yangi rasxod qo'shildi: ${title.trim()} — ${parsedAmount} so'm`]
+            );
+        }
 
         return res.status(201).json({
             message: "Rasxod muvaffaqiyatli qo'shildi",
