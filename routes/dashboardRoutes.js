@@ -1,11 +1,31 @@
 const express = require('express');
 const router = express.Router();
 
+// Auth va obuna tekshiruvi (kerak bo'lsa o'zingizning auth middlewaredan foydalanasiz)
 const checkAuthAndSubscription = (req, res, next) => {
     next();
 };
 
-// 1. STATISTIKA (Rasxodlar ayrib tashlangan foyda bilan)
+// TELEGRAM BOT BILAN BOG'LANISH VA BILDIRISHNOMA YUBORISH FUNKSIYASI
+const sendTelegramNotification = async (req, message) => {
+    try {
+        const bot = req.app.get('bot'); // app.js / server.js faylingizda bot app.set('bot', bot) qilingan deb hisoblaymiz
+        const TELEGRAM_GROUP_ID = process.env.TELEGRAM_GROUP_ID || process.env.GROUP_CHAT_ID;
+
+        if (bot && TELEGRAM_GROUP_ID) {
+            await bot.sendMessage(TELEGRAM_GROUP_ID, message, { parse_mode: 'HTML' });
+        }
+    } catch (err) {
+        console.error('Telegramga xabar yuborishda xatolik:', err.message);
+    }
+};
+
+// Pul summasini formatlash (Masalan: 120 000 so'm)
+const formatSum = (sum) => {
+    return Number(sum || 0).toLocaleString('uz-UZ');
+};
+
+// 1. STATISTIKA
 router.get('/stats', checkAuthAndSubscription, async (req, res) => {
     try {
         const pool = req.app.get('pool');
@@ -13,13 +33,11 @@ router.get('/stats', checkAuthAndSubscription, async (req, res) => {
 
         if (!userId) return res.status(401).json({ message: 'Foydalanuvchi aniqlanmadi!' });
 
-        // Ombordagi tovarlar soni va qoldig'i
         const productsRes = await pool.query(
             'SELECT COUNT(*) as total_products, COALESCE(SUM(quantity), 0) as total_stock FROM products WHERE user_id = $1',
             [userId]
         );
 
-        // SOTUV FOYDALARI
         const totalSalesRes = await pool.query(
             `SELECT 
         COALESCE(SUM(COALESCE(sell_quantity, quantity, 0)), 0) as total_sold, 
@@ -56,7 +74,6 @@ router.get('/stats', checkAuthAndSubscription, async (req, res) => {
             [userId]
         );
 
-        // RASXODLAR HISOBLASH
         const dailyExpenseRes = await pool.query(
             `SELECT COALESCE(SUM(amount), 0) as daily_exp FROM expenses WHERE user_id = $1 AND DATE(created_at) = CURRENT_DATE AND expense_type = 'daily'`,
             [userId]
@@ -129,7 +146,7 @@ router.get('/products', checkAuthAndSubscription, async (req, res) => {
         if (!userId) return res.status(401).json({ message: 'Foydalanuvchi aniqlanmadi!' });
 
         const result = await pool.query(
-            'SELECT id, title, category, cost_price, color, size, quantity, description FROM products WHERE user_id = $1 ORDER BY id DESC',
+            'SELECT id, title, category, cost_price, color, quantity, description FROM products WHERE user_id = $1 ORDER BY id DESC',
             [userId]
         );
 
@@ -140,7 +157,7 @@ router.get('/products', checkAuthAndSubscription, async (req, res) => {
     }
 });
 
-// 3. TOVAR QO'SHISH (Razmersiz / Rang bilan - Avtomatik ID va Birlashtirish)
+// 3. TOVAR QO'SHISH (TELEGRAM GURUH BILDIRISHNOMASI BILAN)
 router.post('/products', checkAuthAndSubscription, async (req, res) => {
     try {
         const pool = req.app.get('pool');
@@ -157,10 +174,9 @@ router.post('/products', checkAuthAndSubscription, async (req, res) => {
 
         const parsedCostPrice = parseFloat(cost_price) || 0;
         const prodCategory = (category || 'Umumiy').trim();
-        const prodColor = color ? String(color).trim() : null; // Rang kiritilgan bo'lsa saqlaydi
+        const prodColor = color ? String(color).trim() : 'Ko‘rsatilmagan';
         const qtyToAdd = parseInt(quantity) || 1;
 
-        // Razmersiz: Faqat Nomi, Kategoriyasi, Rangi va Tannarxi bo'yicha bazani tekshiramiz
         const existingProductRes = await pool.query(
             `SELECT id, quantity FROM products 
              WHERE user_id = $1 
@@ -168,28 +184,23 @@ router.post('/products', checkAuthAndSubscription, async (req, res) => {
                AND LOWER(category) = LOWER($3) 
                AND COALESCE(LOWER(color), '') = COALESCE(LOWER($4), '') 
                AND cost_price = $5`,
-            [userId, productTitle, prodCategory, prodColor, parsedCostPrice]
+            [userId, productTitle, prodCategory, color ? prodColor : null, parsedCostPrice]
         );
 
+        let finalProductId;
+        let newStockQuantity;
+
         if (existingProductRes.rows.length > 0) {
-            // Bir xil nom va rangdagi tovar bo'lsa, mavjud ID'dagi tovar sonini oshiramiz
-            const existingId = existingProductRes.rows[0].id;
+            finalProductId = existingProductRes.rows[0].id;
             const updatedProduct = await pool.query(
                 `UPDATE products 
                  SET quantity = quantity + $1 
                  WHERE id = $2 AND user_id = $3 
                  RETURNING *`,
-                [qtyToAdd, existingId, userId]
+                [qtyToAdd, finalProductId, userId]
             );
-
-            return res.status(200).json({
-                success: true,
-                message: 'Mavjud tovar soni oshirildi',
-                product_id: existingId,
-                product: updatedProduct.rows[0],
-            });
+            newStockQuantity = updatedProduct.rows[0].quantity;
         } else {
-            // Yangi nom yoki yangi rang bo'lsa, PostgreSQL avtomatik yangi unikal ID beradi
             const insertQuery = `
                 INSERT INTO products (user_id, title, category, cost_price, price, color, quantity, description)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -202,27 +213,42 @@ router.post('/products', checkAuthAndSubscription, async (req, res) => {
                 prodCategory,
                 parsedCostPrice,
                 parsedCostPrice,
-                prodColor,
+                color ? prodColor : null,
                 qtyToAdd,
                 description || '',
             ];
 
             const newProduct = await pool.query(insertQuery, values);
-
-            return res.status(201).json({
-                success: true,
-                message: 'Yangi tovar saqlandi va unikal ID berildi',
-                product_id: newProduct.rows[0].id,
-                product: newProduct.rows[0],
-            });
+            finalProductId = newProduct.rows[0].id;
+            newStockQuantity = newProduct.rows[0].quantity;
         }
+
+        // TELEGRAM GURUHGA XABAR
+        const telegramMessage = `
+➕ <b>Yangi Tovar Qo‘shildi!</b>
+
+🆔 <b>ID:</b> #${finalProductId}
+📦 <b>Nomi:</b> ${productTitle}
+📁 <b>Kategoriya:</b> ${prodCategory}
+🎨 <b>Rangi:</b> ${prodColor}
+💵 <b>Kelgan Narxi:</b> ${formatSum(parsedCostPrice)} so'm
+🔢 <b>Qo‘shilgan Soni:</b> ${qtyToAdd} ta
+📊 <b>Umumiy Qoldiq:</b> ${newStockQuantity} ta
+        `;
+        sendTelegramNotification(req, telegramMessage);
+
+        return res.status(200).json({
+            success: true,
+            message: 'Tovar muvaffaqiyatli saqlandi',
+            product_id: finalProductId,
+        });
     } catch (err) {
         console.error('Tovar qo‘shishda xatolik:', err.message);
         res.status(500).json({ message: `Serverda xatolik: ${err.message}` });
     }
 });
 
-// 4. TOVAR SOTISH
+// 4. TOVAR SOTISH (TELEGRAM GURUH BILDIRISHNOMASI BILAN)
 router.post('/sell', checkAuthAndSubscription, async (req, res) => {
     try {
         const pool = req.app.get('pool');
@@ -237,7 +263,7 @@ router.post('/sell', checkAuthAndSubscription, async (req, res) => {
         const totalAmount = qty * sPrice;
 
         const productRes = await pool.query(
-            'SELECT id, quantity, cost_price FROM products WHERE id = $1 AND user_id = $2',
+            'SELECT id, title, category, color, quantity, cost_price FROM products WHERE id = $1 AND user_id = $2',
             [targetProductId, userId]
         );
 
@@ -266,10 +292,28 @@ router.post('/sell', checkAuthAndSubscription, async (req, res) => {
             ]
         );
 
-        await pool.query(
-            'UPDATE products SET quantity = quantity - $1 WHERE id = $2 AND user_id = $3',
+        const updatedProdRes = await pool.query(
+            'UPDATE products SET quantity = quantity - $1 WHERE id = $2 AND user_id = $3 RETURNING quantity',
             [qty, targetProductId, userId]
         );
+
+        const remainingStock = updatedProdRes.rows[0]?.quantity ?? (product.quantity - qty);
+        const profit = (sPrice - parseFloat(product.cost_price || 0)) * qty;
+
+        // TELEGRAM GURUHGA XABAR
+        const telegramMessage = `
+🛒 <b>Tovar Sotildi!</b>
+
+🆔 <b>ID:</b> #${product.id}
+📦 <b>Nomi:</b> ${product.title}
+🎨 <b>Rangi:</b> ${product.color || '-'}
+🔢 <b>Sotilgan Soni:</b> ${qty} ta
+💰 <b>Sotish Narxi:</b> ${formatSum(sPrice)} so'm
+💵 <b>Jami Summa:</b> ${formatSum(totalAmount)} so'm
+📈 <b>Sof Foyda:</b> ${formatSum(profit)} so'm
+📊 <b>Ombordagi Qoldiq:</b> ${remainingStock} ta
+        `;
+        sendTelegramNotification(req, telegramMessage);
 
         res.json({ success: true, message: 'Sotuv amalga oshirildi' });
     } catch (err) {
@@ -278,7 +322,7 @@ router.post('/sell', checkAuthAndSubscription, async (req, res) => {
     }
 });
 
-// 5. TOVARNI OLIB TASHLASH / O'CHIRISH
+// 5. TOVARNI OLIB TASHLASH / O'CHIRISH (TELEGRAM GURUH BILDIRISHNOMASI BILAN)
 router.post('/delete-product', checkAuthAndSubscription, async (req, res) => {
     try {
         const pool = req.app.get('pool');
@@ -294,7 +338,7 @@ router.post('/delete-product', checkAuthAndSubscription, async (req, res) => {
         }
 
         const productRes = await pool.query(
-            'SELECT id, quantity FROM products WHERE id = $1 AND user_id = $2',
+            'SELECT id, title, quantity FROM products WHERE id = $1 AND user_id = $2',
             [targetProductId, userId]
         );
 
@@ -302,19 +346,42 @@ router.post('/delete-product', checkAuthAndSubscription, async (req, res) => {
             return res.status(404).json({ message: 'Tovar topilmadi!' });
         }
 
-        const currentQty = parseInt(productRes.rows[0].quantity) || 0;
+        const product = productRes.rows[0];
+        const currentQty = parseInt(product.quantity) || 0;
         const qtyToRemove = parseInt(quantity_to_remove || quantityToRemove) || 0;
 
         await pool.query('UPDATE sales SET product_id = NULL WHERE product_id = $1 AND user_id = $2', [targetProductId, userId]);
 
+        let telegramMessage = '';
+
         if (remove_all || qtyToRemove >= currentQty) {
             await pool.query('DELETE FROM products WHERE id = $1 AND user_id = $2', [targetProductId, userId]);
+            telegramMessage = `
+🗑️ <b>Tovar To‘liq O‘chirildi!</b>
+
+🆔 <b>ID:</b> #${product.id}
+📦 <b>Nomi:</b> ${product.title}
+❗ Tovar ombordan to‘liq olib tashlandi.
+            `;
+            sendTelegramNotification(req, telegramMessage);
             return res.json({ success: true, message: "Tovar ombordan to'liq o'chirildi!" });
         } else {
-            await pool.query(
-                'UPDATE products SET quantity = quantity - $1 WHERE id = $2 AND user_id = $3',
+            const updatedProdRes = await pool.query(
+                'UPDATE products SET quantity = quantity - $1 WHERE id = $2 AND user_id = $3 RETURNING quantity',
                 [qtyToRemove, targetProductId, userId]
             );
+            const remaining = updatedProdRes.rows[0]?.quantity ?? (currentQty - qtyToRemove);
+
+            telegramMessage = `
+📉 <b>Tovar Soni Kamaytirildi!</b>
+
+🆔 <b>ID:</b> #${product.id}
+📦 <b>Nomi:</b> ${product.title}
+➖ <b>Olib tashlandi:</b> ${qtyToRemove} ta
+📊 <b>Qolgan Qoldiq:</b> ${remaining} ta
+            `;
+            sendTelegramNotification(req, telegramMessage);
+
             return res.json({ success: true, message: `${qtyToRemove} ta tovar ombordan olib tashlandi!` });
         }
     } catch (err) {
@@ -323,7 +390,7 @@ router.post('/delete-product', checkAuthAndSubscription, async (req, res) => {
     }
 });
 
-// 6. RASXOD QO'SHISH
+// 6. RASXOD QO'SHISH (TELEGRAM GURUH BILDIRISHNOMASI BILAN)
 router.post('/expenses', checkAuthAndSubscription, async (req, res) => {
     try {
         const pool = req.app.get('pool');
@@ -342,6 +409,16 @@ router.post('/expenses', checkAuthAndSubscription, async (req, res) => {
              VALUES ($1, $2, $3, $4, NOW())`,
             [userId, title, parseFloat(amount), expense_type]
         );
+
+        // TELEGRAM GURUHGA XABAR
+        const telegramMessage = `
+💸 <b>Yangi Rasxod Yozildi!</b>
+
+📝 <b>Sababi:</b> ${title}
+💰 <b>Summa:</b> ${formatSum(amount)} so'm
+📅 <b>Turi:</b> ${expense_type === 'daily' ? 'Kunlik' : 'Oylik'}
+        `;
+        sendTelegramNotification(req, telegramMessage);
 
         res.status(201).json({ success: true, message: 'Rasxod muvaffaqiyatli saqlandi' });
     } catch (err) {

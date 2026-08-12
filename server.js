@@ -5,7 +5,13 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jwt-simple');
 
+const TelegramBot = require('node-telegram-bot-api');
+
 const app = express();
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
+
+// App ichida bot obyektini biriktirib qo'yamiz:
+app.set('bot', bot);
 
 // Middleware
 app.use(cors());
