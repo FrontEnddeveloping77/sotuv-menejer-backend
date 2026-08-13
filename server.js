@@ -39,6 +39,7 @@ const ensureTables = async () => {
             CREATE TABLE IF NOT EXISTS public.products (
                 id SERIAL PRIMARY KEY,
                 user_id INTEGER NOT NULL,
+                local_id INTEGER NOT NULL DEFAULT 1,
                 category TEXT,
                 name TEXT NOT NULL,
                 cost_price NUMERIC NOT NULL DEFAULT 0,
@@ -48,8 +49,9 @@ const ensureTables = async () => {
             );
         `);
 
-        // Agar jadval avval bor bo'lsa va 'quantity' ustuni bo'lmasa, qo'shish
+        // Agar jadval avval bor bo'lsa va 'quantity' yoki 'local_id' ustunlari bo'lmasa, qo'shish
         await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 0;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS local_id INTEGER NOT NULL DEFAULT 1;`);
 
         await pool.query(`
             CREATE TABLE IF NOT EXISTS public.sales (
@@ -283,15 +285,15 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
                     COALESCE(SUM(quantity), 0) as "sold",
                     COALESCE(SUM(quantity * selling_price), 0) as "revenue",
                     COALESCE(SUM(profit), 0) as "grossProfit"
-                 FROM public.sales
-                 WHERE user_id = $1 AND ${salesDateFilter}`,
+                   FROM public.sales
+                   WHERE user_id = $1 AND ${salesDateFilter}`,
                 [userId]
             );
 
             const expenseResult = await pool.query(
                 `SELECT COALESCE(SUM(amount), 0) as "expense"
-                 FROM public.expenses
-                 WHERE user_id = $1 AND ${expenseDateFilter}`,
+                   FROM public.expenses
+                   WHERE user_id = $1 AND ${expenseDateFilter}`,
                 [userId]
             );
 
@@ -354,7 +356,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 6. TOVAR QO'SHISH (POST /api/products)
+// 6. TOVAR QO'SHISH (POST /api/products) - LOCAL_ID BILAN
 // ----------------------------------------------------
 app.post('/api/products', authenticateToken, async (req, res) => {
     const { category, name, cost_price, color, quantity } = req.body;
@@ -364,35 +366,52 @@ app.post('/api/products', authenticateToken, async (req, res) => {
     }
 
     const qtyValue = parseInt(quantity) || 0;
+    const userId = req.user.userId;
 
+    const client = await pool.connect();
     try {
-        const newProduct = await pool.query(
-            `INSERT INTO public.products (user_id, category, name, cost_price, color, quantity)
-             VALUES ($1, $2, $3, $4, $5, $6)
+        await client.query('BEGIN');
+
+        // Shu do'kon uchun oxirgi local_id ni topib, +1 qo'shamiz (1 dan boshlanadi)
+        const lastProduct = await client.query(
+            `SELECT local_id FROM public.products WHERE user_id = $1 ORDER BY id DESC LIMIT 1`,
+            [userId]
+        );
+
+        const nextLocalId = lastProduct.rows.length > 0 ? Number(lastProduct.rows[0].local_id) + 1 : 1;
+
+        const newProduct = await client.query(
+            `INSERT INTO public.products (user_id, local_id, category, name, cost_price, color, quantity)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING *`,
-            [req.user.userId, category || null, name.trim(), Number(cost_price), color || null, qtyValue]
+            [userId, nextLocalId, category || null, name.trim(), Number(cost_price), color || null, qtyValue]
         );
 
         const product = newProduct.rows[0];
 
-        const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [req.user.userId]);
+        const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
-            const message = `🆕 <b>YANGI MAHSULOT QO'SHILDI</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n💰 <b>Narxi:</b> ${formatSum(product.cost_price)} so'm\n📊 <b>Miqdori:</b> ${product.quantity} dona\n━━━━━━━━━━━━━━━━━━━━\n✅ Ombor yangilandi!`;
+            const message = `🆕 <b>YANGI MAHSULOT QO'SHILDI (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n💰 <b>Narxi:</b> ${formatSum(product.cost_price)} so'm\n📊 <b>Miqdori:</b> ${product.quantity} dona\n━━━━━━━━━━━━━━━━━━━━\n✅ Ombor yangilandi!`;
 
-            await pool.query(
+            await client.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
                 [siteLogin, message]
             );
         }
+
+        await client.query('COMMIT');
 
         return res.status(201).json({
             message: "Tovar muvaffaqiyatli qo'shildi",
             product: product
         });
     } catch (err) {
+        await client.query('ROLLBACK');
         console.error('Tovar qo\'shishda xatolik:', err);
         return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
+    } finally {
+        client.release();
     }
 });
 
@@ -402,7 +421,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 app.get('/api/products', authenticateToken, async (req, res) => {
     try {
         const products = await pool.query(
-            `SELECT id, user_id, category, name, name AS title, cost_price, color, quantity
+            `SELECT id, user_id, local_id, category, name, name AS title, cost_price, color, quantity
              FROM public.products
              WHERE user_id = $1
              ORDER BY id DESC`,
@@ -440,8 +459,9 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
+        // Bu yerda product_id sifatida bazadagi haqiqiy id yoki local_id kelishiga qarab tekshiramiz
         const productResult = await client.query(
-            `SELECT * FROM public.products WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+            `SELECT * FROM public.products WHERE (id = $1 OR local_id = $1) AND user_id = $2 FOR UPDATE`,
             [product_id, userId]
         );
 
@@ -469,19 +489,19 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
 
         let productFullySoldOut = false;
         if (newQuantity === 0) {
-            await client.query(`DELETE FROM public.products WHERE id = $1`, [product_id]);
+            await client.query(`DELETE FROM public.products WHERE id = $1`, [product.id]);
             productFullySoldOut = true;
         } else {
-            await client.query(`UPDATE public.products SET quantity = $1 WHERE id = $2`, [newQuantity, product_id]);
+            await client.query(`UPDATE public.products SET quantity = $1 WHERE id = $2`, [newQuantity, product.id]);
         }
 
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
-        let sellMessage = `💵 <b>TOVAR SOTILDI</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📊 <b>Sotilgan soni:</b> ${qty} dona\n💰 <b>Sotish narxi:</b> ${formatSum(price)} so'm\n📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Qolgan soni:</b> ${newQuantity} dona\n🎉 Tabriklaymiz, savdo amalga oshdi!`;
+        let sellMessage = `💵 <b>TOVAR SOTILDI (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📊 <b>Sotilgan soni:</b> ${qty} dona\n💰 <b>Sotish narxi:</b> ${formatSum(price)} so'm\n📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Qolgan soni:</b> ${newQuantity} dona\n🎉 Tabriklaymiz, savdo amalga oshdi!`;
 
         if (productFullySoldOut) {
-            sellMessage = `🎊 <b>TOVAR SOTILIB TUGADI!</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📊 <b>Sotilgan soni:</b> ${qty} dona\n💰 <b>Sotish narxi:</b> ${formatSum(price)} so'm\n📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n━━━━━━━━━━━━━━━━━━━━\n🗑 Ombordan butunlay chiqarildi (qolmadi)`;
+            sellMessage = `🎊 <b>TOVAR SOTILIB TUGADI! (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📊 <b>Sotilgan soni:</b> ${qty} dona\n💰 <b>Sotish narxi:</b> ${formatSum(price)} so'm\n📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n━━━━━━━━━━━━━━━━━━━━\n🗑 Ombordan butunlay chiqarildi (qolmadi)`;
         }
 
         await client.query(
@@ -522,7 +542,7 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
         await client.query('BEGIN');
 
         const productResult = await client.query(
-            `SELECT * FROM public.products WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+            `SELECT * FROM public.products WHERE (id = $1 OR local_id = $1) AND user_id = $2 FOR UPDATE`,
             [product_id, userId]
         );
 
@@ -543,17 +563,17 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
         let newQty = Number(product.quantity) - removeQty;
 
         if (removeQty >= Number(product.quantity) || newQty <= 0) {
-            await client.query(`DELETE FROM public.products WHERE id = $1`, [product_id]);
+            await client.query(`DELETE FROM public.products WHERE id = $1`, [product.id]);
             productFullySoldOut = true;
             newQty = 0;
         } else {
-            await client.query(`UPDATE public.products SET quantity = $1 WHERE id = $2`, [newQty, product_id]);
+            await client.query(`UPDATE public.products SET quantity = $1 WHERE id = $2`, [newQty, product.id]);
         }
 
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
-        const message = `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n➖ <b>Olib tashlandi:</b> ${removeQty} dona\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Qolgan soni:</b> ${newQty} dona`;
+        const message = `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n➖ <b>Olib tashlandi:</b> ${removeQty} dona\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Qolgan soni:</b> ${newQty} dona`;
 
         await client.query(
             `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
@@ -626,7 +646,7 @@ app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 11. BOT UCHUN DAVRLI FOYDALARNI OLISH ENDPOINTI
+// 11. BOT UCHUN DAVRLI FOYDALARni OLISH ENDPOINTI
 // ----------------------------------------------------
 app.get('/api/bot/profits/:site_login', async (req, res) => {
     const { site_login } = req.params;
@@ -646,15 +666,15 @@ app.get('/api/bot/profits/:site_login', async (req, res) => {
         const getPeriodProfit = async (salesDateFilter, expenseDateFilter) => {
             const salesResult = await pool.query(
                 `SELECT COALESCE(SUM(profit), 0) as "grossProfit"
-                 FROM public.sales
-                 WHERE user_id = $1 AND ${salesDateFilter}`,
+                   FROM public.sales
+                   WHERE user_id = $1 AND ${salesDateFilter}`,
                 [userId]
             );
 
             const expenseResult = await pool.query(
                 `SELECT COALESCE(SUM(amount), 0) as "expense"
-                 FROM public.expenses
-                 WHERE user_id = $1 AND ${expenseDateFilter}`,
+                   FROM public.expenses
+                   WHERE user_id = $1 AND ${expenseDateFilter}`,
                 [userId]
             );
 
