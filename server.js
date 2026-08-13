@@ -1,3 +1,5 @@
+// backend/server.js
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -505,73 +507,127 @@ app.get('/api/products', authenticateToken, async (req, res) => {
 // ----------------------------------------------------
 // 8. TOVARNI SOTISH (POST /api/dashboard/sell)
 // ----------------------------------------------------
+// Bu marshrut ikki xil formatni qabul qiladi:
+//   1) Eski (yagona razmer) format: { product_id, sell_quantity, selling_price }
+//   2) Yangi (bir nechta razmer / "savatcha") format: { items: [{ product_id, sell_quantity, selling_price }, ...] }
+// Har ikkala holatda ham barcha razmerlar BITTA tranzaksiya ichida, har biri
+// alohida ombor qatoridan (product_id = aniq bazadagi id) to'g'ri ayiriladi.
 app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
-    const { product_id, sell_quantity, selling_price } = req.body;
 
-    const qty = parseInt(sell_quantity);
-    const price = parseFloat(selling_price);
+    let items = Array.isArray(req.body.items) ? req.body.items : null;
+    if (!items) {
+        const { product_id, sell_quantity, selling_price } = req.body;
+        items = [{ product_id, sell_quantity, selling_price }];
+    }
 
-    if (!product_id) {
-        return res.status(400).json({ message: "Tovar tanlanishi shart!" });
+    if (items.length === 0) {
+        return res.status(400).json({ message: "Kamida bitta tovar/razmer tanlanishi shart!" });
     }
-    if (!qty || qty <= 0) {
-        return res.status(400).json({ message: "Sotuv soni to'g'ri kiritilishi shart!" });
+
+    // Har bir itemni oldindan tekshirib olamiz (haqiqiy bazaga murojaat qilishdan oldin)
+    const normalizedItems = [];
+    for (const raw of items) {
+        const product_id = raw.product_id;
+        const qty = parseInt(raw.sell_quantity);
+        const price = parseFloat(raw.selling_price);
+
+        if (!product_id) {
+            return res.status(400).json({ message: "Tovar tanlanishi shart!" });
+        }
+        if (!qty || qty <= 0) {
+            return res.status(400).json({ message: "Sotuv soni to'g'ri kiritilishi shart!" });
+        }
+        if (isNaN(price) || price < 0) {
+            return res.status(400).json({ message: "Sotish narxi to'g'ri kiritilishi shart!" });
+        }
+        normalizedItems.push({ product_id, qty, price });
     }
-    if (isNaN(price) || price < 0) {
-        return res.status(400).json({ message: "Sotish narxi to'g'ri kiritilishi shart!" });
+
+    // Bitta savdoda bir xil ombor qatorini ikki marta ko'rsatish xatolikka olib keladi
+    const uniqueIds = new Set(normalizedItems.map((it) => String(it.product_id)));
+    if (uniqueIds.size !== normalizedItems.length) {
+        return res.status(400).json({ message: "Bir xil razmer/tovar qatori ro'yxatda bir necha marta ko'rsatilgan!" });
     }
 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
 
-        // Bu yerda product_id sifatida bazadagi haqiqiy id (aniq razmer qatori) keladi.
-        // Agar local_id kelib qolsa (eski chaqiruvlar uchun moslik), eng kichik id
-        // bo'yicha bitta aniq qator tanlanadi.
-        const productResult = await client.query(
-            `SELECT * FROM public.products WHERE (id = $1 OR local_id = $1) AND user_id = $2 ORDER BY id ASC LIMIT 1 FOR UPDATE`,
-            [product_id, userId]
-        );
+        const soldLines = [];
+        let totalQty = 0;
+        let totalRevenue = 0;
+        let totalProfit = 0;
+        let anyFullySoldOut = false;
+        let firstLocalId = null;
+        let firstProductName = null;
 
-        if (productResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ message: "Tovar topilmadi!" });
-        }
+        for (const item of normalizedItems) {
+            // Bu yerda product_id sifatida bazadagi haqiqiy id (aniq razmer qatori) keladi.
+            // Agar local_id kelib qolsa (eski chaqiruvlar uchun moslik), eng kichik id
+            // bo'yicha bitta aniq qator tanlanadi.
+            const productResult = await client.query(
+                `SELECT * FROM public.products WHERE (id = $1 OR local_id = $1) AND user_id = $2 ORDER BY id ASC LIMIT 1 FOR UPDATE`,
+                [item.product_id, userId]
+            );
 
-        const product = productResult.rows[0];
+            if (productResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({ message: `Tovar topilmadi! (ID: ${item.product_id})` });
+            }
 
-        if (Number(product.quantity) < qty) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: "Omborda yetarli tovar yo'q!" });
-        }
+            const product = productResult.rows[0];
 
-        const costPrice = Number(product.cost_price) || 0;
-        const profit = (price - costPrice) * qty;
-        const newQuantity = Number(product.quantity) - qty;
+            if (Number(product.quantity) < item.qty) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    message: `Omborda yetarli tovar yo'q! (${product.name}${product.size ? ' - ' + product.size : ''}: qoldiq ${product.quantity} ta)`
+                });
+            }
 
-        await client.query(
-            `INSERT INTO public.sales (user_id, product_id, title, quantity, cost_price, selling_price, profit)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-            [userId, product.id, product.name, qty, costPrice, price, profit]
-        );
+            const costPrice = Number(product.cost_price) || 0;
+            const profit = (item.price - costPrice) * item.qty;
+            const newQuantity = Number(product.quantity) - item.qty;
 
-        let productFullySoldOut = false;
-        if (newQuantity === 0) {
-            await client.query(`DELETE FROM public.products WHERE id = $1`, [product.id]);
-            productFullySoldOut = true;
-        } else {
-            await client.query(`UPDATE public.products SET quantity = $1 WHERE id = $2`, [newQuantity, product.id]);
+            await client.query(
+                `INSERT INTO public.sales (user_id, product_id, title, quantity, cost_price, selling_price, profit)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [userId, product.id, product.name, item.qty, costPrice, item.price, profit]
+            );
+
+            let fullySoldOut = false;
+            if (newQuantity === 0) {
+                await client.query(`DELETE FROM public.products WHERE id = $1`, [product.id]);
+                fullySoldOut = true;
+                anyFullySoldOut = true;
+            } else {
+                await client.query(`UPDATE public.products SET quantity = $1 WHERE id = $2`, [newQuantity, product.id]);
+            }
+
+            if (firstLocalId === null) {
+                firstLocalId = product.local_id;
+                firstProductName = product.name;
+            }
+
+            totalQty += item.qty;
+            totalRevenue += item.price * item.qty;
+            totalProfit += profit;
+
+            soldLines.push(
+                `   • 📏 ${product.size || "Standart"}: ${item.qty} dona × ${formatSum(item.price)} so'm = ${formatSum(item.price * item.qty)} so'm${fullySoldOut ? " (🗑 tugadi)" : ` (qoldiq: ${newQuantity} ta)`}`
+            );
         }
 
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
-        let sellMessage = `💵 <b>TOVAR SOTILDI (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📏 <b>O'lchami:</b> ${product.size || "Ko'rsatilmagan"}\n📊 <b>Sotilgan soni:</b> ${qty} dona\n💰 <b>Sotish narxi:</b> ${formatSum(price)} so'm\n📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Qolgan soni:</b> ${newQuantity} dona\n🎉 Tabriklaymiz, savdo amalga oshdi!`;
+        const isMulti = normalizedItems.length > 1;
+        const titleLine = isMulti
+            ? `💵 <b>TOVAR SOTILDI — ${normalizedItems.length} TA RAZMER (#${firstLocalId})</b>`
+            : `💵 <b>TOVAR SOTILDI (#${firstLocalId})</b>`;
 
-        if (productFullySoldOut) {
-            sellMessage = `🎊 <b>TOVAR SOTILIB TUGADI! (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📏 <b>O'lchami:</b> ${product.size || "Ko'rsatilmagan"}\n📊 <b>Sotilgan soni:</b> ${qty} dona\n💰 <b>Sotish narxi:</b> ${formatSum(price)} so'm\n📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n━━━━━━━━━━━━━━━━━━━━\n🗑 Ombordan butunlay chiqarildi (qolmadi)`;
-        }
+        const sellMessage =
+            `${titleLine}\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${firstProductName}\n📏 <b>Razmerlar bo'yicha:</b>\n${soldLines.join('\n')}\n━━━━━━━━━━━━━━━━━━━━\n📊 <b>Jami sotilgan:</b> ${totalQty} dona\n💰 <b>Jami tushum:</b> ${formatSum(totalRevenue)} so'm\n📈 <b>Jami foyda:</b> ${formatSum(totalProfit)} so'm\n${anyFullySoldOut ? "🗑 Ba'zi razmerlar ombordan butunlay chiqarildi\n" : ''}🎉 Tabriklaymiz, savdo amalga oshdi!`;
 
         await client.query(
             `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
@@ -581,10 +637,12 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
         await client.query('COMMIT');
 
         return res.json({
-            message: "Tovar muvaffaqiyatli sotildi",
-            newQuantity: productFullySoldOut ? 0 : newQuantity,
-            productFullySoldOut,
-            profit
+            message: "Tovar(lar) muvaffaqiyatli sotildi",
+            totalQty,
+            totalRevenue,
+            totalProfit,
+            profit: totalProfit,
+            itemsSold: normalizedItems.length
         });
     } catch (err) {
         await client.query('ROLLBACK');
@@ -598,51 +656,114 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
 // ----------------------------------------------------
 // 9. TOVARNI OLIB TASHLASH / O'CHIRISH (POST /api/dashboard/delete-product)
 // ----------------------------------------------------
+// Ushbu marshrut ham eski (yagona razmer) formatni ({ product_id, remove_all,
+// quantity_to_remove }) va yangi ("savatcha") formatni ({ items: [...] })
+// qabul qiladi. Barcha razmerlar bitta tranzaksiya ichida qayta ishlanadi.
 app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
-    const { product_id, remove_all, quantity_to_remove } = req.body;
 
-    if (!product_id) {
-        return res.status(400).json({ message: "Tovar tanlanishi shart!" });
+    let items = Array.isArray(req.body.items) ? req.body.items : null;
+    if (!items) {
+        const { product_id, remove_all, quantity_to_remove } = req.body;
+        items = [{ product_id, remove_all, quantity_to_remove }];
+    }
+
+    if (items.length === 0) {
+        return res.status(400).json({ message: "Kamida bitta tovar/razmer tanlanishi shart!" });
+    }
+
+    for (const raw of items) {
+        if (!raw.product_id) {
+            return res.status(400).json({ message: "Tovar tanlanishi shart!" });
+        }
+    }
+
+    const uniqueIds = new Set(items.map((it) => String(it.product_id)));
+    if (uniqueIds.size !== items.length) {
+        return res.status(400).json({ message: "Bir xil razmer/tovar qatori ro'yxatda bir necha marta ko'rsatilgan!" });
     }
 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
 
-        const productResult = await client.query(
-            `SELECT * FROM public.products WHERE (id = $1 OR local_id = $1) AND user_id = $2 ORDER BY id ASC LIMIT 1 FOR UPDATE`,
-            [product_id, userId]
-        );
+        const removedLines = [];
+        let totalRemoved = 0;
+        let anyFullyRemoved = false;
+        let firstLocalId = null;
+        let firstProductName = null;
+        let firstProductCategory = null;
+        let firstProductColor = null;
+        const results = [];
 
-        if (productResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ message: "Tovar topilmadi!" });
-        }
+        for (const raw of items) {
+            const productResult = await client.query(
+                `SELECT * FROM public.products WHERE (id = $1 OR local_id = $1) AND user_id = $2 ORDER BY id ASC LIMIT 1 FOR UPDATE`,
+                [raw.product_id, userId]
+            );
 
-        const product = productResult.rows[0];
-        const removeQty = remove_all ? Number(product.quantity) : (parseInt(quantity_to_remove) || 1);
+            if (productResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({ message: `Tovar topilmadi! (ID: ${raw.product_id})` });
+            }
 
-        if (removeQty <= 0) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: "Olib tashlanadigan son to'g'ri kiritilishi shart!" });
-        }
+            const product = productResult.rows[0];
+            const removeQty = raw.remove_all ? Number(product.quantity) : (parseInt(raw.quantity_to_remove) || 1);
 
-        let productFullySoldOut = false;
-        let newQty = Number(product.quantity) - removeQty;
+            if (removeQty <= 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ message: "Olib tashlanadigan son to'g'ri kiritilishi shart!" });
+            }
+            if (removeQty > Number(product.quantity)) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    message: `Omborda yetarli tovar yo'q! (${product.name}${product.size ? ' - ' + product.size : ''}: qoldiq ${product.quantity} ta)`
+                });
+            }
 
-        if (removeQty >= Number(product.quantity) || newQty <= 0) {
-            await client.query(`DELETE FROM public.products WHERE id = $1`, [product.id]);
-            productFullySoldOut = true;
-            newQty = 0;
-        } else {
-            await client.query(`UPDATE public.products SET quantity = $1 WHERE id = $2`, [newQty, product.id]);
+            let productFullyRemoved = false;
+            let newQty = Number(product.quantity) - removeQty;
+
+            if (removeQty >= Number(product.quantity) || newQty <= 0) {
+                await client.query(`DELETE FROM public.products WHERE id = $1`, [product.id]);
+                productFullyRemoved = true;
+                anyFullyRemoved = true;
+                newQty = 0;
+            } else {
+                await client.query(`UPDATE public.products SET quantity = $1 WHERE id = $2`, [newQty, product.id]);
+            }
+
+            if (firstLocalId === null) {
+                firstLocalId = product.local_id;
+                firstProductName = product.name;
+                firstProductCategory = product.category;
+                firstProductColor = product.color;
+            }
+
+            totalRemoved += removeQty;
+            removedLines.push(
+                `   • 📏 ${product.size || "Standart"}: ${removeQty} dona olib tashlandi${productFullyRemoved ? " (🗑 butunlay tugadi)" : ` (qoldiq: ${newQty} ta)`}`
+            );
+
+            results.push({
+                product_id: product.id,
+                size: product.size,
+                removedQty: removeQty,
+                remainingQuantity: newQty,
+                productFullyRemoved
+            });
         }
 
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
-        const message = `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📏 <b>O'lchami:</b> ${product.size || "Ko'rsatilmagan"}\n➖ <b>Olib tashlandi:</b> ${removeQty} dona\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Qolgan soni:</b> ${newQty} dona`;
+        const isMulti = items.length > 1;
+        const titleLine = isMulti
+            ? `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI — ${items.length} TA RAZMER (#${firstLocalId})</b>`
+            : `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${firstLocalId})</b>`;
+
+        const message =
+            `${titleLine}\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${firstProductName}\n🗂 <b>Kategoriyasi:</b> ${firstProductCategory || "Yo'q"}\n🎨 <b>Rangi:</b> ${firstProductColor || "Yo'q"}\n📏 <b>Razmerlar bo'yicha:</b>\n${removedLines.join('\n')}\n━━━━━━━━━━━━━━━━━━━━\n➖ <b>Jami olib tashlandi:</b> ${totalRemoved} dona${anyFullyRemoved ? "\n🗑 Ba'zi razmerlar ombordan butunlay chiqarildi" : ''}`;
 
         await client.query(
             `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
@@ -652,9 +773,10 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
         await client.query('COMMIT');
 
         return res.json({
-            message: "Amal bajarildi",
-            productFullySoldOut,
-            remainingQuantity: newQty
+            message: "Amal(lar) bajarildi",
+            totalRemoved,
+            productFullySoldOut: anyFullyRemoved,
+            results
         });
     } catch (err) {
         await client.query('ROLLBACK');
