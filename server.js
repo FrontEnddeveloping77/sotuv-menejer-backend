@@ -30,13 +30,6 @@ const formatSum = (val) => {
     return Number(val).toLocaleString('uz-UZ');
 };
 
-// MUHIM: Bitta 'site_login' turli userlar tomonidan turlicha Telegram guruhlariga
-// bog'lanishi mumkin (har bir user o'z guruhiga botni qo'shib, guruhda login/parol
-// orqali bog'laydi). Shuning uchun BU YERDA (saytning backendida) qaysi guruhga
-// yuborish kerakligini hal qilib bo'lmaydi - guruh<->login bog'lanishi alohida
-// Telegram bot serverida saqlanadi. Shu sababli bu yerda faqat 'notifications'
-// jadvaliga yoziladi; xabarni tegishli guruh(lar)ga yuborish vazifasi butunlay
-// ALOHIDA Telegram bot serveriga tegishli (bu zip faylda mavjud emas).
 // ----------------------------------------------------
 // 0. KERAKLI JADVALLARNI AVTOMATIK YARATISH
 // ----------------------------------------------------
@@ -385,7 +378,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [req.user.userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
-            const message = `🆕 Yangi mahsulot qo'shildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n💰 Narxi: ${formatSum(product.cost_price)} so'm\n📊 Miqdori: ${product.quantity} dona`;
+            const message = `🆕 <b>YANGI MAHSULOT QO'SHILDI</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n💰 <b>Narxi:</b> ${formatSum(product.cost_price)} so'm\n📊 <b>Miqdori:</b> ${product.quantity} dona\n━━━━━━━━━━━━━━━━━━━━\n✅ Ombor yangilandi!`;
 
             await pool.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
@@ -485,10 +478,10 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
-        let sellMessage = `💰 Tovar sotildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${formatSum(price)} so'm\n📈 Foyda: ${formatSum(profit)} so'm\n\n📋 Qolgan soni: ${newQuantity} dona`;
+        let sellMessage = `💵 <b>TOVAR SOTILDI</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📊 <b>Sotilgan soni:</b> ${qty} dona\n💰 <b>Sotish narxi:</b> ${formatSum(price)} so'm\n📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Qolgan soni:</b> ${newQuantity} dona\n🎉 Tabriklaymiz, savdo amalga oshdi!`;
 
         if (productFullySoldOut) {
-            sellMessage = `🗑 Tovar sotilib butunlay tugadi va o'chirildi:\n📦 Nomi: ${product.name}\n🗂 Kategoriyasi: ${product.category || 'Yo\'q'}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📊 Sotilgan soni: ${qty} dona\n💵 Sotish narxi: ${formatSum(price)} so'm\n📈 Foyda: ${formatSum(profit)} so'm`;
+            sellMessage = `🎊 <b>TOVAR SOTILIB TUGADI!</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📊 <b>Sotilgan soni:</b> ${qty} dona\n💰 <b>Sotish narxi:</b> ${formatSum(price)} so'm\n📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n━━━━━━━━━━━━━━━━━━━━\n🗑 Ombordan butunlay chiqarildi (qolmadi)`;
         }
 
         await client.query(
@@ -560,7 +553,7 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
-        const message = `📉 Mahsulot kamaytirildi/o'chirildi:\n📦 Nomi: ${product.name}\n🎨 Rangi: ${product.color || 'Yo\'q'}\n📊 Olib tashlandi: ${removeQty} dona\n📋 Qolgan soni: ${newQty} dona`;
+        const message = `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n➖ <b>Olib tashlandi:</b> ${removeQty} dona\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Qolgan soni:</b> ${newQty} dona`;
 
         await client.query(
             `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
@@ -614,7 +607,7 @@ app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
         const userRow = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
-            const message = `💸 Yangi rasxod qo'shildi:\n📝 Tavsifi: ${expense.title}\n💰 Summasi: ${formatSum(expense.amount)} so'm\n📅 Sanasi: ${new Date(expense.created_at).toISOString().split('T')[0]}`;
+            const message = `💸 <b>YANGI RASXOD QO'SHILDI</b>\n━━━━━━━━━━━━━━━━━━━━\n📝 <b>Tavsifi:</b> ${expense.title}\n💰 <b>Summasi:</b> ${formatSum(expense.amount)} so'm\n📅 <b>Sanasi:</b> ${new Date(expense.created_at).toISOString().split('T')[0]}\n━━━━━━━━━━━━━━━━━━━━`;
 
             await pool.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
