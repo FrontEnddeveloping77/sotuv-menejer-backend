@@ -74,7 +74,7 @@ router.get('/stats', async (req, res) => {
     }
 });
 
-// 2. Yangi tovar qo'shish (kategoriya va rang qo'shilgan)
+// 2. Yangi tovar qo'shish
 router.post('/products', async (req, res) => {
     const pool = req.app.get('pool');
     const userId = req.user.userId;
@@ -84,12 +84,30 @@ router.post('/products', async (req, res) => {
         const store = await pool.query('SELECT id FROM public.stores WHERE user_id = $1', [userId]);
         if (store.rows.length === 0) return res.status(404).json({ message: 'Do‘kon topilmadi!' });
 
+        const storeId = store.rows[0].id;
+
+        // Yangi tovarni bazaga kiritamiz
         const newProduct = await pool.query(
             'INSERT INTO public.products (store_id, title, category, color, cost_price, selling_price, quantity) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-            [store.rows[0].id, title, category || null, color || null, cost_price, selling_price, quantity]
+            [storeId, title, category || null, color || null, cost_price, selling_price, quantity]
         );
 
-        res.json({ success: true, product: newProduct.rows[0] });
+        // Shu do'kondagi jami tovarlar sonini sanaymiz (faydalanuvchining shaxsiy tartib raqami uchun)
+        const countRes = await pool.query(
+            'SELECT COUNT(id) as product_count FROM public.products WHERE store_id = $1',
+            [storeId]
+        );
+
+        const localId = parseInt(countRes.rows[0].product_count);
+
+        res.json({
+            success: true,
+            product: {
+                ...newProduct.rows[0],
+                local_id: localId // Do'kondagi tartib raqami (1, 2, 3...)
+            },
+            message: `Tovar qo‘shildi (#${localId})`
+        });
     } catch (err) {
         console.error('Tovar qo‘shish xatosi:', err);
         res.status(500).json({ message: 'Serverda xatolik yuz berdi' });
