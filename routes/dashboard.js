@@ -1,5 +1,36 @@
 const express = require('express');
 const router = express.Router();
+const axios = require('axios'); // Telegram Bot API'ga HTTP so'rov yuborish uchun
+
+// Telegram Bot Token (ENV faylingizdan olinadi)
+const BOT_TOKEN = process.env.BOT_TOKEN;
+
+/**
+ * Telegram guruhiga sotuv bildirishnomasini yuboruvchi yordamchi funksiya
+ */
+const sendTelegramNotification = async (chatId, saleData) => {
+    if (!chatId || !BOT_TOKEN) return;
+
+    const message =
+        `🛒 **YANGI SOTUV BAJARILDI!**
+
+📦 **Tovar:** ${saleData.title}
+🔢 **Soni:** ${saleData.quantity} dona
+💰 **Sotuv narxi:** ${Number(saleData.sale_price).toLocaleString('uz-UZ')} so'm
+💵 **Jami summa:** ${Number(saleData.total_amount).toLocaleString('uz-UZ')} so'm
+📈 **Foyda:** ${Number(saleData.profit).toLocaleString('uz-UZ')} so'm
+⏰ **Vaqt:** ${new Date().toLocaleString('uz-UZ')}`;
+
+    try {
+        await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            chat_id: chatId,
+            text: message,
+            parse_mode: 'Markdown'
+        });
+    } catch (err) {
+        console.error('Telegramga xabar yuborishda xatolik:', err?.response?.data || err.message);
+    }
+};
 
 // 1. Do'kon statistikasini olish
 router.get('/stats', async (req, res) => {
@@ -7,11 +38,11 @@ router.get('/stats', async (req, res) => {
     const userId = req.user.userId;
 
     try {
-        let storeResult = await pool.query('SELECT id, name FROM public.stores WHERE user_id = $1', [userId]);
+        let storeResult = await pool.query('SELECT id, name, telegram_group_id FROM public.stores WHERE user_id = $1', [userId]);
 
         if (storeResult.rows.length === 0) {
             storeResult = await pool.query(
-                'INSERT INTO public.stores (user_id, name) VALUES ($1, $2) RETURNING id, name',
+                'INSERT INTO public.stores (user_id, name) VALUES ($1, $2) RETURNING id, name, telegram_group_id',
                 [userId, 'Mening Do‘konim']
             );
         }
@@ -30,6 +61,7 @@ router.get('/stats', async (req, res) => {
 
         res.json({
             storeName: storeResult.rows[0].name,
+            telegramGroupId: storeResult.rows[0].telegram_group_id,
             totalProducts: parseInt(productsStats.rows[0].total_products),
             totalStock: parseInt(productsStats.rows[0].total_stock),
             totalSold: parseInt(salesStats.rows[0].total_sold),
@@ -42,19 +74,19 @@ router.get('/stats', async (req, res) => {
     }
 });
 
-// 2. Yangi tovar qo'shish
+// 2. Yangi tovar qo'shish (kategoriya va rang qo'shilgan)
 router.post('/products', async (req, res) => {
     const pool = req.app.get('pool');
     const userId = req.user.userId;
-    const { title, cost_price, selling_price, quantity } = req.body;
+    const { title, category, color, cost_price, selling_price, quantity } = req.body;
 
     try {
         const store = await pool.query('SELECT id FROM public.stores WHERE user_id = $1', [userId]);
         if (store.rows.length === 0) return res.status(404).json({ message: 'Do‘kon topilmadi!' });
 
         const newProduct = await pool.query(
-            'INSERT INTO public.products (store_id, title, cost_price, selling_price, quantity) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-            [store.rows[0].id, title, cost_price, selling_price, quantity]
+            'INSERT INTO public.products (store_id, title, category, color, cost_price, selling_price, quantity) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+            [store.rows[0].id, title, category || null, color || null, cost_price, selling_price, quantity]
         );
 
         res.json({ success: true, product: newProduct.rows[0] });
@@ -64,7 +96,7 @@ router.post('/products', async (req, res) => {
     }
 });
 
-// 3. Barcha tovarlar ro'yxatini olish
+// 3. Barcha tovarlar ro'yxatini olish (Har bir user do'koni bo'yicha filterlangan)
 router.get('/products', async (req, res) => {
     const pool = req.app.get('pool');
     const userId = req.user.userId;
@@ -85,15 +117,18 @@ router.get('/products', async (req, res) => {
     }
 });
 
-// 4. Sotuv kiritish
+// 4. Sotuv kiritish va Telegram guruhiga xabar yuborish
 router.post('/sell', async (req, res) => {
     const pool = req.app.get('pool');
     const userId = req.user.userId;
     const { product_id, sell_quantity } = req.body;
 
     try {
-        const store = await pool.query('SELECT id FROM public.stores WHERE user_id = $1', [userId]);
+        const store = await pool.query('SELECT id, telegram_group_id FROM public.stores WHERE user_id = $1', [userId]);
+        if (store.rows.length === 0) return res.status(404).json({ message: 'Do‘kon topilmadi!' });
+
         const storeId = store.rows[0].id;
+        const telegramGroupId = store.rows[0].telegram_group_id;
 
         const productRes = await pool.query('SELECT * FROM public.products WHERE id = $1 AND store_id = $2', [product_id, storeId]);
         if (productRes.rows.length === 0) return res.status(404).json({ message: 'Tovar topilmadi!' });
@@ -116,6 +151,17 @@ router.post('/sell', async (req, res) => {
             'UPDATE public.products SET quantity = quantity - $1 WHERE id = $2',
             [sell_quantity, product_id]
         );
+
+        // Telegram guruh biriktirilgan bo'lsa bildirishnoma yuboriladi
+        if (telegramGroupId) {
+            await sendTelegramNotification(telegramGroupId, {
+                title: product.title,
+                quantity: sell_quantity,
+                sale_price: product.selling_price,
+                total_amount: totalAmount,
+                profit: profit
+            });
+        }
 
         res.json({ success: true, message: 'Sotuv amalga oshirildi!' });
     } catch (err) {
