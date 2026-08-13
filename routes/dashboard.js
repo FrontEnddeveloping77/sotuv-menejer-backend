@@ -1,13 +1,9 @@
 const express = require('express');
 const router = express.Router();
-const axios = require('axios'); // Telegram Bot API'ga HTTP so'rov yuborish uchun
+const axios = require('axios');
 
-// Telegram Bot Token (ENV faylingizdan olinadi)
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
-/**
- * Telegram guruhiga sotuv bildirishnomasini yuboruvchi yordamchi funksiya
- */
 const sendTelegramNotification = async (chatId, saleData) => {
     if (!chatId || !BOT_TOKEN) return;
 
@@ -74,11 +70,13 @@ router.get('/stats', async (req, res) => {
     }
 });
 
-// 2. Yangi tovar qo'shish
+// 2. Yangi tovar qo'shish (Xabarda shaxsiy tartib raqamini ko'rsatish)
 router.post('/products', async (req, res) => {
     const pool = req.app.get('pool');
     const userId = req.user.userId;
-    const { title, category, color, cost_price, selling_price, quantity } = req.body;
+    const { title, name, category, color, cost_price, selling_price, quantity } = req.body;
+
+    const productTitle = title || name; // frontend'dan name kelishi ham mumkin
 
     try {
         const store = await pool.query('SELECT id FROM public.stores WHERE user_id = $1', [userId]);
@@ -86,27 +84,27 @@ router.post('/products', async (req, res) => {
 
         const storeId = store.rows[0].id;
 
-        // Yangi tovarni bazaga kiritamiz
         const newProduct = await pool.query(
             'INSERT INTO public.products (store_id, title, category, color, cost_price, selling_price, quantity) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-            [storeId, title, category || null, color || null, cost_price, selling_price, quantity]
+            [storeId, productTitle, category || null, color || null, cost_price || 0, selling_price || 0, quantity || 1]
         );
 
-        // Shu do'kondagi jami tovarlar sonini sanaymiz (faydalanuvchining shaxsiy tartib raqami uchun)
+        // Shu foydalanuvchining shaxsiy tovarlar sonini sanaymiz
         const countRes = await pool.query(
-            'SELECT COUNT(id) as product_count FROM public.products WHERE store_id = $1',
+            'SELECT COUNT(id) as total_count FROM public.products WHERE store_id = $1',
             [storeId]
         );
 
-        const localId = parseInt(countRes.rows[0].product_count);
+        const localId = parseInt(countRes.rows[0].total_count);
 
         res.json({
             success: true,
             product: {
                 ...newProduct.rows[0],
-                local_id: localId // Do'kondagi tartib raqami (1, 2, 3...)
+                local_id: localId
             },
-            message: `Tovar qo‘shildi (#${localId})`
+            local_id: localId,
+            message: `Tovar saqlandi! Biriktirilgan ID: #${localId}`
         });
     } catch (err) {
         console.error('Tovar qo‘shish xatosi:', err);
@@ -114,7 +112,7 @@ router.post('/products', async (req, res) => {
     }
 });
 
-// 3. Barcha tovarlar ro'yxatini olish (Har bir user do'koni bo'yicha filterlangan)
+// 3. Barcha tovarlar ro'yxatini olish (ORDER BY id ASC - o'sish tartibida)
 router.get('/products', async (req, res) => {
     const pool = req.app.get('pool');
     const userId = req.user.userId;
@@ -123,8 +121,9 @@ router.get('/products', async (req, res) => {
         const store = await pool.query('SELECT id FROM public.stores WHERE user_id = $1', [userId]);
         if (store.rows.length === 0) return res.json([]);
 
+        // ORDER BY id ASC qilindi: Eng yangi qo'shilgan tovar ro'yxatning O'XIRIGA tushadi
         const products = await pool.query(
-            'SELECT * FROM public.products WHERE store_id = $1 ORDER BY id DESC',
+            'SELECT * FROM public.products WHERE store_id = $1 ORDER BY id ASC',
             [store.rows[0].id]
         );
 
@@ -135,7 +134,7 @@ router.get('/products', async (req, res) => {
     }
 });
 
-// 4. Sotuv kiritish va Telegram guruhiga xabar yuborish
+// 4. Sotuv kiritish
 router.post('/sell', async (req, res) => {
     const pool = req.app.get('pool');
     const userId = req.user.userId;
@@ -170,7 +169,6 @@ router.post('/sell', async (req, res) => {
             [sell_quantity, product_id]
         );
 
-        // Telegram guruh biriktirilgan bo'lsa bildirishnoma yuboriladi
         if (telegramGroupId) {
             await sendTelegramNotification(telegramGroupId, {
                 title: product.title,
