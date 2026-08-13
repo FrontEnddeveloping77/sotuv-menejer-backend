@@ -248,7 +248,6 @@ router.post('/products', checkAuthAndSubscription, async (req, res) => {
     }
 });
 
-// 4. TOVAR SOTISH (TELEGRAM GURUH BILDIRISHNOMASI BILAN)
 router.post('/sell', checkAuthAndSubscription, async (req, res) => {
     try {
         const pool = req.app.get('pool');
@@ -262,8 +261,9 @@ router.post('/sell', checkAuthAndSubscription, async (req, res) => {
         const sPrice = parseFloat(selling_price || sellPrice) || 0;
         const totalAmount = qty * sPrice;
 
+        // 1. SELECT so'roviga 'size' qo'shildi
         const productRes = await pool.query(
-            'SELECT id, title, category, color, quantity, cost_price FROM products WHERE id = $1 AND user_id = $2',
+            'SELECT id, title, category, color, size, quantity, cost_price FROM products WHERE id = $1 AND user_id = $2',
             [targetProductId, userId]
         );
 
@@ -300,13 +300,14 @@ router.post('/sell', checkAuthAndSubscription, async (req, res) => {
         const remainingStock = updatedProdRes.rows[0]?.quantity ?? (product.quantity - qty);
         const profit = (sPrice - parseFloat(product.cost_price || 0)) * qty;
 
-        // TELEGRAM GURUHGA XABAR
+        // 2. TELEGRAM GURUHGA XABAR (Razmer qismi qo'shildi)
         const telegramMessage = `
 🛒 <b>Tovar Sotildi!</b>
 
 🆔 <b>ID:</b> #${product.id}
 📦 <b>Nomi:</b> ${product.title}
 🎨 <b>Rangi:</b> ${product.color || '-'}
+📏 <b>Razmeri:</b> ${product.size || '-'}
 🔢 <b>Sotilgan Soni:</b> ${qty} ta
 💰 <b>Sotish Narxi:</b> ${formatSum(sPrice)} so'm
 💵 <b>Jami Summa:</b> ${formatSum(totalAmount)} so'm
@@ -337,8 +338,9 @@ router.post('/delete-product', checkAuthAndSubscription, async (req, res) => {
             return res.status(400).json({ message: 'Tovar tanlanmagan!' });
         }
 
+        // 1. SELECT so'roviga 'color' va 'size' qo'shildi
         const productRes = await pool.query(
-            'SELECT id, title, quantity FROM products WHERE id = $1 AND user_id = $2',
+            'SELECT id, title, color, size, quantity FROM products WHERE id = $1 AND user_id = $2',
             [targetProductId, userId]
         );
 
@@ -356,11 +358,15 @@ router.post('/delete-product', checkAuthAndSubscription, async (req, res) => {
 
         if (remove_all || qtyToRemove >= currentQty) {
             await pool.query('DELETE FROM products WHERE id = $1 AND user_id = $2', [targetProductId, userId]);
+
+            // 2. To'liq o'chirilganda Telegram xabariga razmer qo'shildi
             telegramMessage = `
 🗑️ <b>Tovar To‘liq O‘chirildi!</b>
 
 🆔 <b>ID:</b> #${product.id}
 📦 <b>Nomi:</b> ${product.title}
+🎨 <b>Rangi:</b> ${product.color || '-'}
+📏 <b>Razmeri:</b> ${product.size || '-'}
 ❗ Tovar ombordan to‘liq olib tashlandi.
             `;
             sendTelegramNotification(req, telegramMessage);
@@ -372,11 +378,14 @@ router.post('/delete-product', checkAuthAndSubscription, async (req, res) => {
             );
             const remaining = updatedProdRes.rows[0]?.quantity ?? (currentQty - qtyToRemove);
 
+            // 3. Soni kamaytirilganda Telegram xabariga razmer qo'shildi
             telegramMessage = `
 📉 <b>Tovar Soni Kamaytirildi!</b>
 
 🆔 <b>ID:</b> #${product.id}
 📦 <b>Nomi:</b> ${product.title}
+🎨 <b>Rangi:</b> ${product.color || '-'}
+📏 <b>Razmeri:</b> ${product.size || '-'}
 ➖ <b>Olib tashlandi:</b> ${qtyToRemove} ta
 📊 <b>Qolgan Qoldiq:</b> ${remaining} ta
             `;

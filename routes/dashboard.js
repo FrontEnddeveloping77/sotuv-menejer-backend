@@ -11,6 +11,7 @@ const sendTelegramNotification = async (chatId, saleData) => {
         `🛒 **YANGI SOTUV BAJARILDI!**
 
 📦 **Tovar:** ${saleData.title}
+📏 **Razmer:** ${saleData.size || "Ko'rsatilmagan"}
 🔢 **Soni:** ${saleData.quantity} dona
 💰 **Sotuv narxi:** ${Number(saleData.sale_price).toLocaleString('uz-UZ')} so'm
 💵 **Jami summa:** ${Number(saleData.total_amount).toLocaleString('uz-UZ')} so'm
@@ -70,13 +71,13 @@ router.get('/stats', async (req, res) => {
     }
 });
 
-// 2. Yangi tovar qo'shish (Xabarda shaxsiy tartib raqamini ko'rsatish)
+// 2. Yangi tovar qo'shish (Razmer bilan birga)
 router.post('/products', async (req, res) => {
     const pool = req.app.get('pool');
     const userId = req.user.userId;
-    const { title, name, category, color, cost_price, selling_price, quantity } = req.body;
+    const { title, name, category, color, size, cost_price, selling_price, quantity } = req.body;
 
-    const productTitle = title || name; // frontend'dan name kelishi ham mumkin
+    const productTitle = title || name;
 
     try {
         const store = await pool.query('SELECT id FROM public.stores WHERE user_id = $1', [userId]);
@@ -84,12 +85,12 @@ router.post('/products', async (req, res) => {
 
         const storeId = store.rows[0].id;
 
+        // INSERT so'roviga size qo'shildi
         const newProduct = await pool.query(
-            'INSERT INTO public.products (store_id, title, category, color, cost_price, selling_price, quantity) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-            [storeId, productTitle, category || null, color || null, cost_price || 0, selling_price || 0, quantity || 1]
+            'INSERT INTO public.products (store_id, title, category, color, size, cost_price, selling_price, quantity) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+            [storeId, productTitle, category || null, color || null, size || null, cost_price || 0, selling_price || 0, quantity || 1]
         );
 
-        // Shu foydalanuvchining shaxsiy tovarlar sonini sanaymiz
         const countRes = await pool.query(
             'SELECT COUNT(id) as total_count FROM public.products WHERE store_id = $1',
             [storeId]
@@ -104,7 +105,7 @@ router.post('/products', async (req, res) => {
                 local_id: localId
             },
             local_id: localId,
-            message: `Tovar saqlandi! Biriktirilgan ID: #${localId}`
+            message: `Tovar saqlandi! Razmer: ${size || "Yo'q"}, ID: #${localId}`
         });
     } catch (err) {
         console.error('Tovar qo‘shish xatosi:', err);
@@ -177,7 +178,8 @@ router.post('/sell', async (req, res) => {
                 quantity: sell_quantity,
                 sale_price: actualSellPrice,
                 total_amount: totalAmount,
-                profit: profit
+                profit: profit,
+                size: product.size
             });
         }
 
