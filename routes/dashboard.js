@@ -138,7 +138,7 @@ router.get('/products', async (req, res) => {
 router.post('/sell', async (req, res) => {
     const pool = req.app.get('pool');
     const userId = req.user.userId;
-    const { product_id, sell_quantity } = req.body;
+    const { product_id, sell_quantity, selling_price } = req.body;
 
     try {
         const store = await pool.query('SELECT id, telegram_group_id FROM public.stores WHERE user_id = $1', [userId]);
@@ -156,12 +156,14 @@ router.post('/sell', async (req, res) => {
             return res.status(400).json({ message: 'Omborda yetarli tovar yo‘q!' });
         }
 
-        const totalAmount = product.selling_price * sell_quantity;
-        const profit = (product.selling_price - product.cost_price) * sell_quantity;
+        // Kiritilgan custom sotish narxi yoki mahsulotning standart sotuv narxi ishlatiladi
+        const actualSellPrice = Number(selling_price) || Number(product.selling_price);
+        const totalAmount = actualSellPrice * sell_quantity;
+        const profit = (actualSellPrice - product.cost_price) * sell_quantity;
 
         await pool.query(
             'INSERT INTO public.sales (store_id, product_id, quantity, sale_price, cost_price, total_amount, profit) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-            [storeId, product_id, sell_quantity, product.selling_price, product.cost_price, totalAmount, profit]
+            [storeId, product_id, sell_quantity, actualSellPrice, product.cost_price, totalAmount, profit]
         );
 
         await pool.query(
@@ -173,7 +175,7 @@ router.post('/sell', async (req, res) => {
             await sendTelegramNotification(telegramGroupId, {
                 title: product.title,
                 quantity: sell_quantity,
-                sale_price: product.selling_price,
+                sale_price: actualSellPrice,
                 total_amount: totalAmount,
                 profit: profit
             });
