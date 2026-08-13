@@ -52,6 +52,10 @@ const ensureTables = async () => {
         // Agar jadval avval bor bo'lsa va 'quantity' yoki 'local_id' ustunlari bo'lmasa, qo'shish
         await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 0;`);
         await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS local_id INTEGER NOT NULL DEFAULT 1;`);
+        // RAZMER (SIZE) ustuni: bir xil tovarning turli o'lchamlari alohida qator sifatida saqlanadi,
+        // lekin bir xil local_id orqali "bitta tovar" sifatida guruhlanadi.
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS size TEXT;`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_user_local ON public.products(user_id, local_id);`);
 
         await pool.query(`
             CREATE TABLE IF NOT EXISTS public.sales (
@@ -272,7 +276,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 
         const productStats = await pool.query(
             `SELECT 
-                COUNT(id) as "totalProducts",
+                COUNT(DISTINCT local_id) as "totalProducts",
                 COALESCE(SUM(quantity), 0) as "totalStock"
              FROM public.products
              WHERE user_id = $1`,
@@ -356,17 +360,39 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 6. TOVAR QO'SHISH (POST /api/products) - LOCAL_ID BILAN
+// 6. TOVAR QO'SHISH (POST /api/products) - LOCAL_ID VA RAZMERLAR BILAN
 // ----------------------------------------------------
+// Foydalanuvchi bir nechta razmer kiritishi mumkin (masalan "39, 40, 41, 42, 43")
+// va umumiy sonni kiritadi (masalan 10 ta). Bu funksiya umumiy sonni har bir
+// razmerga avtomatik ravishda (imkon qadar teng) taqsimlaydi va har bir razmer
+// uchun alohida qator (row) yaratadi, lekin barchasi bitta local_id ostida
+// "bitta tovar" sifatida guruhlanadi.
 app.post('/api/products', authenticateToken, async (req, res) => {
-    const { category, name, cost_price, color, quantity } = req.body;
+    const { category, name, cost_price, color, quantity, sizes } = req.body;
 
     if (!name || cost_price === undefined) {
         return res.status(400).json({ message: "Tovar nomi va kelgan narxi kiritilishi shart!" });
     }
 
-    const qtyValue = parseInt(quantity) || 0;
+    const totalQty = parseInt(quantity) || 0;
+    if (totalQty <= 0) {
+        return res.status(400).json({ message: "Soni to'g'ri (0 dan katta) kiritilishi shart!" });
+    }
+
     const userId = req.user.userId;
+
+    // Razmerlar satrini tozalab, takrorlanmas ro'yxatga aylantiramiz
+    let sizeList = [];
+    if (sizes && typeof sizes === 'string' && sizes.trim() !== '') {
+        const seen = new Set();
+        sizes.split(',').forEach((s) => {
+            const clean = s.trim();
+            if (clean.length > 0 && !seen.has(clean.toLowerCase())) {
+                seen.add(clean.toLowerCase());
+                sizeList.push(clean);
+            }
+        });
+    }
 
     const client = await pool.connect();
     try {
@@ -380,19 +406,50 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 
         const nextLocalId = lastProduct.rows.length > 0 ? Number(lastProduct.rows[0].local_id) + 1 : 1;
 
-        const newProduct = await client.query(
-            `INSERT INTO public.products (user_id, local_id, category, name, cost_price, color, quantity)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             RETURNING *`,
-            [userId, nextLocalId, category || null, name.trim(), Number(cost_price), color || null, qtyValue]
-        );
+        const insertedRows = [];
 
-        const product = newProduct.rows[0];
+        if (sizeList.length === 0) {
+            // Razmersiz tovar - bitta qator, butun son shu qatorga yoziladi
+            const inserted = await client.query(
+                `INSERT INTO public.products (user_id, local_id, category, name, cost_price, color, size, quantity)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 RETURNING *`,
+                [userId, nextLocalId, category || null, name.trim(), Number(cost_price), color || null, null, totalQty]
+            );
+            insertedRows.push(inserted.rows[0]);
+        } else {
+            // RAZMERLARGA AVTOMATIK TAQSIMLASH LOGIKASI
+            // Masalan: 5 ta razmer, 10 ta son -> har biriga 2 tadan
+            // Qoldiq bo'lsa (masalan 11 ta / 5 razmer = 2 qoldiq 1), qoldiq birinchi
+            // razmerlardan boshlab birma-bir qo'shiladi (2,2,2,2,3 emas -> 3,2,2,2,2)
+            const n = sizeList.length;
+            const base = Math.floor(totalQty / n);
+            const remainder = totalQty % n;
+
+            for (let i = 0; i < n; i++) {
+                const sizeQty = base + (i < remainder ? 1 : 0);
+                const inserted = await client.query(
+                    `INSERT INTO public.products (user_id, local_id, category, name, cost_price, color, size, quantity)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     RETURNING *`,
+                    [userId, nextLocalId, category || null, name.trim(), Number(cost_price), color || null, sizeList[i], sizeQty]
+                );
+                insertedRows.push(inserted.rows[0]);
+            }
+        }
 
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         if (userRow.rows.length > 0) {
             const siteLogin = userRow.rows[0].site_login;
-            const message = `🆕 <b>YANGI MAHSULOT QO'SHILDI (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n💰 <b>Narxi:</b> ${formatSum(product.cost_price)} so'm\n📊 <b>Miqdori:</b> ${product.quantity} dona\n━━━━━━━━━━━━━━━━━━━━\n✅ Ombor yangilandi!`;
+            const first = insertedRows[0];
+
+            let sizesBlock = '';
+            if (sizeList.length > 0) {
+                const lines = insertedRows.map((r) => `   • ${r.size}: ${r.quantity} dona`).join('\n');
+                sizesBlock = `\n📏 <b>Razmerlar bo'yicha taqsimot:</b>\n${lines}`;
+            }
+
+            const message = `🆕 <b>YANGI MAHSULOT QO'SHILDI (#${nextLocalId})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${first.name}\n🎨 <b>Rangi:</b> ${first.color || "Yo'q"}\n🗂 <b>Kategoriyasi:</b> ${first.category || "Yo'q"}\n💰 <b>Narxi:</b> ${formatSum(first.cost_price)} so'm\n📊 <b>Umumiy miqdori:</b> ${totalQty} dona${sizesBlock}\n━━━━━━━━━━━━━━━━━━━━\n✅ Ombor yangilandi!`;
 
             await client.query(
                 `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
@@ -403,8 +460,12 @@ app.post('/api/products', authenticateToken, async (req, res) => {
         await client.query('COMMIT');
 
         return res.status(201).json({
-            message: "Tovar muvaffaqiyatli qo'shildi",
-            product: product
+            message: sizeList.length > 0
+                ? `Tovar saqlandi! ${sizeList.length} ta razmer bo'yicha taqsimlandi (ID: #${nextLocalId})`
+                : `Tovar saqlandi! ID: #${nextLocalId}`,
+            product: insertedRows[0],
+            products: insertedRows,
+            local_id: nextLocalId
         });
     } catch (err) {
         await client.query('ROLLBACK');
@@ -420,11 +481,17 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 // ----------------------------------------------------
 app.get('/api/products', authenticateToken, async (req, res) => {
     try {
+        // Eng yangi qo'shilgan tovar (local_id) tepada turadi, har bir tovar ichida
+        // esa razmerlar o'sish tartibida (raqamli bo'lsa raqam bo'yicha, aks holda
+        // alifbo bo'yicha) tartiblanadi - shu bilan interfeysda chiroyli guruhlanadi.
         const products = await pool.query(
-            `SELECT id, user_id, local_id, category, name, name AS title, cost_price, color, quantity
+            `SELECT id, user_id, local_id, category, name, name AS title, cost_price, color, size, quantity
              FROM public.products
              WHERE user_id = $1
-             ORDER BY id DESC`,
+             ORDER BY local_id DESC,
+                      CASE WHEN size ~ '^[0-9]+$' THEN size::int END ASC NULLS LAST,
+                      size ASC NULLS LAST,
+                      id ASC`,
             [req.user.userId]
         );
 
@@ -459,9 +526,11 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // Bu yerda product_id sifatida bazadagi haqiqiy id yoki local_id kelishiga qarab tekshiramiz
+        // Bu yerda product_id sifatida bazadagi haqiqiy id (aniq razmer qatori) keladi.
+        // Agar local_id kelib qolsa (eski chaqiruvlar uchun moslik), eng kichik id
+        // bo'yicha bitta aniq qator tanlanadi.
         const productResult = await client.query(
-            `SELECT * FROM public.products WHERE (id = $1 OR local_id = $1) AND user_id = $2 FOR UPDATE`,
+            `SELECT * FROM public.products WHERE (id = $1 OR local_id = $1) AND user_id = $2 ORDER BY id ASC LIMIT 1 FOR UPDATE`,
             [product_id, userId]
         );
 
@@ -498,10 +567,10 @@ app.post('/api/dashboard/sell', authenticateToken, async (req, res) => {
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
-        let sellMessage = `💵 <b>TOVAR SOTILDI (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📊 <b>Sotilgan soni:</b> ${qty} dona\n💰 <b>Sotish narxi:</b> ${formatSum(price)} so'm\n📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Qolgan soni:</b> ${newQuantity} dona\n🎉 Tabriklaymiz, savdo amalga oshdi!`;
+        let sellMessage = `💵 <b>TOVAR SOTILDI (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📏 <b>O'lchami:</b> ${product.size || "Ko'rsatilmagan"}\n📊 <b>Sotilgan soni:</b> ${qty} dona\n💰 <b>Sotish narxi:</b> ${formatSum(price)} so'm\n📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Qolgan soni:</b> ${newQuantity} dona\n🎉 Tabriklaymiz, savdo amalga oshdi!`;
 
         if (productFullySoldOut) {
-            sellMessage = `🎊 <b>TOVAR SOTILIB TUGADI! (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📊 <b>Sotilgan soni:</b> ${qty} dona\n💰 <b>Sotish narxi:</b> ${formatSum(price)} so'm\n📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n━━━━━━━━━━━━━━━━━━━━\n🗑 Ombordan butunlay chiqarildi (qolmadi)`;
+            sellMessage = `🎊 <b>TOVAR SOTILIB TUGADI! (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🗂 <b>Kategoriyasi:</b> ${product.category || "Yo'q"}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📏 <b>O'lchami:</b> ${product.size || "Ko'rsatilmagan"}\n📊 <b>Sotilgan soni:</b> ${qty} dona\n💰 <b>Sotish narxi:</b> ${formatSum(price)} so'm\n📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n━━━━━━━━━━━━━━━━━━━━\n🗑 Ombordan butunlay chiqarildi (qolmadi)`;
         }
 
         await client.query(
@@ -542,7 +611,7 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
         await client.query('BEGIN');
 
         const productResult = await client.query(
-            `SELECT * FROM public.products WHERE (id = $1 OR local_id = $1) AND user_id = $2 FOR UPDATE`,
+            `SELECT * FROM public.products WHERE (id = $1 OR local_id = $1) AND user_id = $2 ORDER BY id ASC LIMIT 1 FOR UPDATE`,
             [product_id, userId]
         );
 
@@ -573,7 +642,7 @@ app.post('/api/dashboard/delete-product', authenticateToken, async (req, res) =>
         const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
         const siteLogin = userRow.rows.length > 0 ? userRow.rows[0].site_login : 'unknown';
 
-        const message = `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n➖ <b>Olib tashlandi:</b> ${removeQty} dona\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Qolgan soni:</b> ${newQty} dona`;
+        const message = `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${product.local_id})</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Nomi:</b> ${product.name}\n🎨 <b>Rangi:</b> ${product.color || "Yo'q"}\n📏 <b>O'lchami:</b> ${product.size || "Ko'rsatilmagan"}\n➖ <b>Olib tashlandi:</b> ${removeQty} dona\n━━━━━━━━━━━━━━━━━━━━\n📋 <b>Qolgan soni:</b> ${newQty} dona`;
 
         await client.query(
             `INSERT INTO public.notifications (site_login, message) VALUES ($1, $2)`,
