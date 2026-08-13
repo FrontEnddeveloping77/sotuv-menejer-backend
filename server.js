@@ -6,6 +6,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jwt-simple');
+const { randomUUID } = require('crypto');
 
 const app = express();
 
@@ -52,11 +53,29 @@ const ensureTables = async () => {
         `);
 
         // Agar jadval avval bor bo'lsa va 'quantity' yoki 'local_id' ustunlari bo'lmasa, qo'shish
+        // Telegram guruh integratsiyasi: chat_id sayt tomonidan kiritilmaydi.
+        // Telegram bot login+parol tasdiqlanganda bu ustunni avtomatik to'ldiradi.
+        await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS linked_group_chat_id BIGINT;`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_linked_group_chat_id ON public.users(linked_group_chat_id);`);
+
         await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 0;`);
         await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS local_id INTEGER NOT NULL DEFAULT 1;`);
         // RAZMER (SIZE) ustuni: bir xil tovarning turli o'lchamlari alohida qator sifatida saqlanadi,
         // lekin bir xil local_id orqali "bitta tovar" sifatida guruhlanadi.
         await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS size TEXT;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS qr_token UUID;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS qr_created_at TIMESTAMP;`);
+        await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_products_qr_token ON public.products(qr_token) WHERE qr_token IS NOT NULL;`);
+
+        // Mavjud tovarlarga ham QR token beramiz.
+        const qrRows = await pool.query(`SELECT id FROM public.products WHERE qr_token IS NULL`);
+        for (const row of qrRows.rows) {
+            await pool.query(
+                `UPDATE public.products SET qr_token = $1, qr_created_at = NOW() WHERE id = $2 AND qr_token IS NULL`,
+                [randomUUID(), row.id]
+            );
+        }
+
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_products_user_local ON public.products(user_id, local_id);`);
 
         await pool.query(`
@@ -413,10 +432,10 @@ app.post('/api/products', authenticateToken, async (req, res) => {
         if (sizeList.length === 0) {
             // Razmersiz tovar - bitta qator, butun son shu qatorga yoziladi
             const inserted = await client.query(
-                `INSERT INTO public.products (user_id, local_id, category, name, cost_price, color, size, quantity)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                `INSERT INTO public.products (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
                  RETURNING *`,
-                [userId, nextLocalId, category || null, name.trim(), Number(cost_price), color || null, null, totalQty]
+                [userId, nextLocalId, category || null, name.trim(), Number(cost_price), color || null, null, totalQty, randomUUID()]
             );
             insertedRows.push(inserted.rows[0]);
         } else {
@@ -431,10 +450,10 @@ app.post('/api/products', authenticateToken, async (req, res) => {
             for (let i = 0; i < n; i++) {
                 const sizeQty = base + (i < remainder ? 1 : 0);
                 const inserted = await client.query(
-                    `INSERT INTO public.products (user_id, local_id, category, name, cost_price, color, size, quantity)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    `INSERT INTO public.products (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
                      RETURNING *`,
-                    [userId, nextLocalId, category || null, name.trim(), Number(cost_price), color || null, sizeList[i], sizeQty]
+                    [userId, nextLocalId, category || null, name.trim(), Number(cost_price), color || null, sizeList[i], sizeQty, randomUUID()]
                 );
                 insertedRows.push(inserted.rows[0]);
             }
@@ -487,7 +506,7 @@ app.get('/api/products', authenticateToken, async (req, res) => {
         // esa razmerlar o'sish tartibida (raqamli bo'lsa raqam bo'yicha, aks holda
         // alifbo bo'yicha) tartiblanadi - shu bilan interfeysda chiroyli guruhlanadi.
         const products = await pool.query(
-            `SELECT id, user_id, local_id, category, name, name AS title, cost_price, color, size, quantity
+            `SELECT id, user_id, local_id, category, name, name AS title, cost_price, color, size, quantity, qr_token
              FROM public.products
              WHERE user_id = $1
              ORDER BY local_id DESC,
@@ -837,7 +856,146 @@ app.post('/api/dashboard/expenses', authenticateToken, async (req, res) => {
 });
 
 // ----------------------------------------------------
-// 11. BOT UCHUN DAVRLI FOYDALARni OLISH ENDPOINTI
+// 11. QR KOD ORQALI SOTISH / O'CHIRISH
+// ----------------------------------------------------
+const telegramEscape = (value) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/**
+ * Telegramga bevosita chat_id orqali yubormaymiz.
+ * Website faqat notifications jadvaliga yozadi.
+ * Telegram bot esa linked_group_chat_id orqali kerakli guruhga yuboradi.
+ */
+const queueTelegramNotification = async (clientOrPool, siteLogin, message) => {
+    if (!siteLogin) {
+        console.warn('Telegram notification queue: site_login topilmadi.');
+        return;
+    }
+
+    await clientOrPool.query(
+        `INSERT INTO public.notifications (site_login, message, is_sent)
+         VALUES ($1, $2, false)`,
+        [siteLogin, message]
+    );
+};
+
+app.get('/api/qr/:token', async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT id, local_id, name, category, color, size, cost_price, quantity, qr_token
+             FROM public.products WHERE qr_token = $1 LIMIT 1`,
+            [req.params.token]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ message: 'QR kodi eskirgan yoki tovar topilmadi!' });
+        const product = result.rows[0];
+        if (Number(product.quantity) <= 0) return res.status(410).json({ message: 'Bu tovar omborda qolmagan!' });
+        res.json({ product });
+    } catch (err) {
+        console.error('QR ma\'lumot xatosi:', err);
+        res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
+    }
+});
+
+app.post('/api/qr/:token/sell', async (req, res) => {
+    const sellingPrice = Number(req.body?.selling_price);
+    if (!Number.isFinite(sellingPrice) || sellingPrice < 0) {
+        return res.status(400).json({ message: 'Sotuv narxini to\'g\'ri kiriting!' });
+    }
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const result = await client.query(
+            `SELECT * FROM public.products WHERE qr_token = $1 LIMIT 1 FOR UPDATE`,
+            [req.params.token]
+        );
+        if (result.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ message: 'QR kodi eskirgan yoki tovar topilmadi!' });
+        }
+        const product = result.rows[0];
+        const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [product.user_id]);
+        const siteLogin = userRow.rows[0]?.site_login;
+        const qty = 1;
+        if (Number(product.quantity) < qty) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ message: 'Bu tovar omborda qolmagan!' });
+        }
+        const cost = Number(product.cost_price) || 0;
+        const totalAmount = sellingPrice * qty;
+        const profit = (sellingPrice - cost) * qty;
+        const newQty = Number(product.quantity) - qty;
+
+        await client.query(
+            `INSERT INTO public.sales (user_id, product_id, title, quantity, cost_price, selling_price, profit)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [product.user_id, product.id, product.name, qty, cost, sellingPrice, profit]
+        );
+
+        if (newQty === 0) {
+            await client.query(`DELETE FROM public.products WHERE id = $1`, [product.id]);
+        } else {
+            await client.query(`UPDATE public.products SET quantity = $1 WHERE id = $2`, [newQty, product.id]);
+        }
+
+        const stats = await client.query(
+            `SELECT COALESCE(SUM(quantity),0) AS sold,
+                    COALESCE(SUM(quantity * selling_price),0) AS revenue,
+                    COALESCE(SUM(profit),0) AS gross_profit
+             FROM public.sales WHERE user_id = $1`,
+            [product.user_id]
+        );
+        const overall = stats.rows[0];
+        const expenseResult = await client.query(
+            `SELECT COALESCE(SUM(amount),0) AS expense FROM public.expenses WHERE user_id = $1`,
+            [product.user_id]
+        );
+        const totalExpense = Number(expenseResult.rows[0].expense || 0);
+        const netProfit = Number(overall.gross_profit || 0) - totalExpense;
+        const notification = `💰 <b>QR ORQALI SOTUV</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Tovar:</b> ${telegramEscape(product.name)}\n📏 <b>Razmer:</b> ${telegramEscape(product.size || 'Standart')}\n🔢 <b>Soni:</b> 1 dona\n💵 <b>Sotuv:</b> ${formatSum(sellingPrice)} so'm\n💳 <b>Tannarx:</b> ${formatSum(cost)} so'm\n${profit >= 0 ? '📈' : '📉'} <b>${profit >= 0 ? 'Foyda' : 'Ziyon'}:</b> ${formatSum(Math.abs(profit))} so'm\n📦 <b>Qoldiq:</b> ${newQty} dona\n\n📊 <b>Umumiy tushum:</b> ${formatSum(overall.revenue)} so'm\n📈 <b>Umumiy yalpi foyda:</b> ${formatSum(overall.gross_profit)} so'm\n💸 <b>Umumiy rasxod:</b> ${formatSum(totalExpense)} so'm\n${netProfit >= 0 ? '🟢' : '🔴'} <b>Umumiy sof foyda:</b> ${formatSum(Math.abs(netProfit))} so'm${netProfit < 0 ? ' (ziyon)' : ''}`;
+
+        await queueTelegramNotification(client, siteLogin, notification);
+        await client.query('COMMIT');
+        res.json({ success: true, product: { name: product.name, size: product.size, cost_price: cost }, selling_price: sellingPrice, quantity: qty, total_amount: totalAmount, profit, remaining_quantity: newQty });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('QR sotuv xatosi:', err);
+        res.status(500).json({ message: 'QR orqali sotishda server xatosi!' });
+    } finally {
+        client.release();
+    }
+});
+
+app.post('/api/qr/:token/delete', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const result = await client.query(
+            `SELECT * FROM public.products WHERE qr_token = $1 LIMIT 1 FOR UPDATE`,
+            [req.params.token]
+        );
+        if (result.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ message: 'QR kodi eskirgan yoki tovar topilmadi!' });
+        }
+        const product = result.rows[0];
+        const userRow = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [product.user_id]);
+        const siteLogin = userRow.rows[0]?.site_login;
+        await client.query(`DELETE FROM public.products WHERE id = $1`, [product.id]);
+
+        const message = `🗑️ <b>QR ORQALI TOVAR O'CHIRILDI</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 <b>Tovar:</b> ${telegramEscape(product.name)}\n📏 <b>Razmer:</b> ${telegramEscape(product.size || 'Standart')}\n🎨 <b>Rang:</b> ${telegramEscape(product.color || 'Ko\'rsatilmagan')}\n💰 <b>Tannarx:</b> ${formatSum(product.cost_price)} so'm\n🔢 <b>Ombordagi miqdor:</b> ${product.quantity} dona\n━━━━━━━━━━━━━━━━━━━━\n🗑️ Tovar ombordan chiqarildi.`;
+        await queueTelegramNotification(client, siteLogin, message);
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'Tovar ombordan o\'chirildi!' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('QR o\'chirish xatosi:', err);
+        res.status(500).json({ message: 'QR orqali o\'chirishda server xatosi!' });
+    } finally {
+        client.release();
+    }
+});
+
+// ----------------------------------------------------
+// 12. BOT UCHUN DAVRLI FOYDALARni OLISH ENDPOINTI
 // ----------------------------------------------------
 app.get('/api/bot/profits/:site_login', async (req, res) => {
     const { site_login } = req.params;
