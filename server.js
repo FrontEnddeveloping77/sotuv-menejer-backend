@@ -702,7 +702,13 @@ app.get(
                             SUM(quantity),
                             0
                         )
-                            AS "totalStock"
+                            AS "totalStock",
+
+                        COALESCE(
+                            SUM(quantity * cost_price),
+                            0
+                        )
+                            AS "totalStockValue"
                     FROM public.products
                     WHERE user_id = $1
                     `,
@@ -850,6 +856,12 @@ app.get(
                     Number(
                         productStats.rows[0]
                             .totalStock || 0
+                    ),
+
+                totalStockValue:
+                    Number(
+                        productStats.rows[0]
+                            .totalStockValue || 0
                     ),
 
                 totalSold:
