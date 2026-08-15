@@ -116,6 +116,17 @@ const getTodayReport = async (clientOrPool, userId) => {
         [userId]
     );
 
+    const stockResult = await clientOrPool.query(
+        `
+        SELECT
+            COUNT(DISTINCT local_id) AS total_products,
+            COALESCE(SUM(quantity), 0) AS total_stock
+        FROM public.products
+        WHERE user_id = $1
+        `,
+        [userId]
+    );
+
     const revenue =
         Number(salesResult.rows[0].revenue || 0);
 
@@ -131,6 +142,12 @@ const getTodayReport = async (clientOrPool, userId) => {
     const netProfit =
         profit - expense;
 
+    const totalProducts =
+        Number(stockResult.rows[0].total_products || 0);
+
+    const totalStock =
+        Number(stockResult.rows[0].total_stock || 0);
+
     return (
         `\n\n` +
         `📊 <b>BUGUNGI HISOBOT</b>\n` +
@@ -140,6 +157,10 @@ const getTodayReport = async (clientOrPool, userId) => {
         `💸 <b>Bugungi rasxod:</b> ${formatSum(expense)} so'm\n` +
         `${netProfit >= 0 ? '🟢' : '🔴'} <b>Bugungi umumiy sof foyda:</b> ${formatSum(Math.abs(netProfit))} so'm` +
         (netProfit < 0 ? ` (ziyon)` : '') +
+        `\n━━━━━━━━━━━━━━━━━━━━\n` +
+        `📦 <b>OMBOR HOLATI</b>\n` +
+        `🗂 <b>Jami tovar turi:</b> ${totalProducts} xil\n` +
+        `📊 <b>Jami qoldiq:</b> ${totalStock} dona` +
         `\n━━━━━━━━━━━━━━━━━━━━`
     );
 };
@@ -2259,10 +2280,6 @@ app.get(
 // ====================================================
 // QR SOTUV
 // ====================================================
-// Hozircha siz aytganingizdek QR qismiga
-// BUGUNGI HISOBOT qo'shilmayapti.
-// Keyingi bosqichda qilamiz.
-// ====================================================
 
 app.post(
     '/api/qr/:token/sell',
@@ -2437,6 +2454,13 @@ app.post(
                 `${profit >= 0 ? '📈' : '📉'} <b>${profit >= 0 ? 'Foyda' : 'Ziyon'}:</b> ${formatSum(Math.abs(profit))} so'm\n` +
                 `📦 <b>Qoldiq:</b> ${newQty} dona`;
 
+            // BUGUNGI HISOBOT
+            message +=
+                await getTodayReport(
+                    client,
+                    product.user_id
+                );
+
             await queueTelegramNotification(
                 client,
                 siteLogin,
@@ -2571,7 +2595,7 @@ app.post(
                 ]
             );
 
-            const message =
+            const messageBase =
                 `🗑️ <b>QR ORQALI TOVAR O'CHIRILDI</b>\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `📦 <b>Tovar:</b> ${telegramEscape(product.name)}\n` +
@@ -2581,6 +2605,14 @@ app.post(
                 `🔢 <b>Ombordagi miqdor:</b> ${product.quantity} dona\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `🗑️ Tovar ombordan chiqarildi.`;
+
+            // BUGUNGI HISOBOT
+            const message =
+                messageBase +
+                await getTodayReport(
+                    client,
+                    product.user_id
+                );
 
             await queueTelegramNotification(
                 client,
