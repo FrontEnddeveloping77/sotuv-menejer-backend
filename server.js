@@ -1651,27 +1651,15 @@ app.post(
                     ? `💵 <b>TOVAR SOTILDI — ${normalizedItems.length} TA RAZMER (#${firstLocalId})</b>`
                     : `💵 <b>TOVAR SOTILDI (#${firstLocalId})</b>`;
 
-            // 1. Omborda qolgan razmerlarni bazadan aniq topish
             let remainingStockInfo = "";
             try {
-                // Agar kodda id topilmasa, xabar sarlavhasidan yoki boshqa joydan olamiz
-                let targetId = typeof productId !== 'undefined' ? productId :
-                    (typeof item !== 'undefined' && item.id ? item.id :
-                        (typeof id !== 'undefined' ? id : null));
+                // ID qaysi o'zgaruvchidan kelishini aniq ko'rsatamiz (masalan: req.body.id yoki productId)
+                // Agar sizning kodingizda mahsulot ID si boshqa nomda bo'lsa, pastga o'sha o'zgaruvchini yozing
+                const realId = productId || (typeof req !== 'undefined' && req.body?.id);
 
-                // Agar yuqoridagilar bo'sh kelsa, ehtimol id boshqa nomdandir (masalan, req.body ichida)
-                if (!targetId && typeof req !== 'undefined' && req.body) {
-                    targetId = req.body.id || req.body.productId || req.body.itemId;
-                }
+                console.log("Qidirilayotgan ID:", realId); // Terminalda ko'rinadi
 
-                // Bazadan qidirish
-                const product = await Product.findOne({
-                    $or: [
-                        { id: targetId },
-                        { id: Number(targetId) },
-                        { _id: targetId }
-                    ]
-                });
+                const product = await Product.findOne({ id: realId });
 
                 remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
                 if (product && product.sizes && Array.isArray(product.sizes)) {
@@ -1679,14 +1667,13 @@ app.post(
                         .map(s => `• ${s.size}: ${s.quantity} ta`)
                         .join('\n');
 
-                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi (Barcha razmerlar tugadi)";
+                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi";
                 } else {
-                    // Agar baribir topmasa, nima uchun topmaganini bilish uchun targetId ni chiqaramiz
-                    remainingStockInfo += `Topilmadi (ID: ${targetId || 'aniqlanmadi'})`;
+                    remainingStockInfo += "Mahsulot topilmadi";
                 }
             } catch (err) {
-                console.error("Qoldiqni olishda xatolik:", err);
-                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumotni o'qib bo'lmadi";
+                console.error("Xatolik tafsiloti:", err);
+                remainingStockInfo = `\n📏 <b>Omborda qolgan razmerlar:</b> Xato: ${err.message}`;
             }
 
             // 2. SellMessage'ni yangilash
@@ -2003,27 +1990,15 @@ app.post(
                     ? `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI — ${items.length} TA RAZMER (#${firstLocalId})</b>`
                     : `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${firstLocalId})</b>`;
 
-            // 1. Omborda qolgan razmerlarni bazadan aniq topish
             let remainingStockInfo = "";
             try {
-                // Agar kodda id topilmasa, xabar sarlavhasidan yoki boshqa joydan olamiz
-                let targetId = typeof productId !== 'undefined' ? productId :
-                    (typeof item !== 'undefined' && item.id ? item.id :
-                        (typeof id !== 'undefined' ? id : null));
+                // ID qaysi o'zgaruvchidan kelishini aniq ko'rsatamiz (masalan: req.body.id yoki productId)
+                // Agar sizning kodingizda mahsulot ID si boshqa nomda bo'lsa, pastga o'sha o'zgaruvchini yozing
+                const realId = productId || (typeof req !== 'undefined' && req.body?.id);
 
-                // Agar yuqoridagilar bo'sh kelsa, ehtimol id boshqa nomdandir (masalan, req.body ichida)
-                if (!targetId && typeof req !== 'undefined' && req.body) {
-                    targetId = req.body.id || req.body.productId || req.body.itemId;
-                }
+                console.log("Qidirilayotgan ID:", realId); // Terminalda ko'rinadi
 
-                // Bazadan qidirish
-                const product = await Product.findOne({
-                    $or: [
-                        { id: targetId },
-                        { id: Number(targetId) },
-                        { _id: targetId }
-                    ]
-                });
+                const product = await Product.findOne({ id: realId });
 
                 remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
                 if (product && product.sizes && Array.isArray(product.sizes)) {
@@ -2031,14 +2006,13 @@ app.post(
                         .map(s => `• ${s.size}: ${s.quantity} ta`)
                         .join('\n');
 
-                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi (Barcha razmerlar tugadi)";
+                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi";
                 } else {
-                    // Agar baribir topmasa, nima uchun topmaganini bilish uchun targetId ni chiqaramiz
-                    remainingStockInfo += `Topilmadi (ID: ${targetId || 'aniqlanmadi'})`;
+                    remainingStockInfo += "Mahsulot topilmadi";
                 }
             } catch (err) {
-                console.error("Qoldiqni olishda xatolik:", err);
-                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumotni o'qib bo'lmadi";
+                console.error("Xatolik tafsiloti:", err);
+                remainingStockInfo = `\n📏 <b>Omborda qolgan razmerlar:</b> Xato: ${err.message}`;
             }
 
             // 2. DeleteMessage'ni shakllantirish
