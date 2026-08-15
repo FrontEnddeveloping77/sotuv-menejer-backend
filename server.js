@@ -1653,13 +1653,15 @@ app.post(
 
             let remainingStockInfo = "";
             try {
-                // ID qaysi o'zgaruvchidan kelishini aniq ko'rsatamiz (masalan: req.body.id yoki productId)
-                // Agar sizning kodingizda mahsulot ID si boshqa nomda bo'lsa, pastga o'sha o'zgaruvchini yozing
-                const realId = productId || (typeof req !== 'undefined' && req.body?.id);
+                // Diqqat: 'productId' o'rniga o'z kodingizdagi haqiqiy ID o'zgaruvchini yozing (masalan: item.id, id, va hokazo)
+                const currentId = productId; // <-- Shu yerdagi 'productId' o'rniga o'zingizda ishlayotgan ID o'zgaruvchini qo'ying
 
-                console.log("Qidirilayotgan ID:", realId); // Terminalda ko'rinadi
-
-                const product = await Product.findOne({ id: realId });
+                const product = await Product.findOne({
+                    $or: [
+                        { id: currentId },
+                        { id: Number(currentId) }
+                    ]
+                });
 
                 remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
                 if (product && product.sizes && Array.isArray(product.sizes)) {
@@ -1669,11 +1671,11 @@ app.post(
 
                     remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi";
                 } else {
-                    remainingStockInfo += "Mahsulot topilmadi";
+                    remainingStockInfo += "Ma'lumot topilmadi";
                 }
             } catch (err) {
-                console.error("Xatolik tafsiloti:", err);
-                remainingStockInfo = `\n📏 <b>Omborda qolgan razmerlar:</b> Xato: ${err.message}`;
+                console.error("Xatolik:", err);
+                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumotni o'qib bo'lmadi";
             }
 
             // 2. SellMessage'ni yangilash
