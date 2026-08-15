@@ -1651,15 +1651,20 @@ app.post(
                     ? `💵 <b>TOVAR SOTILDI — ${normalizedItems.length} TA RAZMER (#${firstLocalId})</b>`
                     : `💵 <b>TOVAR SOTILDI (#${firstLocalId})</b>`;
 
-            // 1. Omborda qolgan razmerlarni bazadan aniq topib olish
+            // 1. Omborda qolgan razmerlarni bazadan aniq topish
             let remainingStockInfo = "";
             try {
-                // Barcha mumkin bo'lgan ID o'zgaruvchi nomlarini tekshiramiz
-                const targetId = typeof productId !== 'undefined' ? productId :
+                // Agar kodda id topilmasa, xabar sarlavhasidan yoki boshqa joydan olamiz
+                let targetId = typeof productId !== 'undefined' ? productId :
                     (typeof item !== 'undefined' && item.id ? item.id :
-                        (typeof id !== 'undefined' ? id :
-                            (typeof req !== 'undefined' && req.body ? (req.body.productId || req.body.id) : null)));
+                        (typeof id !== 'undefined' ? id : null));
 
+                // Agar yuqoridagilar bo'sh kelsa, ehtimol id boshqa nomdandir (masalan, req.body ichida)
+                if (!targetId && typeof req !== 'undefined' && req.body) {
+                    targetId = req.body.id || req.body.productId || req.body.itemId;
+                }
+
+                // Bazadan qidirish
                 const product = await Product.findOne({
                     $or: [
                         { id: targetId },
@@ -1676,7 +1681,8 @@ app.post(
 
                     remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi (Barcha razmerlar tugadi)";
                 } else {
-                    remainingStockInfo += "Ma'lumot topilmadi";
+                    // Agar baribir topmasa, nima uchun topmaganini bilish uchun targetId ni chiqaramiz
+                    remainingStockInfo += `Topilmadi (ID: ${targetId || 'aniqlanmadi'})`;
                 }
             } catch (err) {
                 console.error("Qoldiqni olishda xatolik:", err);
@@ -1997,15 +2003,20 @@ app.post(
                     ? `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI — ${items.length} TA RAZMER (#${firstLocalId})</b>`
                     : `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${firstLocalId})</b>`;
 
-            // 1. Omborda qolgan razmerlarni bazadan aniq topib olish
+            // 1. Omborda qolgan razmerlarni bazadan aniq topish
             let remainingStockInfo = "";
             try {
-                // Barcha mumkin bo'lgan ID o'zgaruvchi nomlarini tekshiramiz
-                const targetId = typeof productId !== 'undefined' ? productId :
+                // Agar kodda id topilmasa, xabar sarlavhasidan yoki boshqa joydan olamiz
+                let targetId = typeof productId !== 'undefined' ? productId :
                     (typeof item !== 'undefined' && item.id ? item.id :
-                        (typeof id !== 'undefined' ? id :
-                            (typeof req !== 'undefined' && req.body ? (req.body.productId || req.body.id) : null)));
+                        (typeof id !== 'undefined' ? id : null));
 
+                // Agar yuqoridagilar bo'sh kelsa, ehtimol id boshqa nomdandir (masalan, req.body ichida)
+                if (!targetId && typeof req !== 'undefined' && req.body) {
+                    targetId = req.body.id || req.body.productId || req.body.itemId;
+                }
+
+                // Bazadan qidirish
                 const product = await Product.findOne({
                     $or: [
                         { id: targetId },
@@ -2022,7 +2033,8 @@ app.post(
 
                     remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi (Barcha razmerlar tugadi)";
                 } else {
-                    remainingStockInfo += "Ma'lumot topilmadi";
+                    // Agar baribir topmasa, nima uchun topmaganini bilish uchun targetId ni chiqaramiz
+                    remainingStockInfo += `Topilmadi (ID: ${targetId || 'aniqlanmadi'})`;
                 }
             } catch (err) {
                 console.error("Qoldiqni olishda xatolik:", err);
