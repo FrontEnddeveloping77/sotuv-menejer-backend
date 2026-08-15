@@ -1651,20 +1651,19 @@ app.post(
                     ? `💵 <b>TOVAR SOTILDI — ${normalizedItems.length} TA RAZMER (#${firstLocalId})</b>`
                     : `💵 <b>TOVAR SOTILDI (#${firstLocalId})</b>`;
 
-            // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan aniq topish va xatolikni oldini olish
             let remainingStockInfo = "";
             try {
-                // ID qaysi o'zgaruvchidan kelishini xavfsiz aniqlab olamiz
-                const targetId = typeof productId !== 'undefined' ? productId :
-                    (typeof id !== 'undefined' ? id :
-                        (typeof req !== 'undefined' && req.body ? (req.body.productId || req.body.id) : null));
+                // ⚠️ E'tibor bering: Kodingizda ID qanday nomlangan bo'lsa (masalan: item.id, id, req.body.id), 
+                // pastdagi 'productId' o'rniga o'sha o'zgaruvchini yozing. 
+                // Masalan: const currentId = item ? item.id : productId;
+                const currentId = typeof productId !== 'undefined' ? productId : (item && item.id ? item.id : null);
 
-                // Bazadan mahsulotni ID yoki _id bo'yicha qidiramiz
+                // Bazadan qidirish
                 const product = await Product.findOne({
                     $or: [
-                        { id: targetId },
-                        { id: Number(targetId) },
-                        { _id: targetId && targetId.toString().length === 24 ? targetId : null }
+                        { id: Number(currentId) },
+                        { id: currentId },
+                        { _id: currentId }
                     ]
                 });
 
@@ -1674,13 +1673,14 @@ app.post(
                         .map(s => `• ${s.size}: ${s.quantity} ta`)
                         .join('\n');
 
-                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi (Barcha razmerlar tugadi)";
+                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi";
                 } else {
                     remainingStockInfo += "Ma'lumot topilmadi";
                 }
             } catch (err) {
-                console.error("Qoldiqni olishda xatolik:", err);
-                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumotni o'qib bo'lmadi";
+                console.error("Xatolik tafsiloti:", err);
+                // Endi xato chiqsa ham nima uchun chiqqanini aniq ko'rsatadi
+                remainingStockInfo = `\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumot topilmadi`;
             }
 
             // 2. SellMessage'ni yangilash
@@ -1997,20 +1997,19 @@ app.post(
                     ? `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI — ${items.length} TA RAZMER (#${firstLocalId})</b>`
                     : `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${firstLocalId})</b>`;
 
-            // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan aniq topish va xatolikni oldini olish
             let remainingStockInfo = "";
             try {
-                // ID qaysi o'zgaruvchidan kelishini xavfsiz aniqlab olamiz
-                const targetId = typeof productId !== 'undefined' ? productId :
-                    (typeof id !== 'undefined' ? id :
-                        (typeof req !== 'undefined' && req.body ? (req.body.productId || req.body.id) : null));
+                // ⚠️ E'tibor bering: Kodingizda ID qanday nomlangan bo'lsa (masalan: item.id, id, req.body.id), 
+                // pastdagi 'productId' o'rniga o'sha o'zgaruvchini yozing. 
+                // Masalan: const currentId = item ? item.id : productId;
+                const currentId = typeof productId !== 'undefined' ? productId : (item && item.id ? item.id : null);
 
-                // Bazadan mahsulotni ID yoki _id bo'yicha qidiramiz
+                // Bazadan qidirish
                 const product = await Product.findOne({
                     $or: [
-                        { id: targetId },
-                        { id: Number(targetId) },
-                        { _id: targetId && targetId.toString().length === 24 ? targetId : null }
+                        { id: Number(currentId) },
+                        { id: currentId },
+                        { _id: currentId }
                     ]
                 });
 
@@ -2020,13 +2019,14 @@ app.post(
                         .map(s => `• ${s.size}: ${s.quantity} ta`)
                         .join('\n');
 
-                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi (Barcha razmerlar tugadi)";
+                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi";
                 } else {
                     remainingStockInfo += "Ma'lumot topilmadi";
                 }
             } catch (err) {
-                console.error("Qoldiqni olishda xatolik:", err);
-                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumotni o'qib bo'lmadi";
+                console.error("Xatolik tafsiloti:", err);
+                // Endi xato chiqsa ham nima uchun chiqqanini aniq ko'rsatadi
+                remainingStockInfo = `\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumot topilmadi`;
             }
 
             // 2. DeleteMessage'ni shakllantirish
