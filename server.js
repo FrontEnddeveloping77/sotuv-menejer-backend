@@ -1482,13 +1482,8 @@ app.post(
                         SELECT *
                         FROM public.products
                         WHERE
-                            (
-                                id = $1
-                                OR local_id = $1
-                            )
+                            id = $1
                             AND user_id = $2
-                        ORDER BY id ASC
-                        LIMIT 1
                         FOR UPDATE
                         `,
                         [
@@ -1804,13 +1799,8 @@ app.post(
                         SELECT *
                         FROM public.products
                         WHERE
-                            (
-                                id = $1
-                                OR local_id = $1
-                            )
+                            id = $1
                             AND user_id = $2
-                        ORDER BY id ASC
-                        LIMIT 1
                         FOR UPDATE
                         `,
                         [
