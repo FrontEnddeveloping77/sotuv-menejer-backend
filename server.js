@@ -1652,35 +1652,65 @@ app.post(
                     : `💵 <b>TOVAR SOTILDI (#${firstLocalId})</b>`;
 
             let remainingStockInfo = "";
+
             try {
-                // ⚠️ E'tibor bering: Kodingizda ID qanday nomlangan bo'lsa (masalan: item.id, id, req.body.id), 
-                // pastdagi 'productId' o'rniga o'sha o'zgaruvchini yozing. 
-                // Masalan: const currentId = item ? item.id : productId;
-                const currentId = typeof productId !== 'undefined' ? productId : (item && item.id ? item.id : null);
+                const currentId =
+                    typeof productId !== "undefined"
+                        ? productId
+                        : item?.local_id || item?.id || null;
 
-                // Bazadan qidirish
-                const product = await Product.findOne({
-                    $or: [
-                        { id: Number(currentId) },
-                        { id: currentId },
-                        { _id: currentId }
-                    ]
-                });
-
-                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
-                if (product && product.sizes && Array.isArray(product.sizes)) {
-                    const stockList = product.sizes
-                        .map(s => `• ${s.size}: ${s.quantity} ta`)
-                        .join('\n');
-
-                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi";
+                if (!currentId) {
+                    remainingStockInfo =
+                        "\n📏 <b>Omborda qolgan razmerlar:</b>\n❌ Mahsulot ID topilmadi";
                 } else {
-                    remainingStockInfo += "Ma'lumot topilmadi";
+                    const result = await pool.query(
+                        `
+            SELECT size, quantity
+            FROM public.products
+            WHERE user_id = $1
+              AND local_id = $2
+            ORDER BY
+                CASE
+                    WHEN size ~ '^[0-9]+$'
+                    THEN size::int
+                END ASC NULLS LAST,
+                size ASC NULLS LAST
+            `,
+                        [
+                            userId,
+                            Number(currentId)
+                        ]
+                    );
+
+                    remainingStockInfo =
+                        "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
+
+                    if (result.rows.length === 0) {
+                        remainingStockInfo += "❌ Ma'lumot topilmadi";
+                    } else {
+                        const sizeRows = result.rows.filter(
+                            row => row.size !== null
+                        );
+
+                        if (sizeRows.length === 0) {
+                            remainingStockInfo += "📦 Razmer mavjud emas";
+                        } else {
+                            remainingStockInfo += sizeRows
+                                .map(row =>
+                                    `• ${telegramEscape(String(row.size))}: ${Number(row.quantity) || 0} ta`
+                                )
+                                .join("\n");
+                        }
+                    }
                 }
             } catch (err) {
-                console.error("Xatolik tafsiloti:", err);
-                // Endi xato chiqsa ham nima uchun chiqqanini aniq ko'rsatadi
-                remainingStockInfo = `\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumot topilmadi`;
+                console.error(
+                    "❌ Omborda qolgan razmerlarni olishda xatolik:",
+                    err
+                );
+
+                remainingStockInfo =
+                    "\n📏 <b>Omborda qolgan razmerlar:</b>\n❌ Ma'lumot topilmadi";
             }
 
             // 2. SellMessage'ni yangilash
@@ -1998,35 +2028,65 @@ app.post(
                     : `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${firstLocalId})</b>`;
 
             let remainingStockInfo = "";
+
             try {
-                // ⚠️ E'tibor bering: Kodingizda ID qanday nomlangan bo'lsa (masalan: item.id, id, req.body.id), 
-                // pastdagi 'productId' o'rniga o'sha o'zgaruvchini yozing. 
-                // Masalan: const currentId = item ? item.id : productId;
-                const currentId = typeof productId !== 'undefined' ? productId : (item && item.id ? item.id : null);
+                const currentId =
+                    typeof productId !== "undefined"
+                        ? productId
+                        : item?.local_id || item?.id || null;
 
-                // Bazadan qidirish
-                const product = await Product.findOne({
-                    $or: [
-                        { id: Number(currentId) },
-                        { id: currentId },
-                        { _id: currentId }
-                    ]
-                });
-
-                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
-                if (product && product.sizes && Array.isArray(product.sizes)) {
-                    const stockList = product.sizes
-                        .map(s => `• ${s.size}: ${s.quantity} ta`)
-                        .join('\n');
-
-                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi";
+                if (!currentId) {
+                    remainingStockInfo =
+                        "\n📏 <b>Omborda qolgan razmerlar:</b>\n❌ Mahsulot ID topilmadi";
                 } else {
-                    remainingStockInfo += "Ma'lumot topilmadi";
+                    const result = await pool.query(
+                        `
+            SELECT size, quantity
+            FROM public.products
+            WHERE user_id = $1
+              AND local_id = $2
+            ORDER BY
+                CASE
+                    WHEN size ~ '^[0-9]+$'
+                    THEN size::int
+                END ASC NULLS LAST,
+                size ASC NULLS LAST
+            `,
+                        [
+                            userId,
+                            Number(currentId)
+                        ]
+                    );
+
+                    remainingStockInfo =
+                        "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
+
+                    if (result.rows.length === 0) {
+                        remainingStockInfo += "❌ Ma'lumot topilmadi";
+                    } else {
+                        const sizeRows = result.rows.filter(
+                            row => row.size !== null
+                        );
+
+                        if (sizeRows.length === 0) {
+                            remainingStockInfo += "📦 Razmer mavjud emas";
+                        } else {
+                            remainingStockInfo += sizeRows
+                                .map(row =>
+                                    `• ${telegramEscape(String(row.size))}: ${Number(row.quantity) || 0} ta`
+                                )
+                                .join("\n");
+                        }
+                    }
                 }
             } catch (err) {
-                console.error("Xatolik tafsiloti:", err);
-                // Endi xato chiqsa ham nima uchun chiqqanini aniq ko'rsatadi
-                remainingStockInfo = `\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumot topilmadi`;
+                console.error(
+                    "❌ Omborda qolgan razmerlarni olishda xatolik:",
+                    err
+                );
+
+                remainingStockInfo =
+                    "\n📏 <b>Omborda qolgan razmerlar:</b>\n❌ Ma'lumot topilmadi";
             }
 
             // 2. DeleteMessage'ni shakllantirish
