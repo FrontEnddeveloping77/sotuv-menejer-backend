@@ -1651,17 +1651,20 @@ app.post(
                     ? `💵 <b>TOVAR SOTILDI — ${normalizedItems.length} TA RAZMER (#${firstLocalId})</b>`
                     : `💵 <b>TOVAR SOTILDI (#${firstLocalId})</b>`;
 
-            // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan olish (Kengaytirilgan qidiruv)
+            // 1. Omborda qolgan razmerlarni bazadan aniq topib olish
             let remainingStockInfo = "";
             try {
-                // ID qaysi o'zgaruvchidan kelishini tekshirib olamiz (itemId, id yoki product.id)
-                const currentId = typeof productId !== 'undefined' ? productId : (typeof item !== 'undefined' ? item.id : null);
+                // Barcha mumkin bo'lgan ID o'zgaruvchi nomlarini tekshiramiz
+                const targetId = typeof productId !== 'undefined' ? productId :
+                    (typeof item !== 'undefined' && item.id ? item.id :
+                        (typeof id !== 'undefined' ? id :
+                            (typeof req !== 'undefined' && req.body ? (req.body.productId || req.body.id) : null)));
 
                 const product = await Product.findOne({
                     $or: [
-                        { id: currentId },
-                        { id: Number(currentId) },
-                        { _id: currentId }
+                        { id: targetId },
+                        { id: Number(targetId) },
+                        { _id: targetId }
                     ]
                 });
 
@@ -1994,18 +1997,20 @@ app.post(
                     ? `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI — ${items.length} TA RAZMER (#${firstLocalId})</b>`
                     : `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${firstLocalId})</b>`;
 
-            // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan olish (Xavfsiz usul)
-            // 1. Omborda qolgan razmerlarni xavfsiz olish
+            // 1. Omborda qolgan razmerlarni bazadan aniq topib olish
             let remainingStockInfo = "";
             try {
-                // ID qaysi o'zgaruvchidan kelishini tekshirib olamiz (itemId, id yoki product.id)
-                const currentId = typeof productId !== 'undefined' ? productId : (typeof item !== 'undefined' ? item.id : null);
+                // Barcha mumkin bo'lgan ID o'zgaruvchi nomlarini tekshiramiz
+                const targetId = typeof productId !== 'undefined' ? productId :
+                    (typeof item !== 'undefined' && item.id ? item.id :
+                        (typeof id !== 'undefined' ? id :
+                            (typeof req !== 'undefined' && req.body ? (req.body.productId || req.body.id) : null)));
 
                 const product = await Product.findOne({
                     $or: [
-                        { id: currentId },
-                        { id: Number(currentId) },
-                        { _id: currentId }
+                        { id: targetId },
+                        { id: Number(targetId) },
+                        { _id: targetId }
                     ]
                 });
 
