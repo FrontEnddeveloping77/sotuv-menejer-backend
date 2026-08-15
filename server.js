@@ -1654,18 +1654,18 @@ app.post(
             // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan olish (Kengaytirilgan qidiruv)
             let remainingStockInfo = "";
             try {
-                // productId raqam yoki string ekanligini hisobga olib qidiramiz
-                let product = null;
-                if (productId) {
-                    // Agar id raqam yoki maxsus maydon bo'lsa
-                    product = await Product.findOne({
-                        $or: [
-                            { id: productId },
-                            { id: Number(productId) },
-                            { _id: productId.toString().length === 24 ? productId : null }
-                        ]
-                    });
-                }
+                // Bazadan qaysi o'zgaruvchi orqali qidirilayotganini tekshiramiz
+                console.log("Qidirilayotgan Product ID:", productId);
+
+                const product = await Product.findOne({
+                    $or: [
+                        { id: productId },
+                        { id: Number(productId) },
+                        { _id: productId }
+                    ]
+                });
+
+                console.h("Topilgan product:", product);
 
                 remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
                 if (product && product.sizes && Array.isArray(product.sizes)) {
@@ -1673,13 +1673,13 @@ app.post(
                         .map(s => `• ${s.size}: ${s.quantity} ta`)
                         .join('\n');
 
-                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi";
+                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi (Barcha razmerlar tugadi)";
                 } else {
-                    remainingStockInfo += "Ma'lumot topilmadi";
+                    remainingStockInfo += "Ma'lumot topilmadi (product yoki sizes bo'sh)";
                 }
             } catch (err) {
-                console.error("Qoldiqni olishda xatolik:", err);
-                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumotni o'qib bo'lmadi";
+                console.error("Qoldiqni olishda ANIQ XATOLIK:", err.message);
+                remainingStockInfo = `\n📏 <b>Omborda qolgan razmerlar:</b> Xato: ${err.message}`;
             }
 
             // 2. SellMessage'ni yangilash
@@ -1999,14 +1999,18 @@ app.post(
             // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan olish (Xavfsiz usul)
             let remainingStockInfo = "";
             try {
-                // ID raqam yoki matn bo'lishidan qat'i nazar to'g'ri qidirish
+                // Bazadan qaysi o'zgaruvchi orqali qidirilayotganini tekshiramiz
+                console.log("Qidirilayotgan Product ID:", productId);
+
                 const product = await Product.findOne({
                     $or: [
                         { id: productId },
                         { id: Number(productId) },
-                        { _id: productId && productId.toString().length === 24 ? productId : null }
+                        { _id: productId }
                     ]
                 });
+
+                console.h("Topilgan product:", product);
 
                 remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
                 if (product && product.sizes && Array.isArray(product.sizes)) {
@@ -2016,11 +2020,11 @@ app.post(
 
                     remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi (Barcha razmerlar tugadi)";
                 } else {
-                    remainingStockInfo += "Ma'lumot topilmadi";
+                    remainingStockInfo += "Ma'lumot topilmadi (product yoki sizes bo'sh)";
                 }
             } catch (err) {
-                console.error("Qoldiqni olishda xatolik:", err);
-                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumotni o'qib bo'lmadi";
+                console.error("Qoldiqni olishda ANIQ XATOLIK:", err.message);
+                remainingStockInfo = `\n📏 <b>Omborda qolgan razmerlar:</b> Xato: ${err.message}`;
             }
 
             // 2. DeleteMessage'ni shakllantirish
