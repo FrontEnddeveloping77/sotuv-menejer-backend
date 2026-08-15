@@ -1651,18 +1651,24 @@ app.post(
                     ? `💵 <b>TOVAR SOTILDI — ${normalizedItems.length} TA RAZMER (#${firstLocalId})</b>`
                     : `💵 <b>TOVAR SOTILDI (#${firstLocalId})</b>`;
 
-            // 1. Mahsulot qoldiqlarini bazadan olish (Product modelini loyihangizga qarab moslang)
-            const product = await Product.findOne({ id: productId }); // Yoki _id orqali
+            // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan olish (Xavfsiz usul)
+            let remainingStockInfo = "";
+            try {
+                const product = await Product.findById(productId).catch(() => null) || await Product.findOne({ id: productId }).catch(() => null);
 
-            let remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
-            if (product && product.sizes) {
-                const stockList = product.sizes
-                    .map(s => `• ${s.size}: ${s.quantity} ta`)
-                    .join('\n');
+                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
+                if (product && product.sizes && Array.isArray(product.sizes)) {
+                    const stockList = product.sizes
+                        .map(s => `• ${s.size}: ${s.quantity} ta`)
+                        .join('\n');
 
-                remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi";
-            } else {
-                remainingStockInfo += "Ma'lumot topilmadi";
+                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi";
+                } else {
+                    remainingStockInfo += "Ma'lumot topilmadi";
+                }
+            } catch (err) {
+                console.error("Qoldiqni olishda xatolik:", err);
+                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumotni o'qib bo'lmadi";
             }
 
             // 2. SellMessage'ni yangilash
@@ -1676,7 +1682,7 @@ app.post(
                 `📊 <b>Jami sotilgan:</b> ${totalQty} dona\n` +
                 `💰 <b>Jami tushum:</b> ${formatSum(totalRevenue)} so'm\n` +
                 `${totalProfit >= 0 ? '📈' : '📉'} <b>${totalProfit >= 0 ? 'Jami foyda' : 'Jami ziyon'}:</b> ${formatSum(Math.abs(totalProfit))} so'm\n` +
-                remainingStockInfo + // <--- Qoldiq razmerlarni qo'shdik
+                remainingStockInfo +
                 `\n━━━━━━━━━━━━━━━━━━━━\n` +
                 (anyFullySoldOut ? `🗑 Ba'zi razmerlar ombordan butunlay chiqarildi\n` : '') +
                 `🎉 Tabriklaymiz, savdo amalga oshdi!`;
@@ -1979,18 +1985,25 @@ app.post(
                     ? `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI — ${items.length} TA RAZMER (#${firstLocalId})</b>`
                     : `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${firstLocalId})</b>`;
 
-            // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan olish
-            const product = await Product.findOne({ id: productId }); // Yoki _id orqali
+            // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan olish (Xavfsiz usul)
+            let remainingStockInfo = "";
+            try {
+                // Agar product ID bazada qanday saqlanishiga qarab topamiz
+                const product = await Product.findById(productId).catch(() => null) || await Product.findOne({ id: productId }).catch(() => null);
 
-            let remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
-            if (product && product.sizes) {
-                const stockList = product.sizes
-                    .map(s => `• ${s.size}: ${s.quantity} ta`)
-                    .join('\n');
+                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
+                if (product && product.sizes && Array.isArray(product.sizes)) {
+                    const stockList = product.sizes
+                        .map(s => `• ${s.size}: ${s.quantity} ta`)
+                        .join('\n');
 
-                remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi (Barcha razmerlar tugadi)";
-            } else {
-                remainingStockInfo += "Ma'lumot topilmadi";
+                    remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi (Barcha razmerlar tugadi)";
+                } else {
+                    remainingStockInfo += "Ma'lumot topilmadi";
+                }
+            } catch (err) {
+                console.error("Qoldiqni olishda xatolik:", err);
+                remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b> Ma'lumotni o'qib bo'lmadi";
             }
 
             // 2. DeleteMessage'ni shakllantirish
@@ -2004,7 +2017,7 @@ app.post(
                 `${removedLines.join('\n')}\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `➖ <b>Jami olib tashlandi:</b> ${totalRemoved} dona` +
-                remainingStockInfo + // <--- Omborda qolgan razmerlar shu yerga qo'shildi
+                remainingStockInfo +
                 `\n━━━━━━━━━━━━━━━━━━━━` +
                 (
                     anyFullyRemoved
