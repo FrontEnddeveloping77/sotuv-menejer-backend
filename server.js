@@ -1651,10 +1651,21 @@ app.post(
                     ? `💵 <b>TOVAR SOTILDI — ${normalizedItems.length} TA RAZMER (#${firstLocalId})</b>`
                     : `💵 <b>TOVAR SOTILDI (#${firstLocalId})</b>`;
 
-            // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan olish (Xavfsiz usul)
+            // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan olish (Kengaytirilgan qidiruv)
             let remainingStockInfo = "";
             try {
-                const product = await Product.findById(productId).catch(() => null) || await Product.findOne({ id: productId }).catch(() => null);
+                // productId raqam yoki string ekanligini hisobga olib qidiramiz
+                let product = null;
+                if (productId) {
+                    // Agar id raqam yoki maxsus maydon bo'lsa
+                    product = await Product.findOne({
+                        $or: [
+                            { id: productId },
+                            { id: Number(productId) },
+                            { _id: productId.toString().length === 24 ? productId : null }
+                        ]
+                    });
+                }
 
                 remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
                 if (product && product.sizes && Array.isArray(product.sizes)) {
@@ -1988,8 +1999,14 @@ app.post(
             // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan olish (Xavfsiz usul)
             let remainingStockInfo = "";
             try {
-                // Agar product ID bazada qanday saqlanishiga qarab topamiz
-                const product = await Product.findById(productId).catch(() => null) || await Product.findOne({ id: productId }).catch(() => null);
+                // ID raqam yoki matn bo'lishidan qat'i nazar to'g'ri qidirish
+                const product = await Product.findOne({
+                    $or: [
+                        { id: productId },
+                        { id: Number(productId) },
+                        { _id: productId && productId.toString().length === 24 ? productId : null }
+                    ]
+                });
 
                 remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
                 if (product && product.sizes && Array.isArray(product.sizes)) {
