@@ -1651,29 +1651,38 @@ app.post(
                     ? `💵 <b>TOVAR SOTILDI — ${normalizedItems.length} TA RAZMER (#${firstLocalId})</b>`
                     : `💵 <b>TOVAR SOTILDI (#${firstLocalId})</b>`;
 
+            // 1. Mahsulot qoldiqlarini bazadan olish (Product modelini loyihangizga qarab moslang)
+            const product = await Product.findOne({ id: productId }); // Yoki _id orqali
+
+            let remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
+            if (product && product.sizes) {
+                const stockList = product.sizes
+                    .map(s => `• ${s.size}: ${s.quantity} ta`)
+                    .join('\n');
+
+                remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi";
+            } else {
+                remainingStockInfo += "Ma'lumot topilmadi";
+            }
+
+            // 2. SellMessage'ni yangilash
             let sellMessage =
                 `${titleLine}\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `📦 <b>Nomi:</b> ${telegramEscape(firstProductName)}\n` +
-                `📏 <b>Razmerlar bo'yicha:</b>\n` +
+                `📏 <b>Razmerlar bo'yicha sotildi:</b>\n` +
                 `${soldLines.join('\n')}\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `📊 <b>Jami sotilgan:</b> ${totalQty} dona\n` +
                 `💰 <b>Jami tushum:</b> ${formatSum(totalRevenue)} so'm\n` +
                 `${totalProfit >= 0 ? '📈' : '📉'} <b>${totalProfit >= 0 ? 'Jami foyda' : 'Jami ziyon'}:</b> ${formatSum(Math.abs(totalProfit))} so'm\n` +
-                (
-                    anyFullySoldOut
-                        ? `🗑 Ba'zi razmerlar ombordan butunlay chiqarildi\n`
-                        : ''
-                ) +
+                remainingStockInfo + // <--- Qoldiq razmerlarni qo'shdik
+                `\n━━━━━━━━━━━━━━━━━━━━\n` +
+                (anyFullySoldOut ? `🗑 Ba'zi razmerlar ombordan butunlay chiqarildi\n` : '') +
                 `🎉 Tabriklaymiz, savdo amalga oshdi!`;
 
             // BUGUNGI HISOBOT
-            sellMessage +=
-                await getTodayReport(
-                    client,
-                    userId
-                );
+            sellMessage += await getTodayReport(client, userId);
 
             await queueTelegramNotification(
                 client,
@@ -1970,16 +1979,33 @@ app.post(
                     ? `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI — ${items.length} TA RAZMER (#${firstLocalId})</b>`
                     : `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${firstLocalId})</b>`;
 
+            // 1. Mahsulotning omborda qolgan qoldiqlarini bazadan olish
+            const product = await Product.findOne({ id: productId }); // Yoki _id orqali
+
+            let remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
+            if (product && product.sizes) {
+                const stockList = product.sizes
+                    .map(s => `• ${s.size}: ${s.quantity} ta`)
+                    .join('\n');
+
+                remainingStockInfo += stockList.length > 0 ? stockList : "❌ Qolmadi (Barcha razmerlar tugadi)";
+            } else {
+                remainingStockInfo += "Ma'lumot topilmadi";
+            }
+
+            // 2. DeleteMessage'ni shakllantirish
             let deleteMessage =
                 `${titleLine}\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `📦 <b>Nomi:</b> ${telegramEscape(firstProductName)}\n` +
                 `🗂 <b>Kategoriyasi:</b> ${telegramEscape(firstCategory || "Yo'q")}\n` +
                 `🎨 <b>Rangi:</b> ${telegramEscape(firstColor || "Yo'q")}\n` +
-                `📏 <b>Razmerlar bo'yicha:</b>\n` +
+                `📏 <b>Razmerlar bo'yicha olib tashlandi:</b>\n` +
                 `${removedLines.join('\n')}\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `➖ <b>Jami olib tashlandi:</b> ${totalRemoved} dona` +
+                remainingStockInfo + // <--- Omborda qolgan razmerlar shu yerga qo'shildi
+                `\n━━━━━━━━━━━━━━━━━━━━` +
                 (
                     anyFullyRemoved
                         ? `\n🗑 Ba'zi razmerlar ombordan butunlay chiqarildi`
