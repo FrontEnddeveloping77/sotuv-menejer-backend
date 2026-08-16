@@ -1006,32 +1006,30 @@ app.get(
                 await pool.query(
                     `
                     SELECT
-                        COUNT(DISTINCT local_id)
-                            AS "totalProducts",
-
-                        COALESCE(
-                            SUM(quantity),
-                            0
-                        )
-                            AS "totalStock",
-
-                        COALESCE(
-                            SUM(
-                                quantity *
-                                cost_price
-                            ),
-                            0
-                        )
-                            AS "totalStockValue"
-
+                        COUNT(DISTINCT local_id) AS "totalProducts",
+                        COALESCE(SUM(quantity), 0) AS "totalStock",
+                        COALESCE(SUM(quantity * cost_price), 0) AS "totalStockValue"
                     FROM public.products
-
                     WHERE user_id = $1
                     `,
-                    [
-                        userId
-                    ]
+                    [userId]
                 );
+
+            // Jami qarzni hisoblash
+            const debtStats = await pool.query(
+                `
+                SELECT
+                    COALESCE(
+                        SUM(cost_price - COALESCE(paid_amount, 0)),
+                        0
+                    ) AS "totalDebt"
+                FROM public.products
+                WHERE user_id = $1
+                  AND payment_type = 'credit'
+                  AND (cost_price - COALESCE(paid_amount, 0)) > 0
+                `,
+                [userId]
+            );
 
             const getPeriodStats =
                 async (
@@ -1207,6 +1205,12 @@ app.get(
                     Number(
                         productStats.rows[0]
                             .totalStockValue || 0
+                    ),
+
+                totalDebt:
+                    Number(
+                        debtStats.rows[0]
+                            .totalDebt || 0
                     ),
 
                 totalSold:
