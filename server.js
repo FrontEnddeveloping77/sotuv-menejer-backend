@@ -67,14 +67,13 @@ const formatSum = (value) => {
     }
 
     return Number(value).toLocaleString('uz-UZ');
-
 };
 
 const telegramEscape = (value) =>
     String(value ?? '')
-        .replace(/&/g, '&')
-        .replace(/</g, '<')
-        .replace(/>/g, '>');
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
 
 // ====================================================
 // BUGUNGI HISOBOT
@@ -87,56 +86,56 @@ const telegramEscape = (value) =>
 const getTodayReport = async (clientOrPool, userId) => {
     const salesResult = await clientOrPool.query(
         `
-SELECT
-COALESCE(
-SUM(
-(quantity - COALESCE(returned_quantity, 0))
-* selling_price
-),
-0
-) AS revenue,
+        SELECT
+            COALESCE(
+                SUM(
+                    (quantity - COALESCE(returned_quantity, 0))
+                    * selling_price
+                ),
+                0
+            ) AS revenue,
 
-        COALESCE(
-            SUM(
-                (selling_price - cost_price)
-                * (quantity - COALESCE(returned_quantity, 0))
-            ),
-            0
-        ) AS profit,
+            COALESCE(
+                SUM(
+                    (selling_price - cost_price)
+                    * (quantity - COALESCE(returned_quantity, 0))
+                ),
+                0
+            ) AS profit,
 
-        COALESCE(
-            SUM(quantity - COALESCE(returned_quantity, 0)),
-            0
-        ) AS sold
-    FROM public.sales
-    WHERE user_id = $1
-      AND sold_at::date = CURRENT_DATE
-    `,
+            COALESCE(
+                SUM(quantity - COALESCE(returned_quantity, 0)),
+                0
+            ) AS sold
+        FROM public.sales
+        WHERE user_id = $1
+          AND sold_at::date = CURRENT_DATE
+        `,
         [userId]
     );
 
     const expenseResult = await clientOrPool.query(
         `
-    SELECT
-        COALESCE(
-            SUM(amount),
-            0
-        ) AS expense
-    FROM public.expenses
-    WHERE user_id = $1
-        AND created_at >= NOW() - INTERVAL '7 days'
-    `,
+        SELECT
+            COALESCE(
+                SUM(amount),
+                0
+            ) AS expense
+        FROM public.expenses
+        WHERE user_id = $1
+            AND created_at >= NOW() - INTERVAL '7 days'
+        `,
         [userId]
     );
 
     const stockResult = await clientOrPool.query(
         `
-    SELECT
-        COUNT(DISTINCT local_id) AS total_products,
-        COALESCE(SUM(quantity), 0) AS total_stock
-    FROM public.products
-    WHERE user_id = $1
-    `,
+        SELECT
+            COUNT(DISTINCT local_id) AS total_products,
+            COALESCE(SUM(quantity), 0) AS total_stock
+        FROM public.products
+        WHERE user_id = $1
+        `,
         [userId]
     );
 
@@ -180,7 +179,6 @@ SUM(
         `📊 <b>Jami qoldiq:</b> ${totalStock} dona` +
         `\n━━━━━━━━━━━━━━━━━━━━`
     );
-
 };
 
 // ====================================================
@@ -202,21 +200,20 @@ const queueTelegramNotification = async (
 
     await clientOrPool.query(
         `
-    INSERT INTO public.notifications
-    (
-        site_login,
-        message,
-        is_sent
-    )
-    VALUES
-    ($1, $2, false)
-    `,
+        INSERT INTO public.notifications
+        (
+            site_login,
+            message,
+            is_sent
+        )
+        VALUES
+        ($1, $2, false)
+        `,
         [
             siteLogin,
             message
         ]
     );
-
 };
 
 // ====================================================
@@ -239,116 +236,116 @@ const ensureTables = async () => {
          */
 
         await pool.query(`
-        ALTER TABLE public.users
-        ADD COLUMN IF NOT EXISTS linked_group_chat_id BIGINT;
-    `);
+            ALTER TABLE public.users
+            ADD COLUMN IF NOT EXISTS linked_group_chat_id BIGINT;
+        `);
 
         await pool.query(`
-        CREATE INDEX IF NOT EXISTS
-        idx_users_linked_group_chat_id
-        ON public.users(linked_group_chat_id);
-    `);
+            CREATE INDEX IF NOT EXISTS
+            idx_users_linked_group_chat_id
+            ON public.users(linked_group_chat_id);
+        `);
 
         // ------------------------------------------------
         // PRODUCTS
         // ------------------------------------------------
 
         await pool.query(`
-        CREATE TABLE IF NOT EXISTS public.products (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            local_id INTEGER NOT NULL DEFAULT 1,
-            category TEXT,
-            name TEXT NOT NULL,
-            cost_price NUMERIC NOT NULL DEFAULT 0,
-            color TEXT,
-            quantity INTEGER NOT NULL DEFAULT 0,
-            size TEXT,
-            qr_token UUID,
-            qr_created_at TIMESTAMP,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
-        );
-    `);
+            CREATE TABLE IF NOT EXISTS public.products (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                local_id INTEGER NOT NULL DEFAULT 1,
+                category TEXT,
+                name TEXT NOT NULL,
+                cost_price NUMERIC NOT NULL DEFAULT 0,
+                color TEXT,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                size TEXT,
+                qr_token UUID,
+                qr_created_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        `);
 
         await pool.query(`
-        ALTER TABLE public.products
-        ADD COLUMN IF NOT EXISTS local_id INTEGER NOT NULL DEFAULT 1;
-    `);
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS local_id INTEGER NOT NULL DEFAULT 1;
+        `);
 
         await pool.query(`
-        ALTER TABLE public.products
-        ADD COLUMN IF NOT EXISTS category TEXT;
-    `);
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS category TEXT;
+        `);
 
         await pool.query(`
-        ALTER TABLE public.products
-        ADD COLUMN IF NOT EXISTS color TEXT;
-    `);
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS color TEXT;
+        `);
 
         await pool.query(`
-        ALTER TABLE public.products
-        ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 0;
-    `);
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 0;
+        `);
 
         await pool.query(`
-        ALTER TABLE public.products
-        ADD COLUMN IF NOT EXISTS size TEXT;
-    `);
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS size TEXT;
+        `);
 
         await pool.query(`
-        ALTER TABLE public.products
-        ADD COLUMN IF NOT EXISTS qr_token UUID;
-    `);
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS qr_token UUID;
+        `);
 
         await pool.query(`
-        ALTER TABLE public.products
-        ADD COLUMN IF NOT EXISTS qr_created_at TIMESTAMP;
-    `);
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS qr_created_at TIMESTAMP;
+        `);
 
         await pool.query(`
-        ALTER TABLE public.products
-        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();
-    `);
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();
+        `);
 
         await pool.query(`
-        CREATE UNIQUE INDEX IF NOT EXISTS
-        idx_products_qr_token
-        ON public.products(qr_token)
-        WHERE qr_token IS NOT NULL;
-    `);
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_products_qr_token
+            ON public.products(qr_token)
+            WHERE qr_token IS NOT NULL;
+        `);
 
         await pool.query(`
-        CREATE INDEX IF NOT EXISTS
-        idx_products_user_local
-        ON public.products(user_id, local_id);
-    `);
+            CREATE INDEX IF NOT EXISTS
+            idx_products_user_local
+            ON public.products(user_id, local_id);
+        `);
 
         await pool.query(`
-        CREATE INDEX IF NOT EXISTS
-        idx_products_user_id
-        ON public.products(user_id);
-    `);
+            CREATE INDEX IF NOT EXISTS
+            idx_products_user_id
+            ON public.products(user_id);
+        `);
 
         // ------------------------------------------------
         // ESKI TOVARLARGA QR TOKEN
         // ------------------------------------------------
 
         const qrRows = await pool.query(`
-        SELECT id
-        FROM public.products
-        WHERE qr_token IS NULL
-    `);
+            SELECT id
+            FROM public.products
+            WHERE qr_token IS NULL
+        `);
 
         for (const row of qrRows.rows) {
             await pool.query(
                 `
-            UPDATE public.products
-            SET
-                qr_token = $1,
-                qr_created_at = NOW()
-            WHERE id = $2
-              AND qr_token IS NULL
-            `,
+                UPDATE public.products
+                SET
+                    qr_token = $1,
+                    qr_created_at = NOW()
+                WHERE id = $2
+                  AND qr_token IS NULL
+                `,
                 [
                     randomUUID(),
                     row.id
@@ -361,116 +358,116 @@ const ensureTables = async () => {
         // ------------------------------------------------
 
         await pool.query(`
-        CREATE TABLE IF NOT EXISTS public.sales (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            product_id INTEGER NOT NULL,
-            title TEXT,
-            size TEXT,
-            local_id INTEGER,
-            category TEXT,
-            color TEXT,
-            quantity INTEGER NOT NULL,
-            cost_price NUMERIC NOT NULL DEFAULT 0,
-            selling_price NUMERIC NOT NULL DEFAULT 0,
-            profit NUMERIC NOT NULL DEFAULT 0,
-            returned_quantity INTEGER NOT NULL DEFAULT 0,
-            sold_at TIMESTAMP NOT NULL DEFAULT NOW()
-        );
-    `);
+            CREATE TABLE IF NOT EXISTS public.sales (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                title TEXT,
+                size TEXT,
+                local_id INTEGER,
+                category TEXT,
+                color TEXT,
+                quantity INTEGER NOT NULL,
+                cost_price NUMERIC NOT NULL DEFAULT 0,
+                selling_price NUMERIC NOT NULL DEFAULT 0,
+                profit NUMERIC NOT NULL DEFAULT 0,
+                returned_quantity INTEGER NOT NULL DEFAULT 0,
+                sold_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        `);
 
         // Eski o'rnatishlar uchun ustunlarni qo'shamiz
         // (Vozvrat va tahrirlash funksiyalari uchun kerak)
 
         await pool.query(`
-        ALTER TABLE public.sales
-        ADD COLUMN IF NOT EXISTS size TEXT;
-    `);
+            ALTER TABLE public.sales
+            ADD COLUMN IF NOT EXISTS size TEXT;
+        `);
 
         await pool.query(`
-        ALTER TABLE public.sales
-        ADD COLUMN IF NOT EXISTS local_id INTEGER;
-    `);
+            ALTER TABLE public.sales
+            ADD COLUMN IF NOT EXISTS local_id INTEGER;
+        `);
 
         await pool.query(`
-        ALTER TABLE public.sales
-        ADD COLUMN IF NOT EXISTS category TEXT;
-    `);
+            ALTER TABLE public.sales
+            ADD COLUMN IF NOT EXISTS category TEXT;
+        `);
 
         await pool.query(`
-        ALTER TABLE public.sales
-        ADD COLUMN IF NOT EXISTS color TEXT;
-    `);
+            ALTER TABLE public.sales
+            ADD COLUMN IF NOT EXISTS color TEXT;
+        `);
 
         await pool.query(`
-        ALTER TABLE public.sales
-        ADD COLUMN IF NOT EXISTS returned_quantity INTEGER NOT NULL DEFAULT 0;
-    `);
+            ALTER TABLE public.sales
+            ADD COLUMN IF NOT EXISTS returned_quantity INTEGER NOT NULL DEFAULT 0;
+        `);
 
         await pool.query(`
-        CREATE INDEX IF NOT EXISTS
-        idx_sales_user_id
-        ON public.sales(user_id);
-    `);
+            CREATE INDEX IF NOT EXISTS
+            idx_sales_user_id
+            ON public.sales(user_id);
+        `);
 
         await pool.query(`
-        CREATE INDEX IF NOT EXISTS
-        idx_sales_sold_at
-        ON public.sales(sold_at);
-    `);
+            CREATE INDEX IF NOT EXISTS
+            idx_sales_sold_at
+            ON public.sales(sold_at);
+        `);
 
         await pool.query(`
-        CREATE INDEX IF NOT EXISTS
-        idx_sales_user_local
-        ON public.sales(user_id, local_id);
-    `);
+            CREATE INDEX IF NOT EXISTS
+            idx_sales_user_local
+            ON public.sales(user_id, local_id);
+        `);
 
         // ------------------------------------------------
         // EXPENSES
         // ------------------------------------------------
 
         await pool.query(`
-        CREATE TABLE IF NOT EXISTS public.expenses (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            amount NUMERIC NOT NULL DEFAULT 0,
-            expense_type TEXT NOT NULL DEFAULT 'daily',
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
-        );
-    `);
+            CREATE TABLE IF NOT EXISTS public.expenses (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                amount NUMERIC NOT NULL DEFAULT 0,
+                expense_type TEXT NOT NULL DEFAULT 'daily',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        `);
 
         await pool.query(`
-        CREATE INDEX IF NOT EXISTS
-        idx_expenses_user_id
-        ON public.expenses(user_id);
-    `);
+            CREATE INDEX IF NOT EXISTS
+            idx_expenses_user_id
+            ON public.expenses(user_id);
+        `);
 
         await pool.query(`
-        CREATE INDEX IF NOT EXISTS
-        idx_expenses_created_at
-        ON public.expenses(created_at);
-    `);
+            CREATE INDEX IF NOT EXISTS
+            idx_expenses_created_at
+            ON public.expenses(created_at);
+        `);
 
         // ------------------------------------------------
         // NOTIFICATIONS
         // ------------------------------------------------
 
         await pool.query(`
-        CREATE TABLE IF NOT EXISTS public.notifications (
-            id SERIAL PRIMARY KEY,
-            site_login TEXT NOT NULL,
-            message TEXT NOT NULL,
-            is_sent BOOLEAN NOT NULL DEFAULT false,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
-        );
-    `);
+            CREATE TABLE IF NOT EXISTS public.notifications (
+                id SERIAL PRIMARY KEY,
+                site_login TEXT NOT NULL,
+                message TEXT NOT NULL,
+                is_sent BOOLEAN NOT NULL DEFAULT false,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        `);
 
         await pool.query(`
-        CREATE INDEX IF NOT EXISTS
-        idx_notifications_unsent
-        ON public.notifications(is_sent, created_at);
-    `);
+            CREATE INDEX IF NOT EXISTS
+            idx_notifications_unsent
+            ON public.notifications(is_sent, created_at);
+        `);
 
         console.log(
             'Barcha jadvallar tayyor (products, sales, expenses, notifications).'
@@ -482,7 +479,6 @@ const ensureTables = async () => {
             err
         );
     }
-
 };
 
 // ====================================================
@@ -517,7 +513,6 @@ app.get('/api/health', async (req, res) => {
                 'Database bilan ulanishda xatolik!'
         });
     }
-
 });
 
 // ====================================================
@@ -549,11 +544,11 @@ app.post('/api/login', async (req, res) => {
         const result =
             await pool.query(
                 `
-            SELECT *
-            FROM public.users
-            WHERE site_login = $1
-            LIMIT 1
-            `,
+                SELECT *
+                FROM public.users
+                WHERE site_login = $1
+                LIMIT 1
+                `,
                 [
                     cleanLogin
                 ]
@@ -681,7 +676,6 @@ app.post('/api/login', async (req, res) => {
                 'Serverda xatolik yuz berdi!'
         });
     }
-
 });
 
 // ====================================================
@@ -759,14 +753,14 @@ const authenticateToken = async (
         const result =
             await pool.query(
                 `
-            SELECT
-                id,
-                is_paid,
-                expires_at
-            FROM public.users
-            WHERE id = $1
-            LIMIT 1
-            `,
+                SELECT
+                    id,
+                    is_paid,
+                    expires_at
+                FROM public.users
+                WHERE id = $1
+                LIMIT 1
+                `,
                 [
                     decoded.userId
                 ]
@@ -815,7 +809,6 @@ const authenticateToken = async (
                 "Yaroqsiz yoki muddati o'tgan token!"
         });
     }
-
 };
 
 // ====================================================
@@ -832,18 +825,18 @@ app.get(
             const result =
                 await pool.query(
                     `
-                SELECT
-                    id,
-                    telegram_id,
-                    full_name,
-                    username,
-                    site_login,
-                    is_paid,
-                    expires_at
-                FROM public.users
-                WHERE id = $1
-                LIMIT 1
-                `,
+                    SELECT
+                        id,
+                        telegram_id,
+                        full_name,
+                        username,
+                        site_login,
+                        is_paid,
+                        expires_at
+                    FROM public.users
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
                     [
                         req.user.userId
                     ]
@@ -874,7 +867,6 @@ app.get(
             });
         }
     }
-
 );
 
 // ====================================================
@@ -896,13 +888,13 @@ app.get(
             const userResult =
                 await pool.query(
                     `
-                SELECT
-                    full_name,
-                    site_login
-                FROM public.users
-                WHERE id = $1
-                LIMIT 1
-                `,
+                    SELECT
+                        full_name,
+                        site_login
+                    FROM public.users
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
                     [
                         userId
                     ]
@@ -919,29 +911,29 @@ app.get(
             const productStats =
                 await pool.query(
                     `
-                SELECT
-                    COUNT(DISTINCT local_id)
-                        AS "totalProducts",
+                    SELECT
+                        COUNT(DISTINCT local_id)
+                            AS "totalProducts",
 
-                    COALESCE(
-                        SUM(quantity),
-                        0
-                    )
-                        AS "totalStock",
+                        COALESCE(
+                            SUM(quantity),
+                            0
+                        )
+                            AS "totalStock",
 
-                    COALESCE(
-                        SUM(
-                            quantity *
-                            cost_price
-                        ),
-                        0
-                    )
-                        AS "totalStockValue"
+                        COALESCE(
+                            SUM(
+                                quantity *
+                                cost_price
+                            ),
+                            0
+                        )
+                            AS "totalStockValue"
 
-                FROM public.products
+                    FROM public.products
 
-                WHERE user_id = $1
-                `,
+                    WHERE user_id = $1
+                    `,
                     [
                         userId
                     ]
@@ -956,44 +948,44 @@ app.get(
                     const sales =
                         await pool.query(
                             `
-                        SELECT
-                            COALESCE(
-                                SUM(
-                                    quantity -
-                                    COALESCE(returned_quantity, 0)
-                                ),
-                                0
-                            ) AS sold,
-
-                            COALESCE(
-                                SUM(
-                                    (
+                            SELECT
+                                COALESCE(
+                                    SUM(
                                         quantity -
                                         COALESCE(returned_quantity, 0)
-                                    )
-                                    * selling_price
-                                ),
-                                0
-                            ) AS revenue,
+                                    ),
+                                    0
+                                ) AS sold,
 
-                            COALESCE(
-                                SUM(
-                                    (selling_price - cost_price)
-                                    *
-                                    (
-                                        quantity -
-                                        COALESCE(returned_quantity, 0)
-                                    )
-                                ),
-                                0
-                            ) AS gross_profit
+                                COALESCE(
+                                    SUM(
+                                        (
+                                            quantity -
+                                            COALESCE(returned_quantity, 0)
+                                        )
+                                        * selling_price
+                                    ),
+                                    0
+                                ) AS revenue,
 
-                        FROM public.sales
+                                COALESCE(
+                                    SUM(
+                                        (selling_price - cost_price)
+                                        *
+                                        (
+                                            quantity -
+                                            COALESCE(returned_quantity, 0)
+                                        )
+                                    ),
+                                    0
+                                ) AS gross_profit
 
-                        WHERE
-                            user_id = $1
-                            AND ${salesFilter}
-                        `,
+                            FROM public.sales
+
+                            WHERE
+                                user_id = $1
+                                AND ${salesFilter}
+                            `,
                             [
                                 userId
                             ]
@@ -1002,18 +994,18 @@ app.get(
                     const expenses =
                         await pool.query(
                             `
-                        SELECT
-                            COALESCE(
-                                SUM(amount),
-                                0
-                            ) AS expense
+                            SELECT
+                                COALESCE(
+                                    SUM(amount),
+                                    0
+                                ) AS expense
 
-                        FROM public.expenses
+                            FROM public.expenses
 
-                        WHERE
-                            user_id = $1
-                            AND ${expenseFilter}
-                        `,
+                            WHERE
+                                user_id = $1
+                                AND ${expenseFilter}
+                            `,
                             [
                                 userId
                             ]
@@ -1058,53 +1050,53 @@ app.get(
             const monthly =
                 await getPeriodStats(
                     `
-                date_trunc(
-                    'month',
-                    sold_at
-                )
-                =
-                date_trunc(
-                    'month',
-                    CURRENT_DATE
-                )
-                `,
+                    date_trunc(
+                        'month',
+                        sold_at
+                    )
+                    =
+                    date_trunc(
+                        'month',
+                        CURRENT_DATE
+                    )
+                    `,
                     `
-                date_trunc(
-                    'month',
-                    created_at
-                )
-                =
-                date_trunc(
-                    'month',
-                    CURRENT_DATE
-                )
-                `
+                    date_trunc(
+                        'month',
+                        created_at
+                    )
+                    =
+                    date_trunc(
+                        'month',
+                        CURRENT_DATE
+                    )
+                    `
                 );
 
             const yearly =
                 await getPeriodStats(
                     `
-                date_trunc(
-                    'year',
-                    sold_at
-                )
-                =
-                date_trunc(
-                    'year',
-                    CURRENT_DATE
-                )
-                `,
+                    date_trunc(
+                        'year',
+                        sold_at
+                    )
+                    =
+                    date_trunc(
+                        'year',
+                        CURRENT_DATE
+                    )
+                    `,
                     `
-                date_trunc(
-                    'year',
-                    created_at
-                )
-                =
-                date_trunc(
-                    'year',
-                    CURRENT_DATE
-                )
-                `
+                    date_trunc(
+                        'year',
+                        created_at
+                    )
+                    =
+                    date_trunc(
+                        'year',
+                        CURRENT_DATE
+                    )
+                    `
                 );
 
             const total =
@@ -1197,7 +1189,6 @@ app.get(
             });
         }
     }
-
 );
 
 // ====================================================
@@ -1301,12 +1292,12 @@ app.post(
             const last =
                 await client.query(
                     `
-                SELECT local_id
-                FROM public.products
-                WHERE user_id = $1
-                ORDER BY local_id DESC, id DESC
-                LIMIT 1
-                `,
+                    SELECT local_id
+                    FROM public.products
+                    WHERE user_id = $1
+                    ORDER BY local_id DESC, id DESC
+                    LIMIT 1
+                    `,
                     [
                         userId
                     ]
@@ -1328,34 +1319,34 @@ app.post(
                 const result =
                     await client.query(
                         `
-                    INSERT INTO public.products
-                    (
-                        user_id,
-                        local_id,
-                        category,
-                        name,
-                        cost_price,
-                        color,
-                        size,
-                        quantity,
-                        qr_token,
-                        qr_created_at
-                    )
-                    VALUES
-                    (
-                        $1,
-                        $2,
-                        $3,
-                        $4,
-                        $5,
-                        $6,
-                        $7,
-                        $8,
-                        $9,
-                        NOW()
-                    )
-                    RETURNING *
-                    `,
+                        INSERT INTO public.products
+                        (
+                            user_id,
+                            local_id,
+                            category,
+                            name,
+                            cost_price,
+                            color,
+                            size,
+                            quantity,
+                            qr_token,
+                            qr_created_at
+                        )
+                        VALUES
+                        (
+                            $1,
+                            $2,
+                            $3,
+                            $4,
+                            $5,
+                            $6,
+                            $7,
+                            $8,
+                            $9,
+                            NOW()
+                        )
+                        RETURNING *
+                        `,
                         [
                             userId,
                             nextLocalId,
@@ -1403,34 +1394,34 @@ app.post(
                     const result =
                         await client.query(
                             `
-                        INSERT INTO public.products
-                        (
-                            user_id,
-                            local_id,
-                            category,
-                            name,
-                            cost_price,
-                            color,
-                            size,
-                            quantity,
-                            qr_token,
-                            qr_created_at
-                        )
-                        VALUES
-                        (
-                            $1,
-                            $2,
-                            $3,
-                            $4,
-                            $5,
-                            $6,
-                            $7,
-                            $8,
-                            $9,
-                            NOW()
-                        )
-                        RETURNING *
-                        `,
+                            INSERT INTO public.products
+                            (
+                                user_id,
+                                local_id,
+                                category,
+                                name,
+                                cost_price,
+                                color,
+                                size,
+                                quantity,
+                                qr_token,
+                                qr_created_at
+                            )
+                            VALUES
+                            (
+                                $1,
+                                $2,
+                                $3,
+                                $4,
+                                $5,
+                                $6,
+                                $7,
+                                $8,
+                                $9,
+                                NOW()
+                            )
+                            RETURNING *
+                            `,
                             [
                                 userId,
                                 nextLocalId,
@@ -1453,11 +1444,11 @@ app.post(
             const userResult =
                 await client.query(
                     `
-                SELECT site_login
-                FROM public.users
-                WHERE id = $1
-                LIMIT 1
-                `,
+                    SELECT site_login
+                    FROM public.users
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
                     [
                         userId
                     ]
@@ -1566,7 +1557,6 @@ app.post(
             client.release();
         }
     }
-
 );
 
 // ====================================================
@@ -1583,31 +1573,31 @@ app.get(
             const result =
                 await pool.query(
                     `
-                SELECT
-                    id,
-                    user_id,
-                    local_id,
-                    category,
-                    name,
-                    name AS title,
-                    cost_price,
-                    color,
-                    size,
-                    quantity,
-                    qr_token,
-                    qr_created_at,
-                    created_at
-                FROM public.products
-                WHERE user_id = $1
-                ORDER BY
-                    local_id DESC,
-                    CASE
-                        WHEN size ~ '^[0-9]+$'
-                        THEN size::int
-                    END ASC NULLS LAST,
-                    size ASC NULLS LAST,
-                    id ASC
-                `,
+                    SELECT
+                        id,
+                        user_id,
+                        local_id,
+                        category,
+                        name,
+                        name AS title,
+                        cost_price,
+                        color,
+                        size,
+                        quantity,
+                        qr_token,
+                        qr_created_at,
+                        created_at
+                    FROM public.products
+                    WHERE user_id = $1
+                    ORDER BY
+                        local_id DESC,
+                        CASE
+                            WHEN size ~ '^[0-9]+$'
+                            THEN size::int
+                        END ASC NULLS LAST,
+                        size ASC NULLS LAST,
+                        id ASC
+                    `,
                     [
                         req.user.userId
                     ]
@@ -1631,7 +1621,6 @@ app.get(
             });
         }
     }
-
 );
 
 // ====================================================
@@ -1647,7 +1636,7 @@ app.get(
 // olib tashlangan razmerlar esa o'chiriladi.
 
 app.put(
-    '/api/products/',
+    '/api/products/:local_id',
     authenticateToken,
     async (req, res) => {
 
@@ -1723,11 +1712,11 @@ app.put(
 
             const existingResult = await client.query(
                 `
-            SELECT *
-            FROM public.products
-            WHERE user_id = $1 AND local_id = $2
-            FOR UPDATE
-            `,
+                SELECT *
+                FROM public.products
+                WHERE user_id = $1 AND local_id = $2
+                FOR UPDATE
+                `,
                 [userId, localId]
             );
 
@@ -1786,17 +1775,17 @@ app.put(
 
                     const updated = await client.query(
                         `
-                    UPDATE public.products
-                    SET
-                        category = $1,
-                        name = $2,
-                        cost_price = $3,
-                        color = $4,
-                        size = $5,
-                        quantity = $6
-                    WHERE id = $7 AND user_id = $8
-                    RETURNING *
-                    `,
+                        UPDATE public.products
+                        SET
+                            category = $1,
+                            name = $2,
+                            cost_price = $3,
+                            color = $4,
+                            size = $5,
+                            quantity = $6
+                        WHERE id = $7 AND user_id = $8
+                        RETURNING *
+                        `,
                         [
                             cleanCategory,
                             cleanName,
@@ -1815,23 +1804,23 @@ app.put(
 
                     const inserted = await client.query(
                         `
-                    INSERT INTO public.products
-                    (
-                        user_id,
-                        local_id,
-                        category,
-                        name,
-                        cost_price,
-                        color,
-                        size,
-                        quantity,
-                        qr_token,
-                        qr_created_at
-                    )
-                    VALUES
-                    ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
-                    RETURNING *
-                    `,
+                        INSERT INTO public.products
+                        (
+                            user_id,
+                            local_id,
+                            category,
+                            name,
+                            cost_price,
+                            color,
+                            size,
+                            quantity,
+                            qr_token,
+                            qr_created_at
+                        )
+                        VALUES
+                        ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+                        RETURNING *
+                        `,
                         [
                             userId,
                             localId,
@@ -1857,9 +1846,9 @@ app.put(
 
                 await client.query(
                     `
-                DELETE FROM public.products
-                WHERE id = $1 AND user_id = $2
-                `,
+                    DELETE FROM public.products
+                    WHERE id = $1 AND user_id = $2
+                    `,
                     [row.id, userId]
                 );
             }
@@ -1870,10 +1859,10 @@ app.put(
 
             const userResult = await client.query(
                 `
-            SELECT site_login
-            FROM public.users
-            WHERE id = $1
-            `,
+                SELECT site_login
+                FROM public.users
+                WHERE id = $1
+                `,
                 [userId]
             );
 
@@ -1947,7 +1936,6 @@ app.put(
             client.release();
         }
     }
-
 );
 
 // ====================================================
@@ -2075,13 +2063,13 @@ app.post(
 
                 const result = await client.query(
                     `
-                SELECT *
-                FROM public.products
-                WHERE
-                    id = $1
-                    AND user_id = $2
-                FOR UPDATE
-                `,
+                    SELECT *
+                    FROM public.products
+                    WHERE
+                        id = $1
+                        AND user_id = $2
+                    FOR UPDATE
+                    `,
                     [
                         item.product_id,
                         userId
@@ -2130,35 +2118,35 @@ app.post(
                 // hisobotlar uchun snapshot sifatida saqlanadi)
                 await client.query(
                     `
-                INSERT INTO public.sales
-                (
-                    user_id,
-                    product_id,
-                    title,
-                    size,
-                    local_id,
-                    category,
-                    color,
-                    quantity,
-                    cost_price,
-                    selling_price,
-                    profit
-                )
-                VALUES
-                (
-                    $1,
-                    $2,
-                    $3,
-                    $4,
-                    $5,
-                    $6,
-                    $7,
-                    $8,
-                    $9,
-                    $10,
-                    $11
-                )
-                `,
+                    INSERT INTO public.sales
+                    (
+                        user_id,
+                        product_id,
+                        title,
+                        size,
+                        local_id,
+                        category,
+                        color,
+                        quantity,
+                        cost_price,
+                        selling_price,
+                        profit
+                    )
+                    VALUES
+                    (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5,
+                        $6,
+                        $7,
+                        $8,
+                        $9,
+                        $10,
+                        $11
+                    )
+                    `,
                     [
                         userId,
                         product.id,
@@ -2181,11 +2169,11 @@ app.post(
 
                     await client.query(
                         `
-                    DELETE FROM public.products
-                    WHERE
-                        id = $1
-                        AND user_id = $2
-                    `,
+                        DELETE FROM public.products
+                        WHERE
+                            id = $1
+                            AND user_id = $2
+                        `,
                         [
                             product.id,
                             userId
@@ -2198,12 +2186,12 @@ app.post(
 
                     await client.query(
                         `
-                    UPDATE public.products
-                    SET quantity = $1
-                    WHERE
-                        id = $2
-                        AND user_id = $3
-                    `,
+                        UPDATE public.products
+                        SET quantity = $1
+                        WHERE
+                            id = $2
+                            AND user_id = $3
+                        `,
                         [
                             newQuantity,
                             product.id,
@@ -2255,10 +2243,10 @@ app.post(
             const userResult =
                 await client.query(
                     `
-                SELECT site_login
-                FROM public.users
-                WHERE id = $1
-                `,
+                    SELECT site_login
+                    FROM public.users
+                    WHERE id = $1
+                    `,
                     [userId]
                 );
 
@@ -2294,23 +2282,23 @@ app.post(
                     const remainingResult =
                         await client.query(
                             `
-                        SELECT
-                            local_id,
-                            size,
-                            quantity
-                        FROM public.products
-                        WHERE
-                            user_id = $1
-                            AND local_id = ANY($2::int[])
-                        ORDER BY
-                            local_id ASC,
-                            CASE
-                                WHEN size ~ '^[0-9]+$'
-                                THEN size::int
-                            END ASC NULLS LAST,
-                            size ASC NULLS LAST,
-                            id ASC
-                        `,
+                            SELECT
+                                local_id,
+                                size,
+                                quantity
+                            FROM public.products
+                            WHERE
+                                user_id = $1
+                                AND local_id = ANY($2::int[])
+                            ORDER BY
+                                local_id ASC,
+                                CASE
+                                    WHEN size ~ '^[0-9]+$'
+                                    THEN size::int
+                                END ASC NULLS LAST,
+                                size ASC NULLS LAST,
+                                id ASC
+                            `,
                             [
                                 userId,
                                 localIds
@@ -2515,8 +2503,8 @@ app.post(
             client.release();
         }
     }
-
 );
+
 
 // ====================================================
 // TOVARNI O'CHIRISH / KAMAYTIRISH
@@ -2663,13 +2651,13 @@ app.post(
                 const result =
                     await client.query(
                         `
-                    SELECT *
-                    FROM public.products
-                    WHERE
-                        id = $1
-                        AND user_id = $2
-                    FOR UPDATE
-                    `,
+                        SELECT *
+                        FROM public.products
+                        WHERE
+                            id = $1
+                            AND user_id = $2
+                        FOR UPDATE
+                        `,
                         [
                             item.product_id,
                             userId
@@ -2733,11 +2721,11 @@ app.post(
 
                     await client.query(
                         `
-                    DELETE FROM public.products
-                    WHERE
-                        id = $1
-                        AND user_id = $2
-                    `,
+                        DELETE FROM public.products
+                        WHERE
+                            id = $1
+                            AND user_id = $2
+                        `,
                         [
                             product.id,
                             userId
@@ -2750,12 +2738,12 @@ app.post(
 
                     await client.query(
                         `
-                    UPDATE public.products
-                    SET quantity = $1
-                    WHERE
-                        id = $2
-                        AND user_id = $3
-                    `,
+                        UPDATE public.products
+                        SET quantity = $1
+                        WHERE
+                            id = $2
+                            AND user_id = $3
+                        `,
                         [
                             newQty,
                             product.id,
@@ -2827,10 +2815,10 @@ app.post(
             const userResult =
                 await client.query(
                     `
-                SELECT site_login
-                FROM public.users
-                WHERE id = $1
-                `,
+                    SELECT site_login
+                    FROM public.users
+                    WHERE id = $1
+                    `,
                     [userId]
                 );
 
@@ -2862,23 +2850,23 @@ app.post(
                     const remainingResult =
                         await client.query(
                             `
-                        SELECT
-                            local_id,
-                            size,
-                            quantity
-                        FROM public.products
-                        WHERE
-                            user_id = $1
-                            AND local_id = ANY($2::int[])
-                        ORDER BY
-                            local_id ASC,
-                            CASE
-                                WHEN size ~ '^[0-9]+$'
-                                THEN size::int
-                            END ASC NULLS LAST,
-                            size ASC NULLS LAST,
-                            id ASC
-                        `,
+                            SELECT
+                                local_id,
+                                size,
+                                quantity
+                            FROM public.products
+                            WHERE
+                                user_id = $1
+                                AND local_id = ANY($2::int[])
+                            ORDER BY
+                                local_id ASC,
+                                CASE
+                                    WHEN size ~ '^[0-9]+$'
+                                    THEN size::int
+                                END ASC NULLS LAST,
+                                size ASC NULLS LAST,
+                                id ASC
+                            `,
                             [
                                 userId,
                                 localIds
@@ -3075,7 +3063,6 @@ app.post(
             client.release();
         }
     }
-
 );
 
 // ====================================================
@@ -3144,22 +3131,22 @@ app.post(
             const result =
                 await client.query(
                     `
-                INSERT INTO public.expenses
-                (
-                    user_id,
-                    title,
-                    amount,
-                    expense_type
-                )
-                VALUES
-                (
-                    $1,
-                    $2,
-                    $3,
-                    $4
-                )
-                RETURNING *
-                `,
+                    INSERT INTO public.expenses
+                    (
+                        user_id,
+                        title,
+                        amount,
+                        expense_type
+                    )
+                    VALUES
+                    (
+                        $1,
+                        $2,
+                        $3,
+                        $4
+                    )
+                    RETURNING *
+                    `,
                     [
                         userId,
                         cleanTitle,
@@ -3178,11 +3165,11 @@ app.post(
             const userResult =
                 await client.query(
                     `
-                SELECT
-                    site_login
-                FROM public.users
-                WHERE id = $1
-                `,
+                    SELECT
+                        site_login
+                    FROM public.users
+                    WHERE id = $1
+                    `,
                     [userId]
                 );
 
@@ -3282,7 +3269,6 @@ app.post(
             client.release();
         }
     }
-
 );
 
 // ====================================================
@@ -3296,12 +3282,12 @@ app.get(
         try {
             const result = await pool.query(
                 `
-    SELECT *
-    FROM public.expenses
-    WHERE user_id = $1
-      AND created_at >= NOW() - INTERVAL '7 days'
-    ORDER BY created_at DESC, id DESC
-    `,
+                SELECT *
+                FROM public.expenses
+                WHERE user_id = $1
+                  AND created_at >= NOW() - INTERVAL '7 days'
+                ORDER BY created_at DESC, id DESC
+                `,
                 [req.user.userId]
             );
 
@@ -3311,7 +3297,6 @@ app.get(
             res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
         }
     }
-
 );
 
 // ====================================================
@@ -3319,7 +3304,7 @@ app.get(
 // ====================================================
 
 app.put(
-    '/api/dashboard/expenses/',
+    '/api/dashboard/expenses/:id',
     authenticateToken,
     async (req, res) => {
 
@@ -3368,14 +3353,14 @@ app.put(
 
             const result = await client.query(
                 `
-            UPDATE public.expenses
-            SET
-                title = $1,
-                amount = $2,
-                expense_type = $3
-            WHERE id = $4 AND user_id = $5
-            RETURNING *
-            `,
+                UPDATE public.expenses
+                SET
+                    title = $1,
+                    amount = $2,
+                    expense_type = $3
+                WHERE id = $4 AND user_id = $5
+                RETURNING *
+                `,
                 [cleanTitle, parsedAmount, type, expenseId, userId]
             );
 
@@ -3439,7 +3424,6 @@ app.put(
             client.release();
         }
     }
-
 );
 
 // ====================================================
@@ -3447,7 +3431,7 @@ app.put(
 // ====================================================
 
 app.delete(
-    '/api/dashboard/expenses/',
+    '/api/dashboard/expenses/:id',
     authenticateToken,
     async (req, res) => {
 
@@ -3468,10 +3452,10 @@ app.delete(
 
             const result = await client.query(
                 `
-            DELETE FROM public.expenses
-            WHERE id = $1 AND user_id = $2
-            RETURNING *
-            `,
+                DELETE FROM public.expenses
+                WHERE id = $1 AND user_id = $2
+                RETURNING *
+                `,
                 [expenseId, userId]
             );
 
@@ -3533,7 +3517,6 @@ app.delete(
             client.release();
         }
     }
-
 );
 
 // ====================================================
@@ -3551,30 +3534,20 @@ app.get(
         try {
             const result = await pool.query(
                 `
-    SELECT
-        id,
-        product_id,
-        title,
-        title AS name,
-        size,
-        local_id,
-        category,
-        color,
-        quantity,
-        COALESCE(returned_quantity, 0) AS returned_quantity,
-        (quantity - COALESCE(returned_quantity, 0)) AS sell_quantity,
-        cost_price,
-        selling_price,
-        profit,
-        sold_at
-    FROM public.sales
-    WHERE
-        user_id = $1
-        AND quantity > COALESCE(returned_quantity, 0)
-        AND sold_at >= NOW() - INTERVAL '7 days'
-    ORDER BY sold_at DESC, id DESC
-    LIMIT 300
-    `,
+                SELECT
+                    id, product_id, title, title AS name, size,
+                    local_id, category, color, quantity,
+                    COALESCE(returned_quantity, 0) AS returned_quantity,
+                    (quantity - COALESCE(returned_quantity, 0)) AS sell_quantity,
+                    cost_price, selling_price, profit, sold_at
+                FROM public.sales
+                WHERE
+                    user_id = $1
+                    AND quantity > COALESCE(returned_quantity, 0)
+                    AND sold_at >= NOW() - INTERVAL '7 days'
+                ORDER BY sold_at DESC, id DESC
+                LIMIT 300
+                `,
                 [req.user.userId]
             );
 
@@ -3584,7 +3557,6 @@ app.get(
             res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
         }
     }
-
 );
 
 // ====================================================
@@ -3627,11 +3599,11 @@ app.post(
 
             const saleResult = await client.query(
                 `
-            SELECT *
-            FROM public.sales
-            WHERE id = $1 AND user_id = $2
-            FOR UPDATE
-            `,
+                SELECT *
+                FROM public.sales
+                WHERE id = $1 AND user_id = $2
+                FOR UPDATE
+                `,
                 [saleId, userId]
             );
 
@@ -3664,10 +3636,10 @@ app.post(
 
             await client.query(
                 `
-            UPDATE public.sales
-            SET returned_quantity = $1
-            WHERE id = $2 AND user_id = $3
-            `,
+                UPDATE public.sales
+                SET returned_quantity = $1
+                WHERE id = $2 AND user_id = $3
+                `,
                 [alreadyReturned + returnQty, saleId, userId]
             );
 
@@ -3681,11 +3653,11 @@ app.post(
 
                 const byId = await client.query(
                     `
-                SELECT *
-                FROM public.products
-                WHERE id = $1 AND user_id = $2
-                FOR UPDATE
-                `,
+                    SELECT *
+                    FROM public.products
+                    WHERE id = $1 AND user_id = $2
+                    FOR UPDATE
+                    `,
                     [sale.product_id, userId]
                 );
 
@@ -3699,15 +3671,15 @@ app.post(
                 const bySizeQuery =
                     sale.size === null
                         ? `
-                      SELECT * FROM public.products
-                      WHERE user_id = $1 AND local_id = $2 AND size IS NULL
-                      FOR UPDATE
-                      `
+                          SELECT * FROM public.products
+                          WHERE user_id = $1 AND local_id = $2 AND size IS NULL
+                          FOR UPDATE
+                          `
                         : `
-                      SELECT * FROM public.products
-                      WHERE user_id = $1 AND local_id = $2 AND size = $3
-                      FOR UPDATE
-                      `;
+                          SELECT * FROM public.products
+                          WHERE user_id = $1 AND local_id = $2 AND size = $3
+                          FOR UPDATE
+                          `;
 
                 const params =
                     sale.size === null
@@ -3730,11 +3702,11 @@ app.post(
 
                 const updated = await client.query(
                     `
-                UPDATE public.products
-                SET quantity = $1
-                WHERE id = $2 AND user_id = $3
-                RETURNING *
-                `,
+                    UPDATE public.products
+                    SET quantity = $1
+                    WHERE id = $2 AND user_id = $3
+                    RETURNING *
+                    `,
                     [newQty, targetProduct.id, userId]
                 );
 
@@ -3746,23 +3718,23 @@ app.post(
                 // sotuv yozuvi asosida qaytadan yaratamiz
                 const inserted = await client.query(
                     `
-                INSERT INTO public.products
-                (
-                    user_id,
-                    local_id,
-                    category,
-                    name,
-                    cost_price,
-                    color,
-                    size,
-                    quantity,
-                    qr_token,
-                    qr_created_at
-                )
-                VALUES
-                ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
-                RETURNING *
-                `,
+                    INSERT INTO public.products
+                    (
+                        user_id,
+                        local_id,
+                        category,
+                        name,
+                        cost_price,
+                        color,
+                        size,
+                        quantity,
+                        qr_token,
+                        qr_created_at
+                    )
+                    VALUES
+                    ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+                    RETURNING *
+                    `,
                     [
                         userId,
                         sale.local_id || 1,
@@ -3834,15 +3806,15 @@ app.post(
             client.release();
         }
     }
-
 );
+
 
 // ====================================================
 // QR MA'LUMOT
 // ====================================================
 
 app.get(
-    '/api/qr/',
+    '/api/qr/:token',
     async (req, res) => {
 
         const token =
@@ -3862,23 +3834,23 @@ app.get(
             const result =
                 await pool.query(
                     `
-                SELECT
-                    id,
-                    user_id,
-                    local_id,
-                    name,
-                    category,
-                    color,
-                    size,
-                    cost_price,
-                    quantity,
-                    qr_token,
-                    qr_created_at,
-                    created_at
-                FROM public.products
-                WHERE qr_token = $1
-                LIMIT 1
-                `,
+                    SELECT
+                        id,
+                        user_id,
+                        local_id,
+                        name,
+                        category,
+                        color,
+                        size,
+                        cost_price,
+                        quantity,
+                        qr_token,
+                        qr_created_at,
+                        created_at
+                    FROM public.products
+                    WHERE qr_token = $1
+                    LIMIT 1
+                    `,
                     [token]
                 );
 
@@ -3919,15 +3891,15 @@ app.get(
             });
         }
     }
-
 );
+
 
 // ====================================================
 // QR SOTUV
 // ====================================================
 
 app.post(
-    '/api/qr//sell',
+    '/api/qr/:token/sell',
     async (req, res) => {
 
         const token =
@@ -3971,12 +3943,12 @@ app.post(
             const result =
                 await client.query(
                     `
-                SELECT *
-                FROM public.products
-                WHERE qr_token = $1
-                LIMIT 1
-                FOR UPDATE
-                `,
+                    SELECT *
+                    FROM public.products
+                    WHERE qr_token = $1
+                    LIMIT 1
+                    FOR UPDATE
+                    `,
                     [token]
                 );
 
@@ -4032,35 +4004,35 @@ app.post(
 
             await client.query(
                 `
-            INSERT INTO public.sales
-            (
-                user_id,
-                product_id,
-                title,
-                size,
-                local_id,
-                category,
-                color,
-                quantity,
-                cost_price,
-                selling_price,
-                profit
-            )
-            VALUES
-            (
-                $1,
-                $2,
-                $3,
-                $4,
-                $5,
-                $6,
-                $7,
-                $8,
-                $9,
-                $10,
-                $11
-            )
-            `,
+                INSERT INTO public.sales
+                (
+                    user_id,
+                    product_id,
+                    title,
+                    size,
+                    local_id,
+                    category,
+                    color,
+                    quantity,
+                    cost_price,
+                    selling_price,
+                    profit
+                )
+                VALUES
+                (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    $5,
+                    $6,
+                    $7,
+                    $8,
+                    $9,
+                    $10,
+                    $11
+                )
+                `,
                 [
                     product.user_id,
                     product.id,
@@ -4084,11 +4056,11 @@ app.post(
 
                 await client.query(
                     `
-                DELETE FROM public.products
-                WHERE
-                    id = $1
-                    AND user_id = $2
-                `,
+                    DELETE FROM public.products
+                    WHERE
+                        id = $1
+                        AND user_id = $2
+                    `,
                     [
                         product.id,
                         product.user_id
@@ -4099,12 +4071,12 @@ app.post(
 
                 await client.query(
                     `
-                UPDATE public.products
-                SET quantity = $1
-                WHERE
-                    id = $2
-                    AND user_id = $3
-                `,
+                    UPDATE public.products
+                    SET quantity = $1
+                    WHERE
+                        id = $2
+                        AND user_id = $3
+                    `,
                     [
                         newQty,
                         product.id,
@@ -4120,11 +4092,11 @@ app.post(
             const userResult =
                 await client.query(
                     `
-                SELECT
-                    site_login
-                FROM public.users
-                WHERE id = $1
-                `,
+                    SELECT
+                        site_login
+                    FROM public.users
+                    WHERE id = $1
+                    `,
                     [product.user_id]
                 );
 
@@ -4259,15 +4231,15 @@ app.post(
             client.release();
         }
     }
-
 );
+
 
 // ====================================================
 // QR O'CHIRISH
 // ====================================================
 
 app.post(
-    '/api/qr//delete',
+    '/api/qr/:token/delete',
     async (req, res) => {
 
         const token =
@@ -4296,12 +4268,12 @@ app.post(
             const result =
                 await client.query(
                     `
-                SELECT *
-                FROM public.products
-                WHERE qr_token = $1
-                LIMIT 1
-                FOR UPDATE
-                `,
+                    SELECT *
+                    FROM public.products
+                    WHERE qr_token = $1
+                    LIMIT 1
+                    FOR UPDATE
+                    `,
                     [token]
                 );
 
@@ -4325,11 +4297,11 @@ app.post(
             const userResult =
                 await client.query(
                     `
-                SELECT
-                    site_login
-                FROM public.users
-                WHERE id = $1
-                `,
+                    SELECT
+                        site_login
+                    FROM public.users
+                    WHERE id = $1
+                    `,
                     [product.user_id]
                 );
 
@@ -4343,11 +4315,11 @@ app.post(
 
             await client.query(
                 `
-            DELETE FROM public.products
-            WHERE
-                id = $1
-                AND user_id = $2
-            `,
+                DELETE FROM public.products
+                WHERE
+                    id = $1
+                    AND user_id = $2
+                `,
                 [
                     product.id,
                     product.user_id
@@ -4441,15 +4413,15 @@ app.post(
             client.release();
         }
     }
-
 );
+
 
 // ====================================================
 // BOT PROFITS
 // ====================================================
 
 app.get(
-    '/api/bot/profits/',
+    '/api/bot/profits/:site_login',
     async (req, res) => {
 
         const siteLogin =
@@ -4473,12 +4445,12 @@ app.get(
             const userResult =
                 await pool.query(
                     `
-                SELECT
-                    id
-                FROM public.users
-                WHERE site_login = $1
-                LIMIT 1
-                `,
+                    SELECT
+                        id
+                    FROM public.users
+                    WHERE site_login = $1
+                    LIMIT 1
+                    `,
                     [siteLogin]
                 );
 
@@ -4505,39 +4477,39 @@ app.get(
                     const sales =
                         await pool.query(
                             `
-                        SELECT
-                            COALESCE(
-                                SUM(
-                                    (selling_price - cost_price)
-                                    *
-                                    (
-                                        quantity -
-                                        COALESCE(returned_quantity, 0)
-                                    )
-                                ),
-                                0
-                            ) AS gross_profit
-                        FROM public.sales
-                        WHERE
-                            user_id = $1
-                            AND ${salesFilter}
-                        `,
+                            SELECT
+                                COALESCE(
+                                    SUM(
+                                        (selling_price - cost_price)
+                                        *
+                                        (
+                                            quantity -
+                                            COALESCE(returned_quantity, 0)
+                                        )
+                                    ),
+                                    0
+                                ) AS gross_profit
+                            FROM public.sales
+                            WHERE
+                                user_id = $1
+                                AND ${salesFilter}
+                            `,
                             [userId]
                         );
 
                     const expenses =
                         await pool.query(
                             `
-                        SELECT
-                            COALESCE(
-                                SUM(amount),
-                                0
-                            ) AS expense
-                        FROM public.expenses
-                        WHERE
-                            user_id = $1
-                            AND ${expenseFilter}
-                        `,
+                            SELECT
+                                COALESCE(
+                                    SUM(amount),
+                                    0
+                                ) AS expense
+                            FROM public.expenses
+                            WHERE
+                                user_id = $1
+                                AND ${expenseFilter}
+                            `,
                             [userId]
                         );
 
@@ -4560,13 +4532,13 @@ app.get(
             const dailyProfit =
                 await getPeriodProfit(
                     `
-                sold_at::date =
-                CURRENT_DATE
-                `,
+                    sold_at::date =
+                    CURRENT_DATE
+                    `,
                     `
-                created_at::date =
-                CURRENT_DATE
-                `
+                    created_at::date =
+                    CURRENT_DATE
+                    `
                 );
 
             // ====================================================
@@ -4576,19 +4548,19 @@ app.get(
             const weeklyProfit =
                 await getPeriodProfit(
                     `
-                sold_at >=
-                date_trunc(
-                    'week',
-                    CURRENT_DATE
-                )
-                `,
+                    sold_at >=
+                    date_trunc(
+                        'week',
+                        CURRENT_DATE
+                    )
+                    `,
                     `
-                created_at >=
-                date_trunc(
-                    'week',
-                    CURRENT_DATE
-                )
-                `
+                    created_at >=
+                    date_trunc(
+                        'week',
+                        CURRENT_DATE
+                    )
+                    `
                 );
 
             // ====================================================
@@ -4598,27 +4570,27 @@ app.get(
             const monthlyProfit =
                 await getPeriodProfit(
                     `
-                date_trunc(
-                    'month',
-                    sold_at
-                )
-                =
-                date_trunc(
-                    'month',
-                    CURRENT_DATE
-                )
-                `,
+                    date_trunc(
+                        'month',
+                        sold_at
+                    )
+                    =
+                    date_trunc(
+                        'month',
+                        CURRENT_DATE
+                    )
+                    `,
                     `
-                date_trunc(
-                    'month',
-                    created_at
-                )
-                =
-                date_trunc(
-                    'month',
-                    CURRENT_DATE
-                )
-                `
+                    date_trunc(
+                        'month',
+                        created_at
+                    )
+                    =
+                    date_trunc(
+                        'month',
+                        CURRENT_DATE
+                    )
+                    `
                 );
 
             // ====================================================
@@ -4628,27 +4600,27 @@ app.get(
             const yearlyProfit =
                 await getPeriodProfit(
                     `
-                date_trunc(
-                    'year',
-                    sold_at
-                )
-                =
-                date_trunc(
-                    'year',
-                    CURRENT_DATE
-                )
-                `,
+                    date_trunc(
+                        'year',
+                        sold_at
+                    )
+                    =
+                    date_trunc(
+                        'year',
+                        CURRENT_DATE
+                    )
+                    `,
                     `
-                date_trunc(
-                    'year',
-                    created_at
-                )
-                =
-                date_trunc(
-                    'year',
-                    CURRENT_DATE
-                )
-                `
+                    date_trunc(
+                        'year',
+                        created_at
+                    )
+                    =
+                    date_trunc(
+                        'year',
+                        CURRENT_DATE
+                    )
+                    `
                 );
 
             return res.json({
@@ -4680,8 +4652,8 @@ app.get(
             });
         }
     }
-
 );
+
 
 // ====================================================
 // 404
@@ -4695,8 +4667,8 @@ app.use(
                 "Bunday yo'nalish topilmadi"
         });
     }
-
 );
+
 
 // ====================================================
 // GLOBAL ERROR HANDLER
@@ -4719,8 +4691,8 @@ app.use(
                 "Serverda kutilmagan xatolik yuz berdi!"
         });
     }
-
 );
+
 
 // ====================================================
 // SERVER
@@ -4741,6 +4713,7 @@ const server =
             ensureTables();
         }
     );
+
 
 // ====================================================
 // SERVER ERROR
@@ -4766,8 +4739,8 @@ server.on(
 
         process.exit(1);
     }
-
 );
+
 
 // ====================================================
 // GRACEFUL SHUTDOWN
@@ -4804,7 +4777,6 @@ const shutdown = async (signal) => {
 
         process.exit(1);
     }
-
 };
 
 process.on(
