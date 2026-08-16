@@ -1453,13 +1453,7 @@ app.post(
             });
         }
 
-        // Razmerlar majburiy
-        if (!sizes || !String(sizes).trim()) {
-            return res.status(400).json({
-                message:
-                    "Razmerlar kiritilishi shart!"
-            });
-        }
+        // Razmerlar ixtiyoriy (bo'sh bo'lsa bitta Standart sifatida saqlanadi)
 
         const parsedCostPrice =
             Number(cost_price);
@@ -1580,12 +1574,7 @@ app.post(
                 });
         }
 
-        if (sizeList.length === 0) {
-            return res.status(400).json({
-                message:
-                    "Kamida bitta razmer kiritilishi shart!"
-            });
-        }
+        // sizeList bo'sh bo'lsa — bitta qator size=null (Standart) bilan yoziladi
 
         const client =
             await pool.connect();
@@ -2355,12 +2344,7 @@ app.put(
             });
         }
 
-        // Razmerlar majburiy
-        if (!sizes || !String(sizes).trim()) {
-            return res.status(400).json({
-                message: "Razmerlar kiritilishi shart!"
-            });
-        }
+        // Razmerlar ixtiyoriy
 
         const parsedCostPrice = Number(cost_price);
 
@@ -2427,11 +2411,7 @@ app.put(
             });
         }
 
-        if (sizeList.length === 0) {
-            return res.status(400).json({
-                message: "Kamida bitta razmer kiritilishi shart!"
-            });
-        }
+        // sizeList bo'sh bo'lsa — bitta qator size=null bilan
 
         const client = await pool.connect();
 
