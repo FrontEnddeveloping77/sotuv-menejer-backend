@@ -224,22 +224,33 @@ const queueTelegramNotification = async (
 
 // ====================================================
 // JADVALLARNI YARATISH
+// (HAR BIR BO'LIM ALOHIDA try/catch BILAN O'RALGAN —
+//  bittasida xato bo'lsa ham, qolgan jadvallar baribir
+//  yaratiladi. Avval bu funksiya hech qayerda
+//  chaqirilmagani sabab, jadvallar umuman tekshirilmay
+//  qolgan va shu tufayli barcha amallar xato berardi.)
 // ====================================================
 
 const ensureTables = async () => {
+
+    // ------------------------------------------------
+    // USERS
+    // ------------------------------------------------
+
+    /*
+     * users jadvali Telegram bot tomonidan oldindan
+     * yaratilgan bo'lishi mumkin.
+     *
+     * Shu sababli bu yerda users jadvalini qayta
+     * yaratmaymiz. Faqat kerakli ustunlarni qo'shamiz.
+     *
+     * Agar bu jadval hali mavjud bo'lmasa ham, xato
+     * shu blokda ushlab qolinadi va qolgan jadvallar
+     * (products, sales, expenses, notifications)
+     * baribir yaratiladi.
+     */
+
     try {
-
-        // ------------------------------------------------
-        // USERS
-        // ------------------------------------------------
-
-        /*
-         * users jadvali Telegram bot tomonidan oldindan
-         * yaratilgan bo'lishi mumkin.
-         *
-         * Shu sababli bu yerda users jadvalini qayta
-         * yaratmaymiz. Faqat kerakli ustunlarni qo'shamiz.
-         */
 
         await pool.query(`
             ALTER TABLE public.users
@@ -252,9 +263,19 @@ const ensureTables = async () => {
             ON public.users(linked_group_chat_id);
         `);
 
-        // ------------------------------------------------
-        // PRODUCTS
-        // ------------------------------------------------
+    } catch (err) {
+
+        console.error(
+            "⚠️ USERS jadvalini yangilashda xatolik (davom etilmoqda):",
+            err.message
+        );
+    }
+
+    // ------------------------------------------------
+    // PRODUCTS
+    // ------------------------------------------------
+
+    try {
 
         await pool.query(`
             CREATE TABLE IF NOT EXISTS public.products (
@@ -332,9 +353,19 @@ const ensureTables = async () => {
             ON public.products(user_id);
         `);
 
-        // ------------------------------------------------
-        // ESKI TOVARLARGA QR TOKEN
-        // ------------------------------------------------
+    } catch (err) {
+
+        console.error(
+            "⚠️ PRODUCTS jadvalini yaratishda xatolik:",
+            err.message
+        );
+    }
+
+    // ------------------------------------------------
+    // ESKI TOVARLARGA QR TOKEN
+    // ------------------------------------------------
+
+    try {
 
         const qrRows = await pool.query(`
             SELECT id
@@ -359,9 +390,19 @@ const ensureTables = async () => {
             );
         }
 
-        // ------------------------------------------------
-        // SALES
-        // ------------------------------------------------
+    } catch (err) {
+
+        console.error(
+            "⚠️ Eski tovarlarga QR token biriktirishda xatolik:",
+            err.message
+        );
+    }
+
+    // ------------------------------------------------
+    // SALES
+    // ------------------------------------------------
+
+    try {
 
         await pool.query(`
             CREATE TABLE IF NOT EXISTS public.sales (
@@ -396,9 +437,19 @@ const ensureTables = async () => {
             ON public.sales(sold_at);
         `);
 
-        // ------------------------------------------------
-        // EXPENSES
-        // ------------------------------------------------
+    } catch (err) {
+
+        console.error(
+            "⚠️ SALES jadvalini yaratishda xatolik:",
+            err.message
+        );
+    }
+
+    // ------------------------------------------------
+    // EXPENSES
+    // ------------------------------------------------
+
+    try {
 
         await pool.query(`
             CREATE TABLE IF NOT EXISTS public.expenses (
@@ -423,9 +474,19 @@ const ensureTables = async () => {
             ON public.expenses(created_at);
         `);
 
-        // ------------------------------------------------
-        // NOTIFICATIONS
-        // ------------------------------------------------
+    } catch (err) {
+
+        console.error(
+            "⚠️ EXPENSES jadvalini yaratishda xatolik:",
+            err.message
+        );
+    }
+
+    // ------------------------------------------------
+    // NOTIFICATIONS
+    // ------------------------------------------------
+
+    try {
 
         await pool.query(`
             CREATE TABLE IF NOT EXISTS public.notifications (
@@ -443,16 +504,17 @@ const ensureTables = async () => {
             ON public.notifications(is_sent, created_at);
         `);
 
-        console.log(
-            'Barcha jadvallar tayyor (products, sales, expenses, notifications).'
-        );
-
     } catch (err) {
+
         console.error(
-            'Jadvallarni yaratishda xatolik:',
-            err
+            "⚠️ NOTIFICATIONS jadvalini yaratishda xatolik:",
+            err.message
         );
     }
+
+    console.log(
+        '✅ Jadvallar tekshirildi/tayyorlandi (products, sales, expenses, notifications).'
+    );
 };
 
 // ====================================================
@@ -4501,13 +4563,32 @@ app.use(
 
 // ====================================================
 // SERVER
+// (endi ensureTables() server ishga tushishidan oldin
+//  chaqirilib, KUTIB TURILADI — shu tufayli barcha
+//  jadvallar tayyor bo'lgandan keyingina server so'rovlarni
+//  qabul qila boshlaydi.)
 // ====================================================
 
 const PORT =
     Number(process.env.PORT) || 5000;
 
-const server =
-    app.listen(
+let server;
+
+const startServer = async () => {
+
+    try {
+
+        await ensureTables();
+
+    } catch (err) {
+
+        console.error(
+            '❌ ensureTables() umumiy xatosi (server baribir ishga tushadi):',
+            err
+        );
+    }
+
+    server = app.listen(
         PORT,
         () => {
 
@@ -4517,32 +4598,34 @@ const server =
         }
     );
 
+    // ====================================================
+    // SERVER ERROR
+    // ====================================================
 
-// ====================================================
-// SERVER ERROR
-// ====================================================
+    server.on(
+        'error',
+        (err) => {
 
-server.on(
-    'error',
-    (err) => {
+            if (err.code === 'EADDRINUSE') {
 
-        if (err.code === 'EADDRINUSE') {
+                console.error(
+                    `❌ ${PORT}-port allaqachon band!`
+                );
+
+                process.exit(1);
+            }
 
             console.error(
-                `❌ ${PORT}-port allaqachon band!`
+                '❌ Server ishga tushishida xatolik:',
+                err
             );
 
             process.exit(1);
         }
+    );
+};
 
-        console.error(
-            '❌ Server ishga tushishida xatolik:',
-            err
-        );
-
-        process.exit(1);
-    }
-);
+startServer();
 
 
 // ====================================================
@@ -4557,11 +4640,13 @@ const shutdown = async (signal) => {
 
     try {
 
-        await new Promise(
-            (resolve) => {
-                server.close(resolve);
-            }
-        );
+        if (server) {
+            await new Promise(
+                (resolve) => {
+                    server.close(resolve);
+                }
+            );
+        }
 
         await pool.end();
 
