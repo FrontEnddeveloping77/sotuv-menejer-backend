@@ -1988,8 +1988,11 @@ app.get(
                 SELECT
                     local_id,
                     MAX(name) AS name,
+                    MAX(category) AS category,
+                    MAX(color) AS color,
                     MAX(supplier) AS supplier,
                     MAX(supplier_phone) AS supplier_phone,
+                    SUM(quantity) AS total_quantity,
                     SUM(cost_price * quantity) AS total_cost,
                     MAX(COALESCE(paid_amount, 0)) AS total_paid,
                     GREATEST(
@@ -2006,16 +2009,18 @@ app.get(
                 [userId]
             );
 
-            // Supplier bo'yicha guruhlaymiz
+            // Bir xil odam (ism + telefon) bitta qatorga yig'iladi
             const grouped = {};
 
             for (const row of result.rows) {
-                const key = (row.supplier || 'Noma\'lum') + '|' + (row.supplier_phone || '');
+                const supplierName = (row.supplier || "Noma'lum").trim();
+                const phone = (row.supplier_phone || '').trim();
+                const key = supplierName.toLowerCase() + '|' + phone;
 
                 if (!grouped[key]) {
                     grouped[key] = {
-                        supplier: row.supplier || 'Noma\'lum',
-                        supplier_phone: row.supplier_phone || null,
+                        supplier: supplierName,
+                        supplier_phone: phone || null,
                         total_debt: 0,
                         total_cost: 0,
                         total_paid: 0,
@@ -2035,7 +2040,11 @@ app.get(
                 grouped[key].products.push({
                     local_id: row.local_id,
                     name: row.name,
-                    size: null,
+                    category: row.category || 'Umumiy',
+                    color: row.color || null,
+                    quantity: Number(row.total_quantity) || 0,
+                    total_cost: cost,
+                    total_paid: paid,
                     debt: debt
                 });
             }
