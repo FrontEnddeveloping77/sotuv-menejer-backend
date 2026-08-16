@@ -225,6 +225,125 @@ const getTodayReport = async (clientOrPool, userId) => {
 };
 
 // ====================================================
+// OYLIK HISOBOT (Telegram uchun)
+// ====================================================
+const getMonthReport = async (clientOrPool, userId) => {
+    const salesResult = await clientOrPool.query(
+        `
+        SELECT
+            COALESCE(SUM(quantity * selling_price), 0) AS revenue,
+            COALESCE(SUM(profit), 0) AS profit,
+            COALESCE(SUM(quantity), 0) AS sold
+        FROM public.sales
+        WHERE user_id = $1
+          AND date_trunc('month', sold_at) = date_trunc('month', CURRENT_DATE)
+          AND returned = false
+        `,
+        [userId]
+    );
+
+    const expenseResult = await clientOrPool.query(
+        `
+        SELECT COALESCE(SUM(amount), 0) AS expense
+        FROM public.expenses
+        WHERE user_id = $1
+          AND date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)
+        `,
+        [userId]
+    );
+
+    const debtResult = await clientOrPool.query(
+        `
+        SELECT COALESCE(SUM(cost_price - COALESCE(paid_amount, 0)), 0) AS total_debt
+        FROM public.products
+        WHERE user_id = $1
+          AND payment_type = 'credit'
+          AND (cost_price - COALESCE(paid_amount, 0)) > 0
+        `,
+        [userId]
+    );
+
+    const stockResult = await clientOrPool.query(
+        `
+        SELECT
+            COUNT(DISTINCT local_id) AS total_products,
+            COALESCE(SUM(quantity), 0) AS total_stock
+        FROM public.products
+        WHERE user_id = $1
+        `,
+        [userId]
+    );
+
+    const revenue = Number(salesResult.rows[0].revenue || 0);
+    const profit = Number(salesResult.rows[0].profit || 0);
+    const sold = Number(salesResult.rows[0].sold || 0);
+    const expense = Number(expenseResult.rows[0].expense || 0);
+    const netProfit = profit - expense;
+    const totalDebt = Number(debtResult.rows[0].total_debt || 0);
+    const totalProducts = Number(stockResult.rows[0].total_products || 0);
+    const totalStock = Number(stockResult.rows[0].total_stock || 0);
+
+    const now = new Date();
+    const monthName = now.toLocaleString('uz-UZ', { month: 'long', year: 'numeric' });
+
+    return (
+        `📅 <b>OYLIK HISOBOT</b>\n` +
+        `🗓 <b>Oy:</b> ${telegramEscape(monthName)}\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `🛒 <b>Sotilgan:</b> ${sold} dona\n` +
+        `💰 <b>Tushum:</b> ${formatSum(revenue)} so'm\n` +
+        `📈 <b>Foyda:</b> ${formatSum(profit)} so'm\n` +
+        `💸 <b>Rasxod:</b> ${formatSum(expense)} so'm\n` +
+        `${netProfit >= 0 ? '🟢' : '🔴'} <b>Sof foyda:</b> ${formatSum(Math.abs(netProfit))} so'm` +
+        (netProfit < 0 ? ` (ziyon)` : '') +
+        `\n💳 <b>Jami qarz:</b> ${formatSum(totalDebt)} so'm\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `📦 <b>OMBOR HOLATI</b>\n` +
+        `🗂 <b>Jami tovar turi:</b> ${totalProducts} xil\n` +
+        `📊 <b>Jami qoldiq:</b> ${totalStock} dona\n` +
+        `━━━━━━━━━━━━━━━━━━━━`
+    );
+};
+
+// ====================================================
+// BARCHA FOYDALANUVCHILARGA HISOBOT YUBORISH
+// ====================================================
+const sendReportToAllUsers = async (type = 'daily') => {
+    try {
+        const usersResult = await pool.query(
+            `SELECT id, site_login, full_name FROM public.users WHERE site_login IS NOT NULL`
+        );
+
+        for (const user of usersResult.rows) {
+            try {
+                let message = '';
+
+                if (type === 'daily') {
+                    message =
+                        `🌙 <b>KUNLIK YAKUNIY HISOBOT</b>\n` +
+                        `━━━━━━━━━━━━━━━━━━━━\n` +
+                        `👤 <b>Do'kon:</b> ${telegramEscape(user.full_name || user.site_login)}\n`;
+                    message += await getTodayReport(pool, user.id);
+                } else {
+                    message =
+                        `📆 <b>OYLIK YAKUNIY HISOBOT</b>\n` +
+                        `━━━━━━━━━━━━━━━━━━━━\n` +
+                        `👤 <b>Do'kon:</b> ${telegramEscape(user.full_name || user.site_login)}\n\n`;
+                    message += await getMonthReport(pool, user.id);
+                }
+
+                await queueTelegramNotification(pool, user.site_login, message);
+                console.log(`[REPORT] ${type} hisobot yuborildi: ${user.site_login}`);
+            } catch (err) {
+                console.error(`[REPORT] ${user.site_login} ga yuborishda xato:`, err.message);
+            }
+        }
+    } catch (err) {
+        console.error('[REPORT] Umumiy xato:', err);
+    }
+};
+
+// ====================================================
 // TELEGRAM NOTIFICATION QUEUE
 // ====================================================
 
@@ -1902,6 +2021,167 @@ app.get(
             res.status(500).json({
                 message: 'Serverda xatolik yuz berdi!'
             });
+        }
+    }
+);
+
+// ====================================================
+// QARZNI TO'LASH
+// ====================================================
+
+app.post(
+    '/api/debts/pay',
+    authenticateToken,
+    async (req, res) => {
+        const userId = req.user.userId;
+        const { supplier, supplier_phone, amount } = req.body || {};
+
+        const cleanSupplier = typeof supplier === 'string' ? supplier.trim() : '';
+        const parsedAmount = Number(amount);
+
+        if (!cleanSupplier) {
+            return res.status(400).json({
+                message: "Kimdan ekanligi ko'rsatilmagan!"
+            });
+        }
+
+        if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+            return res.status(400).json({
+                message: "To'lov summasi noto'g'ri!"
+            });
+        }
+
+        const client = await pool.connect();
+
+        try {
+            await client.query('BEGIN');
+
+            // Shu supplierga tegishli nasiya tovarlarni olamiz (qarzi borlari)
+            const productsResult = await client.query(
+                `
+                SELECT id, local_id, name, size, cost_price, paid_amount,
+                       (cost_price - COALESCE(paid_amount, 0)) AS debt
+                FROM public.products
+                WHERE user_id = $1
+                  AND payment_type = 'credit'
+                  AND supplier = $2
+                  AND (cost_price - COALESCE(paid_amount, 0)) > 0
+                ORDER BY id ASC
+                FOR UPDATE
+                `,
+                [userId, cleanSupplier]
+            );
+
+            if (productsResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({
+                    message: "Bu odamga tegishli qarz topilmadi!"
+                });
+            }
+
+            let remainingPay = parsedAmount;
+            let totalPaidNow = 0;
+            const updatedProducts = [];
+
+            for (const product of productsResult.rows) {
+                if (remainingPay <= 0) break;
+
+                const currentDebt = Number(product.debt) || 0;
+                if (currentDebt <= 0) continue;
+
+                const payForThis = Math.min(remainingPay, currentDebt);
+                const newPaidAmount = Number(product.paid_amount || 0) + payForThis;
+
+                await client.query(
+                    `
+                    UPDATE public.products
+                    SET paid_amount = $1
+                    WHERE id = $2 AND user_id = $3
+                    `,
+                    [newPaidAmount, product.id, userId]
+                );
+
+                remainingPay -= payForThis;
+                totalPaidNow += payForThis;
+
+                updatedProducts.push({
+                    local_id: product.local_id,
+                    name: product.name,
+                    size: product.size,
+                    paid: payForThis,
+                    remaining_debt: currentDebt - payForThis
+                });
+            }
+
+            if (totalPaidNow <= 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    message: "To'lov amalga oshirilmadi!"
+                });
+            }
+
+            // Qolgan umumiy qarzni hisoblash
+            const remainingDebtResult = await client.query(
+                `
+                SELECT COALESCE(SUM(cost_price - COALESCE(paid_amount, 0)), 0) AS remaining
+                FROM public.products
+                WHERE user_id = $1
+                  AND payment_type = 'credit'
+                  AND supplier = $2
+                  AND (cost_price - COALESCE(paid_amount, 0)) > 0
+                `,
+                [userId, cleanSupplier]
+            );
+
+            const remainingDebt = Number(remainingDebtResult.rows[0].remaining || 0);
+
+            // Telegram xabar
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1 LIMIT 1`,
+                [userId]
+            );
+
+            const siteLogin = userResult.rows[0]?.site_login || null;
+
+            if (siteLogin) {
+                let productsBlock = updatedProducts
+                    .map(p => `   • #${p.local_id} ${telegramEscape(p.name)}${p.size ? ' (' + telegramEscape(p.size) + ')' : ''}: ${formatSum(p.paid)} so'm`)
+                    .join('\n');
+
+                let message =
+                    `💰 <b>QARZ TO'LANDI</b>\n` +
+                    `━━━━━━━━━━━━━━━━━━━━\n` +
+                    `👤 <b>Kimga:</b> ${telegramEscape(cleanSupplier)}\n` +
+                    (supplier_phone ? `📞 <b>Telefon:</b> ${telegramEscape(supplier_phone)}\n` : '') +
+                    `💵 <b>To'langan summa:</b> ${formatSum(totalPaidNow)} so'm\n` +
+                    `📉 <b>Qolgan qarz:</b> ${formatSum(remainingDebt)} so'm\n` +
+                    `━━━━━━━━━━━━━━━━━━━━\n` +
+                    `📦 <b>To'lov taqsimoti:</b>\n${productsBlock}\n` +
+                    `━━━━━━━━━━━━━━━━━━━━`;
+
+                message += await getTodayReport(client, userId);
+
+                await queueTelegramNotification(client, siteLogin, message);
+            }
+
+            await client.query('COMMIT');
+
+            res.json({
+                message: `${formatSum(totalPaidNow)} so'm qarz muvaffaqiyatli to'landi! Qolgan qarz: ${formatSum(remainingDebt)} so'm`,
+                paid: totalPaidNow,
+                remaining_debt: remainingDebt
+            });
+
+        } catch (err) {
+            try {
+                await client.query('ROLLBACK');
+            } catch (e) { }
+            console.error('Qarz to\'lashda xatolik:', err);
+            res.status(500).json({
+                message: 'Serverda xatolik yuz berdi!'
+            });
+        } finally {
+            client.release();
         }
     }
 );
@@ -4928,6 +5208,54 @@ if (process.env.VERCEL) {
         Number(process.env.PORT) || 5000;
 
     let server;
+
+    // ====================================================
+    // AVTOMATIK HISOBOTLAR (har kuni 23:59 va oy oxiri)
+    // ====================================================
+    let lastDailyReportDate = null;
+    let lastMonthlyReportMonth = null;
+
+    const checkAndSendScheduledReports = async () => {
+        try {
+            // Toshkent vaqti (UTC+5)
+            const now = new Date();
+            const tashkentOffset = 5 * 60; // daqiqa
+            const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+            const tashkent = new Date(utc + (tashkentOffset * 60000));
+
+            const hours = tashkent.getHours();
+            const minutes = tashkent.getMinutes();
+            const dateStr = tashkent.toISOString().slice(0, 10); // YYYY-MM-DD
+            const monthStr = dateStr.slice(0, 7); // YYYY-MM
+
+            // Har kuni soat 23:59 da kunlik hisobot
+            if (hours === 23 && minutes === 59) {
+                if (lastDailyReportDate !== dateStr) {
+                    lastDailyReportDate = dateStr;
+                    console.log('[CRON] Kunlik hisobot yuborilmoqda...', dateStr);
+                    await sendReportToAllUsers('daily');
+                }
+            }
+
+            // Oy oxirgi kuni + soat 23:59 da oylik hisobot
+            const tomorrow = new Date(tashkent);
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            const isLastDayOfMonth = tomorrow.getDate() === 1;
+
+            if (isLastDayOfMonth && hours === 23 && minutes === 59) {
+                if (lastMonthlyReportMonth !== monthStr) {
+                    lastMonthlyReportMonth = monthStr;
+                    console.log('[CRON] Oylik hisobot yuborilmoqda...', monthStr);
+                    await sendReportToAllUsers('monthly');
+                }
+            }
+        } catch (err) {
+            console.error('[CRON] Xatolik:', err);
+        }
+    };
+
+    // Har 30 soniyada tekshiradi (aniq 23:59 ni ushlash uchun)
+    setInterval(checkAndSendScheduledReports, 30 * 1000);
 
     const startServer = async () => {
 
