@@ -19,6 +19,43 @@ app.use(cors());
 app.use(express.json());
 
 // ====================================================
+// JADVALLARNI TAYYORLASH — "GATE" MIDDLEWARE
+// (Vercel'da har bir cold start'da birinchi so'rovdan
+//  oldin jadvallar (products, sales, expenses,
+//  notifications) tayyor ekanligini tekshiradi.
+//  ensureTables() funksiyasi faylning pastida
+//  aniqlangan, lekin bu yerda faqat REFERENCE qilinadi —
+//  chaqirilishi so'rov kelganda amalga oshadi, shu payt
+//  butun fayl allaqachon to'liq yuklangan bo'ladi.)
+// ====================================================
+
+let tablesReadyPromise = null;
+
+const ensureTablesOnce = () => {
+    if (!tablesReadyPromise) {
+        tablesReadyPromise = ensureTables().catch((err) => {
+            console.error(
+                '❌ ensureTables() umumiy xatosi:',
+                err
+            );
+            // Keyingi so'rovda qayta urinib ko'rish uchun
+            // promise'ni tozalaymiz
+            tablesReadyPromise = null;
+        });
+    }
+    return tablesReadyPromise;
+};
+
+app.use(async (req, res, next) => {
+    try {
+        await ensureTablesOnce();
+    } catch (err) {
+        console.error('Gate middleware xatosi:', err);
+    }
+    next();
+});
+
+// ====================================================
 // POSTGRESQL / SUPABASE
 // ====================================================
 
@@ -4562,117 +4599,139 @@ app.use(
 
 
 // ====================================================
-// SERVER
-// (endi ensureTables() server ishga tushishidan oldin
-//  chaqirilib, KUTIB TURILADI — shu tufayli barcha
-//  jadvallar tayyor bo'lgandan keyingina server so'rovlarni
-//  qabul qila boshlaydi.)
+// SERVER ISHGA TUSHIRISH
+//
+// MUHIM: Vercel muhitida Express serverini app.listen()
+// bilan ishga tushirib bo'lmaydi — Vercel har bir so'rovni
+// alohida "serverless function" sifatida chaqiradi va
+// buning uchun Express `app` obyekti export qilinishi kerak
+// (`module.exports = app`), portni tinglash esa kerak emas
+// (buni Vercel platformasining o'zi bajaradi).
+//
+// Shu sababli quyida ikki holat ajratilgan:
+//   1) process.env.VERCEL mavjud bo'lsa -> faqat export
+//   2) aks holda (lokal kompyuter, Render va h.k.)
+//      -> odatiy app.listen() bilan klassik server
 // ====================================================
 
-const PORT =
-    Number(process.env.PORT) || 5000;
+if (process.env.VERCEL) {
 
-let server;
+    // ------------------------------------------------
+    // VERCEL (SERVERLESS) MUHITI
+    // ------------------------------------------------
 
-const startServer = async () => {
+    module.exports = app;
 
-    try {
+} else {
 
-        await ensureTables();
+    // ------------------------------------------------
+    // LOKAL / RENDER (KLASSIK SERVER) MUHITI
+    // ------------------------------------------------
 
-    } catch (err) {
+    const PORT =
+        Number(process.env.PORT) || 5000;
 
-        console.error(
-            '❌ ensureTables() umumiy xatosi (server baribir ishga tushadi):',
-            err
-        );
-    }
+    let server;
 
-    server = app.listen(
-        PORT,
-        () => {
+    const startServer = async () => {
 
-            console.log(
-                `Backend Server ${PORT}-portda ishga tushdi 🚀`
+        try {
+
+            await ensureTablesOnce();
+
+        } catch (err) {
+
+            console.error(
+                '❌ ensureTables() umumiy xatosi (server baribir ishga tushadi):',
+                err
             );
         }
-    );
 
-    // ====================================================
-    // SERVER ERROR
-    // ====================================================
+        server = app.listen(
+            PORT,
+            () => {
 
-    server.on(
-        'error',
-        (err) => {
+                console.log(
+                    `Backend Server ${PORT}-portda ishga tushdi 🚀`
+                );
+            }
+        );
 
-            if (err.code === 'EADDRINUSE') {
+        // ====================================================
+        // SERVER ERROR
+        // ====================================================
+
+        server.on(
+            'error',
+            (err) => {
+
+                if (err.code === 'EADDRINUSE') {
+
+                    console.error(
+                        `❌ ${PORT}-port allaqachon band!`
+                    );
+
+                    process.exit(1);
+                }
 
                 console.error(
-                    `❌ ${PORT}-port allaqachon band!`
+                    '❌ Server ishga tushishida xatolik:',
+                    err
                 );
 
                 process.exit(1);
             }
+        );
+    };
+
+    startServer();
+
+    // ====================================================
+    // GRACEFUL SHUTDOWN
+    // ====================================================
+
+    const shutdown = async (signal) => {
+
+        console.log(
+            `\n${signal} signali olindi. Server yopilmoqda...`
+        );
+
+        try {
+
+            if (server) {
+                await new Promise(
+                    (resolve) => {
+                        server.close(resolve);
+                    }
+                );
+            }
+
+            await pool.end();
+
+            console.log(
+                'Server va PostgreSQL connection pool yopildi.'
+            );
+
+            process.exit(0);
+
+        } catch (err) {
 
             console.error(
-                '❌ Server ishga tushishida xatolik:',
+                'Serverni yopishda xatolik:',
                 err
             );
 
             process.exit(1);
         }
-    );
-};
+    };
 
-startServer();
-
-
-// ====================================================
-// GRACEFUL SHUTDOWN
-// ====================================================
-
-const shutdown = async (signal) => {
-
-    console.log(
-        `\n${signal} signali olindi. Server yopilmoqda...`
+    process.on(
+        'SIGTERM',
+        () => shutdown('SIGTERM')
     );
 
-    try {
-
-        if (server) {
-            await new Promise(
-                (resolve) => {
-                    server.close(resolve);
-                }
-            );
-        }
-
-        await pool.end();
-
-        console.log(
-            'Server va PostgreSQL connection pool yopildi.'
-        );
-
-        process.exit(0);
-
-    } catch (err) {
-
-        console.error(
-            'Serverni yopishda xatolik:',
-            err
-        );
-
-        process.exit(1);
-    }
-};
-
-process.on(
-    'SIGTERM',
-    () => shutdown('SIGTERM')
-);
-
-process.on(
-    'SIGINT',
-    () => shutdown('SIGINT')
-);
+    process.on(
+        'SIGINT',
+        () => shutdown('SIGINT')
+    );
+}
