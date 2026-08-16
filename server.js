@@ -58,6 +58,21 @@ const JWT_SECRET =
     process.env.JWT_SECRET || 'super_secret_jwt_key_123';
 
 // ====================================================
+// TAHRIRLASH / VOZVRAT UCHUN MUDDATLAR
+// ====================================================
+
+const PRODUCT_EDIT_WINDOW_DAYS = 7;
+const SALE_RETURN_WINDOW_DAYS = 7;
+const EXPENSE_EDIT_WINDOW_DAYS = 30;
+
+const daysSince = (dateValue) => {
+    if (!dateValue) return Infinity;
+    const then = new Date(dateValue).getTime();
+    if (Number.isNaN(then)) return Infinity;
+    return (Date.now() - then) / (1000 * 60 * 60 * 24);
+};
+
+// ====================================================
 // YORDAMCHI FUNKSIYALAR
 // ====================================================
 
@@ -100,6 +115,7 @@ const getTodayReport = async (clientOrPool, userId) => {
         FROM public.sales
         WHERE user_id = $1
           AND sold_at::date = CURRENT_DATE
+          AND returned = false
         `,
         [userId]
     );
@@ -358,8 +374,15 @@ const ensureTables = async () => {
                 selling_price NUMERIC NOT NULL DEFAULT 0,
                 profit NUMERIC NOT NULL DEFAULT 0,
                 sold_at TIMESTAMP NOT NULL DEFAULT NOW()
+                
             );
         `);
+
+        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS local_id INTEGER;`);
+        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS category TEXT;`);
+        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS color TEXT;`);
+        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS size TEXT;`);
+        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS returned BOOLEAN NOT NULL DEFAULT false;`);
 
         await pool.query(`
             CREATE INDEX IF NOT EXISTS
@@ -922,6 +945,7 @@ app.get(
 
                             WHERE
                                 user_id = $1
+                                AND returned = false
                                 AND ${salesFilter}
                             `,
                             [
@@ -1562,6 +1586,242 @@ app.get(
 );
 
 // ====================================================
+// TOVARNI TAHRIRLASH (faqat 7 kun ichida qo'shilgan bo'lsa)
+// ====================================================
+
+app.put(
+    '/api/products/:local_id',
+    authenticateToken,
+    async (req, res) => {
+
+        const userId = req.user.userId;
+        const localId = Number(req.params.local_id);
+
+        if (!Number.isInteger(localId) || localId <= 0) {
+            return res.status(400).json({
+                message: "Tovar ID noto'g'ri!"
+            });
+        }
+
+        const {
+            category,
+            name,
+            cost_price,
+            color,
+            quantity,
+            sizes
+        } = req.body || {};
+
+        if (!name || cost_price === undefined) {
+            return res.status(400).json({
+                message: "Tovar nomi va kelgan narxi kiritilishi shart!"
+            });
+        }
+
+        const parsedCostPrice = Number(cost_price);
+
+        if (!Number.isFinite(parsedCostPrice) || parsedCostPrice < 0) {
+            return res.status(400).json({
+                message: "Kelgan narx noto'g'ri!"
+            });
+        }
+
+        const totalQty = parseInt(quantity, 10) || 0;
+
+        if (totalQty <= 0) {
+            return res.status(400).json({
+                message: "Soni 0 dan katta bo'lishi kerak!"
+            });
+        }
+
+        let sizeList = [];
+
+        if (sizes && typeof sizes === 'string') {
+            const seen = new Set();
+
+            sizes.split(',').forEach((item) => {
+                const clean = item.trim();
+
+                if (clean && !seen.has(clean.toLowerCase())) {
+                    seen.add(clean.toLowerCase());
+                    sizeList.push(clean);
+                }
+            });
+        }
+
+        const client = await pool.connect();
+
+        try {
+
+            await client.query('BEGIN');
+
+            const existing = await client.query(
+                `
+                SELECT *
+                FROM public.products
+                WHERE user_id = $1 AND local_id = $2
+                FOR UPDATE
+                `,
+                [userId, localId]
+            );
+
+            if (!existing.rows.length) {
+                await client.query('ROLLBACK');
+
+                return res.status(404).json({
+                    message: "Tovar topilmadi!"
+                });
+            }
+
+            const earliestCreatedAt = existing.rows.reduce(
+                (earliest, row) => {
+                    const t = new Date(row.created_at).getTime();
+                    return (!earliest || t < earliest) ? t : earliest;
+                },
+                null
+            );
+
+            if (daysSince(earliestCreatedAt) > PRODUCT_EDIT_WINDOW_DAYS) {
+                await client.query('ROLLBACK');
+
+                return res.status(403).json({
+                    message:
+                        `Bu tovar qo'shilganiga ${PRODUCT_EDIT_WINDOW_DAYS} kundan ko'p vaqt o'tgan, tahrirlab bo'lmaydi!`
+                });
+            }
+
+            // Eski qatorlarni o'chirib, yangilarini qo'shamiz
+            await client.query(
+                `DELETE FROM public.products WHERE user_id = $1 AND local_id = $2`,
+                [userId, localId]
+            );
+
+            const insertedRows = [];
+
+            if (sizeList.length === 0) {
+
+                const result = await client.query(
+                    `
+                    INSERT INTO public.products
+                    (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at, created_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW())
+                    RETURNING *
+                    `,
+                    [
+                        userId,
+                        localId,
+                        category || null,
+                        String(name).trim(),
+                        parsedCostPrice,
+                        color || null,
+                        null,
+                        totalQty,
+                        randomUUID()
+                    ]
+                );
+
+                insertedRows.push(result.rows[0]);
+
+            } else {
+
+                const count = sizeList.length;
+                const base = Math.floor(totalQty / count);
+                const remainder = totalQty % count;
+
+                for (let i = 0; i < count; i++) {
+
+                    const sizeQty = base + (i < remainder ? 1 : 0);
+
+                    const result = await client.query(
+                        `
+                        INSERT INTO public.products
+                        (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at, created_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW())
+                        RETURNING *
+                        `,
+                        [
+                            userId,
+                            localId,
+                            category || null,
+                            String(name).trim(),
+                            parsedCostPrice,
+                            color || null,
+                            sizeList[i],
+                            sizeQty,
+                            randomUUID()
+                        ]
+                    );
+
+                    insertedRows.push(result.rows[0]);
+                }
+            }
+
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1 LIMIT 1`,
+                [userId]
+            );
+
+            if (userResult.rows.length) {
+
+                const siteLogin = userResult.rows[0].site_login;
+                const first = insertedRows[0];
+
+                let sizesBlock = '';
+
+                if (sizeList.length) {
+                    const lines = insertedRows
+                        .map((row) => `   • ${telegramEscape(row.size)}: ${row.quantity} dona`)
+                        .join('\n');
+
+                    sizesBlock = `\n📏 <b>Razmerlar bo'yicha taqsimot:</b>\n${lines}`;
+                }
+
+                let message =
+                    `✏️ <b>TOVAR TAHRIRLANDI (#${localId})</b>\n` +
+                    `━━━━━━━━━━━━━━━━━━━━\n` +
+                    `📦 <b>Nomi:</b> ${telegramEscape(first.name)}\n` +
+                    `🎨 <b>Rangi:</b> ${telegramEscape(first.color || "Yo'q")}\n` +
+                    `🗂 <b>Kategoriyasi:</b> ${telegramEscape(first.category || "Yo'q")}\n` +
+                    `💰 <b>Narxi:</b> ${formatSum(first.cost_price)} so'm\n` +
+                    `📊 <b>Umumiy miqdori:</b> ${totalQty} dona` +
+                    sizesBlock +
+                    `\n━━━━━━━━━━━━━━━━━━━━\n` +
+                    `✅ Tovar ma'lumotlari yangilandi!`;
+
+                message += await getTodayReport(client, userId);
+
+                await queueTelegramNotification(client, siteLogin, message);
+            }
+
+            await client.query('COMMIT');
+
+            res.json({
+                message: "Tovar muvaffaqiyatli tahrirlandi!",
+                products: insertedRows,
+                local_id: localId
+            });
+
+        } catch (err) {
+
+            try {
+                await client.query('ROLLBACK');
+            } catch (rollbackError) {
+                console.error('ROLLBACK xatosi:', rollbackError);
+            }
+
+            console.error("Tovarni tahrirlashda xatolik:", err);
+
+            res.status(500).json({
+                message: "Serverda xatolik yuz berdi!"
+            });
+
+        } finally {
+            client.release();
+        }
+    }
+);
+
+// ====================================================
 // TOVAR SOTISH
 // ====================================================
 
@@ -1747,7 +2007,11 @@ app.post(
                         quantity,
                         cost_price,
                         selling_price,
-                        profit
+                        profit,
+                        local_id,
+                        category,
+                        color,
+                        size
                     )
                     VALUES
                     (
@@ -1757,7 +2021,11 @@ app.post(
                         $4,
                         $5,
                         $6,
-                        $7
+                        $7,
+                        $8,
+                        $9,
+                        $10,
+                        $11
                     )
                     `,
                     [
@@ -1767,7 +2035,11 @@ app.post(
                         item.qty,
                         costPrice,
                         item.price,
-                        profit
+                        profit,
+                        product.local_id,
+                        product.category,
+                        product.color,
+                        product.size
                     ]
                 );
 
@@ -2109,6 +2381,213 @@ app.post(
 
         } finally {
 
+            client.release();
+        }
+    }
+);
+
+
+// ====================================================
+// SOTUVLAR RO'YXATI
+// ====================================================
+
+app.get(
+    '/api/sales',
+    authenticateToken,
+    async (req, res) => {
+
+        try {
+
+            const result = await pool.query(
+                `
+                SELECT
+                    id,
+                    product_id,
+                    title,
+                    quantity,
+                    cost_price,
+                    selling_price,
+                    profit,
+                    local_id,
+                    category,
+                    color,
+                    size,
+                    returned,
+                    sold_at
+                FROM public.sales
+                WHERE user_id = $1
+                ORDER BY sold_at DESC
+                LIMIT 200
+                `,
+                [req.user.userId]
+            );
+
+            res.json({
+                sales: result.rows
+            });
+
+        } catch (err) {
+
+            console.error('Sotuvlarni olish xatosi:', err);
+
+            res.status(500).json({
+                message: 'Serverda xatolik yuz berdi!'
+            });
+        }
+    }
+);
+
+// ====================================================
+// TOVARNI VOZVRAT QILISH (faqat 7 kun ichida sotilgan bo'lsa)
+// ====================================================
+
+app.post(
+    '/api/sales/:id/return',
+    authenticateToken,
+    async (req, res) => {
+
+        const userId = req.user.userId;
+        const saleId = Number(req.params.id);
+
+        if (!Number.isInteger(saleId) || saleId <= 0) {
+            return res.status(400).json({
+                message: "Sotuv ID noto'g'ri!"
+            });
+        }
+
+        const client = await pool.connect();
+
+        try {
+
+            await client.query('BEGIN');
+
+            const saleResult = await client.query(
+                `SELECT * FROM public.sales WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+                [saleId, userId]
+            );
+
+            if (!saleResult.rows.length) {
+                await client.query('ROLLBACK');
+
+                return res.status(404).json({
+                    message: "Sotuv topilmadi!"
+                });
+            }
+
+            const sale = saleResult.rows[0];
+
+            if (sale.returned) {
+                await client.query('ROLLBACK');
+
+                return res.status(400).json({
+                    message: "Bu sotuv allaqachon vozvrat qilingan!"
+                });
+            }
+
+            if (daysSince(sale.sold_at) > SALE_RETURN_WINDOW_DAYS) {
+                await client.query('ROLLBACK');
+
+                return res.status(403).json({
+                    message:
+                        `Bu sotuv ${SALE_RETURN_WINDOW_DAYS} kundan ko'p vaqt oldin bo'lgan, vozvrat qilib bo'lmaydi!`
+                });
+            }
+
+            await client.query(
+                `UPDATE public.sales SET returned = true WHERE id = $1`,
+                [saleId]
+            );
+
+            // Ombordagi qoldiqni tiklaymiz
+            const productResult = await client.query(
+                `SELECT * FROM public.products WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+                [sale.product_id, userId]
+            );
+
+            let restoredProduct;
+
+            if (productResult.rows.length) {
+
+                const product = productResult.rows[0];
+                const newQty = Number(product.quantity) + Number(sale.quantity);
+
+                const updated = await client.query(
+                    `UPDATE public.products SET quantity = $1 WHERE id = $2 RETURNING *`,
+                    [newQty, product.id]
+                );
+
+                restoredProduct = updated.rows[0];
+
+            } else {
+
+                // Tovar butunlay sotilib, ombordan o'chirilgan edi — qayta tiklaymiz
+                const insertResult = await client.query(
+                    `
+                    INSERT INTO public.products
+                    (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+                    RETURNING *
+                    `,
+                    [
+                        userId,
+                        sale.local_id,
+                        sale.category,
+                        sale.title,
+                        sale.cost_price,
+                        sale.color,
+                        sale.size,
+                        sale.quantity,
+                        randomUUID()
+                    ]
+                );
+
+                restoredProduct = insertResult.rows[0];
+            }
+
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [userId]
+            );
+
+            const siteLogin = userResult.rows[0]?.site_login || null;
+
+            let message =
+                `↩️ <b>TOVAR VOZVRAT QILINDI</b>\n` +
+                `━━━━━━━━━━━━━━━━━━━━\n` +
+                `📦 <b>Nomi:</b> ${telegramEscape(sale.title)}\n` +
+                `📏 <b>Razmer:</b> ${telegramEscape(sale.size || 'Standart')}\n` +
+                `🔢 <b>Soni:</b> ${sale.quantity} dona\n` +
+                `💵 <b>Qaytarilgan summa:</b> ${formatSum(Number(sale.selling_price) * Number(sale.quantity))} so'm\n` +
+                `━━━━━━━━━━━━━━━━━━━━\n` +
+                `📦 <b>Ombor yangilandi, qoldiq:</b> ${restoredProduct.quantity} dona`;
+
+            message += await getTodayReport(client, userId);
+
+            await queueTelegramNotification(client, siteLogin, message);
+
+            await client.query('COMMIT');
+
+            return res.json({
+                message: "Tovar muvaffaqiyatli vozvrat qilindi!",
+                sale: { ...sale, returned: true },
+                product: restoredProduct
+            });
+
+        } catch (err) {
+
+            try {
+                await client.query('ROLLBACK');
+            } catch (rollbackError) {
+                console.error('ROLLBACK xatosi:', rollbackError);
+            }
+
+            console.error('Vozvrat qilishda xatolik:', err);
+
+            return res.status(500).json({
+                message: "Serverda xatolik yuz berdi!"
+            });
+
+        } finally {
             client.release();
         }
     }
@@ -2880,6 +3359,266 @@ app.post(
     }
 );
 
+// ====================================================
+// RASXODLAR RO'YXATI
+// ====================================================
+
+app.get(
+    '/api/expenses',
+    authenticateToken,
+    async (req, res) => {
+
+        try {
+
+            const result = await pool.query(
+                `
+                SELECT id, title, amount, expense_type, created_at
+                FROM public.expenses
+                WHERE user_id = $1
+                ORDER BY created_at DESC
+                LIMIT 200
+                `,
+                [req.user.userId]
+            );
+
+            res.json({
+                expenses: result.rows
+            });
+
+        } catch (err) {
+
+            console.error('Rasxodlarni olish xatosi:', err);
+
+            res.status(500).json({
+                message: 'Serverda xatolik yuz berdi!'
+            });
+        }
+    }
+);
+
+// ====================================================
+// RASXODNI TAHRIRLASH (faqat 1 oy ichida qo'shilgan bo'lsa)
+// ====================================================
+
+app.put(
+    '/api/expenses/:id',
+    authenticateToken,
+    async (req, res) => {
+
+        const userId = req.user.userId;
+        const expenseId = Number(req.params.id);
+
+        if (!Number.isInteger(expenseId) || expenseId <= 0) {
+            return res.status(400).json({
+                message: "Rasxod ID noto'g'ri!"
+            });
+        }
+
+        const { title, amount, expense_type } = req.body || {};
+
+        const cleanTitle = typeof title === 'string' ? title.trim() : '';
+        const parsedAmount = Number(amount);
+
+        if (!cleanTitle) {
+            return res.status(400).json({
+                message: "Rasxod nomi kiritilishi shart!"
+            });
+        }
+
+        if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+            return res.status(400).json({
+                message: "Rasxod summasi noto'g'ri!"
+            });
+        }
+
+        const type =
+            ['daily', 'monthly', 'yearly'].includes(expense_type)
+                ? expense_type
+                : 'daily';
+
+        const client = await pool.connect();
+
+        try {
+
+            await client.query('BEGIN');
+
+            const existing = await client.query(
+                `SELECT * FROM public.expenses WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+                [expenseId, userId]
+            );
+
+            if (!existing.rows.length) {
+                await client.query('ROLLBACK');
+
+                return res.status(404).json({
+                    message: "Rasxod topilmadi!"
+                });
+            }
+
+            const expense = existing.rows[0];
+
+            if (daysSince(expense.created_at) > EXPENSE_EDIT_WINDOW_DAYS) {
+                await client.query('ROLLBACK');
+
+                return res.status(403).json({
+                    message:
+                        `Bu rasxod qo'shilganiga 1 oydan ko'p vaqt o'tgan, tahrirlab bo'lmaydi!`
+                });
+            }
+
+            const updated = await client.query(
+                `
+                UPDATE public.expenses
+                SET title = $1, amount = $2, expense_type = $3
+                WHERE id = $4
+                RETURNING *
+                `,
+                [cleanTitle, parsedAmount, type, expenseId]
+            );
+
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [userId]
+            );
+
+            const siteLogin = userResult.rows[0]?.site_login || null;
+
+            let message =
+                `✏️ <b>RASXOD TAHRIRLANDI</b>\n` +
+                `━━━━━━━━━━━━━━━━━━━━\n` +
+                `📝 <b>Tavsifi:</b> ${telegramEscape(cleanTitle)}\n` +
+                `💰 <b>Summasi:</b> ${formatSum(parsedAmount)} so'm\n` +
+                `📂 <b>Turi:</b> ${telegramEscape(type)}\n` +
+                `━━━━━━━━━━━━━━━━━━━━`;
+
+            message += await getTodayReport(client, userId);
+
+            await queueTelegramNotification(client, siteLogin, message);
+
+            await client.query('COMMIT');
+
+            return res.json({
+                message: "Rasxod muvaffaqiyatli tahrirlandi!",
+                expense: updated.rows[0]
+            });
+
+        } catch (err) {
+
+            try {
+                await client.query('ROLLBACK');
+            } catch (rollbackError) {
+                console.error('ROLLBACK xatosi:', rollbackError);
+            }
+
+            console.error("Rasxodni tahrirlashda xatolik:", err);
+
+            return res.status(500).json({
+                message: "Serverda xatolik yuz berdi!"
+            });
+
+        } finally {
+            client.release();
+        }
+    }
+);
+
+// ====================================================
+// RASXODNI O'CHIRISH (faqat 1 oy ichida qo'shilgan bo'lsa)
+// ====================================================
+
+app.delete(
+    '/api/expenses/:id',
+    authenticateToken,
+    async (req, res) => {
+
+        const userId = req.user.userId;
+        const expenseId = Number(req.params.id);
+
+        if (!Number.isInteger(expenseId) || expenseId <= 0) {
+            return res.status(400).json({
+                message: "Rasxod ID noto'g'ri!"
+            });
+        }
+
+        const client = await pool.connect();
+
+        try {
+
+            await client.query('BEGIN');
+
+            const existing = await client.query(
+                `SELECT * FROM public.expenses WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+                [expenseId, userId]
+            );
+
+            if (!existing.rows.length) {
+                await client.query('ROLLBACK');
+
+                return res.status(404).json({
+                    message: "Rasxod topilmadi!"
+                });
+            }
+
+            const expense = existing.rows[0];
+
+            if (daysSince(expense.created_at) > EXPENSE_EDIT_WINDOW_DAYS) {
+                await client.query('ROLLBACK');
+
+                return res.status(403).json({
+                    message:
+                        `Bu rasxod qo'shilganiga 1 oydan ko'p vaqt o'tgan, o'chirib bo'lmaydi!`
+                });
+            }
+
+            await client.query(
+                `DELETE FROM public.expenses WHERE id = $1`,
+                [expenseId]
+            );
+
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [userId]
+            );
+
+            const siteLogin = userResult.rows[0]?.site_login || null;
+
+            let message =
+                `🗑️ <b>RASXOD O'CHIRILDI</b>\n` +
+                `━━━━━━━━━━━━━━━━━━━━\n` +
+                `📝 <b>Tavsifi:</b> ${telegramEscape(expense.title)}\n` +
+                `💰 <b>Summasi:</b> ${formatSum(expense.amount)} so'm\n` +
+                `━━━━━━━━━━━━━━━━━━━━`;
+
+            message += await getTodayReport(client, userId);
+
+            await queueTelegramNotification(client, siteLogin, message);
+
+            await client.query('COMMIT');
+
+            return res.json({
+                message: "Rasxod muvaffaqiyatli o'chirildi!"
+            });
+
+        } catch (err) {
+
+            try {
+                await client.query('ROLLBACK');
+            } catch (rollbackError) {
+                console.error('ROLLBACK xatosi:', rollbackError);
+            }
+
+            console.error("Rasxodni o'chirishda xatolik:", err);
+
+            return res.status(500).json({
+                message: "Serverda xatolik yuz berdi!"
+            });
+
+        } finally {
+            client.release();
+        }
+    }
+);
+
 
 // ====================================================
 // QR MA'LUMOT
@@ -3084,7 +3823,11 @@ app.post(
                     quantity,
                     cost_price,
                     selling_price,
-                    profit
+                    profit,
+                    local_id,
+                    category,
+                    color,
+                    size
                 )
                 VALUES
                 (
@@ -3094,7 +3837,11 @@ app.post(
                     $4,
                     $5,
                     $6,
-                    $7
+                    $7,
+                    $8,
+                    $9,
+                    $10,
+                    $11
                 )
                 `,
                 [
@@ -3104,7 +3851,11 @@ app.post(
                     qty,
                     cost,
                     sellingPrice,
-                    profit
+                    profit,
+                    product.local_id,
+                    product.category,
+                    product.color,
+                    product.size
                 ]
             );
 
@@ -3545,6 +4296,7 @@ app.get(
                             FROM public.sales
                             WHERE
                                 user_id = $1
+                                AND returned = false
                                 AND ${salesFilter}
                             `,
                             [userId]
