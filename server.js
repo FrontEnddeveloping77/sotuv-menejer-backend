@@ -1515,17 +1515,19 @@ app.post(
 
         let parsedPaidAmount = 0;
 
+        // To‘langan summa ixtiyoriy — bo‘sh yoki noto‘g‘ri bo‘lsa 0
         if (cleanPaymentType === 'credit') {
-            parsedPaidAmount = Number(paid_amount);
-
-            if (
-                !Number.isFinite(parsedPaidAmount) ||
-                parsedPaidAmount < 0
-            ) {
-                return res.status(400).json({
-                    message:
-                        "To'langan summa noto'g'ri!"
-                });
+            if (paid_amount !== undefined && paid_amount !== null && paid_amount !== '') {
+                const n = Number(paid_amount);
+                if (!Number.isFinite(n) || n < 0) {
+                    return res.status(400).json({
+                        message:
+                            "To'langan summa noto'g'ri!"
+                    });
+                }
+                parsedPaidAmount = n;
+            } else {
+                parsedPaidAmount = 0;
             }
         }
 
@@ -2396,15 +2398,17 @@ app.put(
                 });
             }
 
-            parsedPaidAmount = Number(paid_amount);
-
-            if (
-                !Number.isFinite(parsedPaidAmount) ||
-                parsedPaidAmount < 0
-            ) {
-                return res.status(400).json({
-                    message: "To'langan summa noto'g'ri!"
-                });
+            // To‘langan summa ixtiyoriy
+            if (paid_amount !== undefined && paid_amount !== null && paid_amount !== '') {
+                const n = Number(paid_amount);
+                if (!Number.isFinite(n) || n < 0) {
+                    return res.status(400).json({
+                        message: "To'langan summa noto'g'ri!"
+                    });
+                }
+                parsedPaidAmount = n;
+            } else {
+                parsedPaidAmount = 0;
             }
         }
 
