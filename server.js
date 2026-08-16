@@ -371,6 +371,22 @@ const ensureTables = async () => {
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();
         `);
 
+        // Yangi maydonlar: to'lov turi, kimdan olindi, to'langan summa
+        await pool.query(`
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS payment_type TEXT DEFAULT 'cash';
+        `);
+
+        await pool.query(`
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS supplier TEXT;
+        `);
+
+        await pool.query(`
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
+        `);
+
         await pool.query(`
             CREATE UNIQUE INDEX IF NOT EXISTS
             idx_products_qr_token
@@ -1267,7 +1283,10 @@ app.post(
             cost_price,
             color,
             quantity,
-            sizes
+            sizes,
+            payment_type,
+            supplier,
+            paid_amount
         } = req.body || {};
 
         if (
@@ -1277,6 +1296,22 @@ app.post(
             return res.status(400).json({
                 message:
                     "Tovar nomi va kelgan narxi kiritilishi shart!"
+            });
+        }
+
+        // Kategoriya majburiy
+        if (!category || !String(category).trim()) {
+            return res.status(400).json({
+                message:
+                    "Kategoriya kiritilishi shart!"
+            });
+        }
+
+        // Razmerlar majburiy
+        if (!sizes || !String(sizes).trim()) {
+            return res.status(400).json({
+                message:
+                    "Razmerlar kiritilishi shart!"
             });
         }
 
@@ -1301,6 +1336,39 @@ app.post(
                 message:
                     "Soni 0 dan katta bo'lishi kerak!"
             });
+        }
+
+        // To'lov turi
+        const cleanPaymentType =
+            payment_type === 'credit' ? 'credit' : 'cash';
+
+        let cleanSupplier = null;
+        let parsedPaidAmount = 0;
+
+        if (cleanPaymentType === 'credit') {
+            cleanSupplier =
+                typeof supplier === 'string'
+                    ? supplier.trim()
+                    : '';
+
+            if (!cleanSupplier) {
+                return res.status(400).json({
+                    message:
+                        "Nasiya bo'lsa, kimdan olinganini kiritish shart!"
+                });
+            }
+
+            parsedPaidAmount = Number(paid_amount);
+
+            if (
+                !Number.isFinite(parsedPaidAmount) ||
+                parsedPaidAmount < 0
+            ) {
+                return res.status(400).json({
+                    message:
+                        "To'langan summa noto'g'ri!"
+                });
+            }
         }
 
         const userId =
@@ -1339,6 +1407,13 @@ app.post(
                         );
                     }
                 });
+        }
+
+        if (sizeList.length === 0) {
+            return res.status(400).json({
+                message:
+                    "Kamida bitta razmer kiritilishi shart!"
+            });
         }
 
         const client =
@@ -1391,7 +1466,10 @@ app.post(
                             size,
                             quantity,
                             qr_token,
-                            qr_created_at
+                            qr_created_at,
+                            payment_type,
+                            supplier,
+                            paid_amount
                         )
                         VALUES
                         (
@@ -1404,20 +1482,26 @@ app.post(
                             $7,
                             $8,
                             $9,
-                            NOW()
+                            NOW(),
+                            $10,
+                            $11,
+                            $12
                         )
                         RETURNING *
                         `,
                         [
                             userId,
                             nextLocalId,
-                            category || null,
+                            String(category).trim(),
                             String(name).trim(),
                             parsedCostPrice,
                             color || null,
                             null,
                             totalQty,
-                            randomUUID()
+                            randomUUID(),
+                            cleanPaymentType,
+                            cleanSupplier,
+                            parsedPaidAmount
                         ]
                     );
 
@@ -1466,7 +1550,10 @@ app.post(
                                 size,
                                 quantity,
                                 qr_token,
-                                qr_created_at
+                                qr_created_at,
+                                payment_type,
+                                supplier,
+                                paid_amount
                             )
                             VALUES
                             (
@@ -1479,20 +1566,26 @@ app.post(
                                 $7,
                                 $8,
                                 $9,
-                                NOW()
+                                NOW(),
+                                $10,
+                                $11,
+                                $12
                             )
                             RETURNING *
                             `,
                             [
                                 userId,
                                 nextLocalId,
-                                category || null,
+                                String(category).trim(),
                                 String(name).trim(),
                                 parsedCostPrice,
                                 color || null,
                                 sizeList[i],
                                 sizeQty,
-                                randomUUID()
+                                randomUUID(),
+                                cleanPaymentType,
+                                cleanSupplier,
+                                parsedPaidAmount
                             ]
                         );
 
@@ -1544,14 +1637,27 @@ app.post(
                         `\n📏 <b>Razmerlar bo'yicha taqsimot:</b>\n${lines}`;
                 }
 
+                let paymentInfo = '';
+                if (cleanPaymentType === 'credit') {
+                    paymentInfo =
+                        `\n💳 <b>To'lov turi:</b> Nasiya\n` +
+                        `👤 <b>Kimdan:</b> ${telegramEscape(cleanSupplier)}\n` +
+                        `💵 <b>To'langan:</b> ${formatSum(parsedPaidAmount)} so'm\n` +
+                        `📉 <b>Qarz:</b> ${formatSum(parsedCostPrice - parsedPaidAmount)} so'm`;
+                } else {
+                    paymentInfo =
+                        `\n💳 <b>To'lov turi:</b> Naqd`;
+                }
+
                 let message =
                     `🆕 <b>YANGI MAHSULOT QO'SHILDI (#${nextLocalId})</b>\n` +
                     `━━━━━━━━━━━━━━━━━━━━\n` +
                     `📦 <b>Nomi:</b> ${telegramEscape(first.name)}\n` +
                     `🎨 <b>Rangi:</b> ${telegramEscape(first.color || "Yo'q")}\n` +
                     `🗂 <b>Kategoriyasi:</b> ${telegramEscape(first.category || "Yo'q")}\n` +
-                    `💰 <b>Narxi:</b> ${formatSum(first.cost_price)} so'm\n` +
-                    `📊 <b>Umumiy miqdori:</b> ${totalQty} dona` +
+                    `💰 <b>Narxi:</b> ${formatSum(first.cost_price)} so'm` +
+                    paymentInfo +
+                    `\n📊 <b>Umumiy miqdori:</b> ${totalQty} dona` +
                     sizesBlock +
                     `\n━━━━━━━━━━━━━━━━━━━━\n` +
                     `✅ Ombor yangilandi!`;
@@ -1647,7 +1753,10 @@ app.get(
                         quantity,
                         qr_token,
                         qr_created_at,
-                        created_at
+                        created_at,
+                        payment_type,
+                        supplier,
+                        paid_amount
                     FROM public.products
                     WHERE user_id = $1
                     ORDER BY
@@ -1708,12 +1817,29 @@ app.put(
             cost_price,
             color,
             quantity,
-            sizes
+            sizes,
+            payment_type,
+            supplier,
+            paid_amount
         } = req.body || {};
 
         if (!name || cost_price === undefined) {
             return res.status(400).json({
                 message: "Tovar nomi va kelgan narxi kiritilishi shart!"
+            });
+        }
+
+        // Kategoriya majburiy
+        if (!category || !String(category).trim()) {
+            return res.status(400).json({
+                message: "Kategoriya kiritilishi shart!"
+            });
+        }
+
+        // Razmerlar majburiy
+        if (!sizes || !String(sizes).trim()) {
+            return res.status(400).json({
+                message: "Razmerlar kiritilishi shart!"
             });
         }
 
@@ -1733,6 +1859,38 @@ app.put(
             });
         }
 
+        // To'lov turi
+        const cleanPaymentType =
+            payment_type === 'credit' ? 'credit' : 'cash';
+
+        let cleanSupplier = null;
+        let parsedPaidAmount = 0;
+
+        if (cleanPaymentType === 'credit') {
+            cleanSupplier =
+                typeof supplier === 'string'
+                    ? supplier.trim()
+                    : '';
+
+            if (!cleanSupplier) {
+                return res.status(400).json({
+                    message:
+                        "Nasiya bo'lsa, kimdan olinganini kiritish shart!"
+                });
+            }
+
+            parsedPaidAmount = Number(paid_amount);
+
+            if (
+                !Number.isFinite(parsedPaidAmount) ||
+                parsedPaidAmount < 0
+            ) {
+                return res.status(400).json({
+                    message: "To'langan summa noto'g'ri!"
+                });
+            }
+        }
+
         let sizeList = [];
 
         if (sizes && typeof sizes === 'string') {
@@ -1745,6 +1903,12 @@ app.put(
                     seen.add(clean.toLowerCase());
                     sizeList.push(clean);
                 }
+            });
+        }
+
+        if (sizeList.length === 0) {
+            return res.status(400).json({
+                message: "Kamida bitta razmer kiritilishi shart!"
             });
         }
 
@@ -1802,20 +1966,23 @@ app.put(
                 const result = await client.query(
                     `
                     INSERT INTO public.products
-                    (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at, created_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW())
+                    (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at, created_at, payment_type, supplier, paid_amount)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW(),$10,$11,$12)
                     RETURNING *
                     `,
                     [
                         userId,
                         localId,
-                        category || null,
+                        String(category).trim(),
                         String(name).trim(),
                         parsedCostPrice,
                         color || null,
                         null,
                         totalQty,
-                        randomUUID()
+                        randomUUID(),
+                        cleanPaymentType,
+                        cleanSupplier,
+                        parsedPaidAmount
                     ]
                 );
 
@@ -1834,20 +2001,23 @@ app.put(
                     const result = await client.query(
                         `
                         INSERT INTO public.products
-                        (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at, created_at)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW())
+                        (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at, created_at, payment_type, supplier, paid_amount)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW(),$10,$11,$12)
                         RETURNING *
                         `,
                         [
                             userId,
                             localId,
-                            category || null,
+                            String(category).trim(),
                             String(name).trim(),
                             parsedCostPrice,
                             color || null,
                             sizeList[i],
                             sizeQty,
-                            randomUUID()
+                            randomUUID(),
+                            cleanPaymentType,
+                            cleanSupplier,
+                            parsedPaidAmount
                         ]
                     );
 
@@ -1875,14 +2045,27 @@ app.put(
                     sizesBlock = `\n📏 <b>Razmerlar bo'yicha taqsimot:</b>\n${lines}`;
                 }
 
+                let paymentInfo = '';
+                if (cleanPaymentType === 'credit') {
+                    paymentInfo =
+                        `\n💳 <b>To'lov turi:</b> Nasiya\n` +
+                        `👤 <b>Kimdan:</b> ${telegramEscape(cleanSupplier)}\n` +
+                        `💵 <b>To'langan:</b> ${formatSum(parsedPaidAmount)} so'm\n` +
+                        `📉 <b>Qarz:</b> ${formatSum(parsedCostPrice - parsedPaidAmount)} so'm`;
+                } else {
+                    paymentInfo =
+                        `\n💳 <b>To'lov turi:</b> Naqd`;
+                }
+
                 let message =
                     `✏️ <b>TOVAR TAHRIRLANDI (#${localId})</b>\n` +
                     `━━━━━━━━━━━━━━━━━━━━\n` +
                     `📦 <b>Nomi:</b> ${telegramEscape(first.name)}\n` +
                     `🎨 <b>Rangi:</b> ${telegramEscape(first.color || "Yo'q")}\n` +
                     `🗂 <b>Kategoriyasi:</b> ${telegramEscape(first.category || "Yo'q")}\n` +
-                    `💰 <b>Narxi:</b> ${formatSum(first.cost_price)} so'm\n` +
-                    `📊 <b>Umumiy miqdori:</b> ${totalQty} dona` +
+                    `💰 <b>Narxi:</b> ${formatSum(first.cost_price)} so'm` +
+                    paymentInfo +
+                    `\n📊 <b>Umumiy miqdori:</b> ${totalQty} dona` +
                     sizesBlock +
                     `\n━━━━━━━━━━━━━━━━━━━━\n` +
                     `✅ Tovar ma'lumotlari yangilandi!`;
@@ -2623,8 +2806,8 @@ app.post(
                 const insertResult = await client.query(
                     `
                     INSERT INTO public.products
-                    (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+                    (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at, payment_type, supplier, paid_amount)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),'cash',NULL,0)
                     RETURNING *
                     `,
                     [
