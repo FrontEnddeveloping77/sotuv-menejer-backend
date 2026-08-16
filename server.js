@@ -1481,35 +1481,34 @@ app.post(
         const cleanPaymentType =
             payment_type === 'credit' ? 'credit' : 'cash';
 
-        let cleanSupplier = null;
-        let cleanSupplierPhone = null;
+        // Supplier va telefon HAR DOIM majburiy (naqd ham, nasiya ham)
+        let cleanSupplier =
+            typeof supplier === 'string'
+                ? supplier.trim()
+                : '';
+
+        if (!cleanSupplier) {
+            return res.status(400).json({
+                message:
+                    "Kimdan olinganini kiritish shart!"
+            });
+        }
+
+        let cleanSupplierPhone =
+            typeof supplier_phone === 'string'
+                ? supplier_phone.trim()
+                : '';
+
+        if (!cleanSupplierPhone) {
+            return res.status(400).json({
+                message:
+                    "Telefon raqamini kiritish shart!"
+            });
+        }
+
         let parsedPaidAmount = 0;
 
         if (cleanPaymentType === 'credit') {
-            cleanSupplier =
-                typeof supplier === 'string'
-                    ? supplier.trim()
-                    : '';
-
-            if (!cleanSupplier) {
-                return res.status(400).json({
-                    message:
-                        "Nasiya bo'lsa, kimdan olinganini kiritish shart!"
-                });
-            }
-
-            cleanSupplierPhone =
-                typeof supplier_phone === 'string'
-                    ? supplier_phone.trim()
-                    : '';
-
-            if (!cleanSupplierPhone) {
-                return res.status(400).json({
-                    message:
-                        "Nasiya bo'lsa, telefon raqamini kiritish shart!"
-                });
-            }
-
             parsedPaidAmount = Number(paid_amount);
 
             if (
@@ -1800,11 +1799,14 @@ app.post(
                     paymentInfo =
                         `\n💳 <b>To'lov turi:</b> Nasiya\n` +
                         `👤 <b>Kimdan:</b> ${telegramEscape(cleanSupplier)}\n` +
+                        `📞 <b>Telefon:</b> ${telegramEscape(cleanSupplierPhone)}\n` +
                         `💵 <b>To'langan:</b> ${formatSum(parsedPaidAmount)} so'm\n` +
                         `📉 <b>Qarz:</b> ${formatSum(Math.max(0, (parsedCostPrice * totalQty) - parsedPaidAmount))} so'm`;
                 } else {
                     paymentInfo =
-                        `\n💳 <b>To'lov turi:</b> Naqd`;
+                        `\n💳 <b>To'lov turi:</b> Naqd\n` +
+                        `👤 <b>Kimdan:</b> ${telegramEscape(cleanSupplier)}\n` +
+                        `📞 <b>Telefon:</b> ${telegramEscape(cleanSupplierPhone)}`;
                 }
 
                 let message =
@@ -2213,6 +2215,71 @@ app.post(
             });
         } finally {
             client.release();
+        }
+    }
+);
+
+// ====================================================
+// TOVAR BERGANLAR (SUPPLIERS) RO'YXATI
+// ====================================================
+
+app.get(
+    '/api/suppliers',
+    authenticateToken,
+    async (req, res) => {
+        try {
+            const userId = req.user.userId;
+
+            // Barcha tovarlarni (naqd + nasiya) supplier bo'yicha guruhlaymiz
+            const result = await pool.query(
+                `
+                SELECT
+                    COALESCE(NULLIF(TRIM(supplier), ''), 'Noma''lum') AS supplier,
+                    MAX(NULLIF(TRIM(supplier_phone), '')) AS supplier_phone,
+                    COUNT(DISTINCT local_id) AS products_count,
+                    COALESCE(SUM(cost_price * quantity), 0) AS total_cost,
+                    COALESCE(SUM(quantity), 0) AS total_quantity,
+                    json_agg(
+                        json_build_object(
+                            'local_id', local_id,
+                            'name', name,
+                            'color', color,
+                            'size', size,
+                            'quantity', quantity,
+                            'cost_price', cost_price,
+                            'payment_type', payment_type,
+                            'created_at', created_at
+                        )
+                        ORDER BY local_id DESC, size ASC NULLS LAST
+                    ) AS products
+                FROM public.products
+                WHERE user_id = $1
+                  AND supplier IS NOT NULL
+                  AND TRIM(supplier) <> ''
+                GROUP BY COALESCE(NULLIF(TRIM(supplier), ''), 'Noma''lum')
+                ORDER BY MAX(created_at) DESC NULLS LAST, supplier ASC
+                `,
+                [userId]
+            );
+
+            const suppliers = result.rows.map((row) => ({
+                supplier: row.supplier,
+                supplier_phone: row.supplier_phone || null,
+                products_count: Number(row.products_count) || 0,
+                total_cost: Number(row.total_cost) || 0,
+                total_quantity: Number(row.total_quantity) || 0,
+                products: Array.isArray(row.products) ? row.products : []
+            }));
+
+            res.json({
+                suppliers
+            });
+
+        } catch (err) {
+            console.error('Tovar berganlarni olish xatosi:', err);
+            res.status(500).json({
+                message: 'Serverda xatolik yuz berdi!'
+            });
         }
     }
 );
