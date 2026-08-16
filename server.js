@@ -388,6 +388,11 @@ const ensureTables = async () => {
         `);
 
         await pool.query(`
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS supplier_phone TEXT;
+        `);
+
+        await pool.query(`
             CREATE UNIQUE INDEX IF NOT EXISTS
             idx_products_qr_token
             ON public.products(qr_token)
@@ -1286,7 +1291,8 @@ app.post(
             sizes,
             payment_type,
             supplier,
-            paid_amount
+            paid_amount,
+            supplier_phone
         } = req.body || {};
 
         if (
@@ -1343,6 +1349,7 @@ app.post(
             payment_type === 'credit' ? 'credit' : 'cash';
 
         let cleanSupplier = null;
+        let cleanSupplierPhone = null;
         let parsedPaidAmount = 0;
 
         if (cleanPaymentType === 'credit') {
@@ -1355,6 +1362,18 @@ app.post(
                 return res.status(400).json({
                     message:
                         "Nasiya bo'lsa, kimdan olinganini kiritish shart!"
+                });
+            }
+
+            cleanSupplierPhone =
+                typeof supplier_phone === 'string'
+                    ? supplier_phone.trim()
+                    : '';
+
+            if (!cleanSupplierPhone) {
+                return res.status(400).json({
+                    message:
+                        "Nasiya bo'lsa, telefon raqamini kiritish shart!"
                 });
             }
 
@@ -1469,7 +1488,8 @@ app.post(
                             qr_created_at,
                             payment_type,
                             supplier,
-                            paid_amount
+                            paid_amount,
+                            supplier_phone
                         )
                         VALUES
                         (
@@ -1485,7 +1505,8 @@ app.post(
                             NOW(),
                             $10,
                             $11,
-                            $12
+                            $12,
+                            $13
                         )
                         RETURNING *
                         `,
@@ -1501,7 +1522,8 @@ app.post(
                             randomUUID(),
                             cleanPaymentType,
                             cleanSupplier,
-                            parsedPaidAmount
+                            parsedPaidAmount,
+                            cleanSupplierPhone
                         ]
                     );
 
@@ -1553,7 +1575,8 @@ app.post(
                                 qr_created_at,
                                 payment_type,
                                 supplier,
-                                paid_amount
+                                paid_amount,
+                                supplier_phone
                             )
                             VALUES
                             (
@@ -1569,7 +1592,8 @@ app.post(
                                 NOW(),
                                 $10,
                                 $11,
-                                $12
+                                $12,
+                                $13
                             )
                             RETURNING *
                             `,
@@ -1585,7 +1609,8 @@ app.post(
                                 randomUUID(),
                                 cleanPaymentType,
                                 cleanSupplier,
-                                parsedPaidAmount
+                                parsedPaidAmount,
+                                cleanSupplierPhone
                             ]
                         );
 
@@ -1756,7 +1781,8 @@ app.get(
                         created_at,
                         payment_type,
                         supplier,
-                        paid_amount
+                        paid_amount,
+                        supplier_phone
                     FROM public.products
                     WHERE user_id = $1
                     ORDER BY
@@ -1788,6 +1814,89 @@ app.get(
             res.status(500).json({
                 message:
                     'Serverda xatolik yuz berdi!'
+            });
+        }
+    }
+);
+
+// ====================================================
+// QARZLAR RO'YXATI
+// ====================================================
+
+app.get(
+    '/api/debts',
+    authenticateToken,
+    async (req, res) => {
+        try {
+            const userId = req.user.userId;
+
+            // Nasiya bilan olingan tovarlarni olamiz
+            const result = await pool.query(
+                `
+                SELECT
+                    local_id,
+                    name,
+                    size,
+                    cost_price,
+                    paid_amount,
+                    supplier,
+                    supplier_phone,
+                    (cost_price - COALESCE(paid_amount, 0)) AS debt
+                FROM public.products
+                WHERE user_id = $1
+                  AND payment_type = 'credit'
+                  AND (cost_price - COALESCE(paid_amount, 0)) > 0
+                ORDER BY supplier, local_id, size
+                `,
+                [userId]
+            );
+
+            // Supplier bo'yicha guruhlaymiz
+            const grouped = {};
+
+            for (const row of result.rows) {
+                const key = (row.supplier || 'Noma\'lum') + '|' + (row.supplier_phone || '');
+
+                if (!grouped[key]) {
+                    grouped[key] = {
+                        supplier: row.supplier || 'Noma\'lum',
+                        supplier_phone: row.supplier_phone || null,
+                        total_debt: 0,
+                        total_cost: 0,
+                        total_paid: 0,
+                        products_count: 0,
+                        products: []
+                    };
+                }
+
+                const debt = Number(row.debt) || 0;
+                const cost = Number(row.cost_price) || 0;
+                const paid = Number(row.paid_amount) || 0;
+
+                grouped[key].total_debt += debt;
+                grouped[key].total_cost += cost;
+                grouped[key].total_paid += paid;
+                grouped[key].products_count += 1;
+                grouped[key].products.push({
+                    local_id: row.local_id,
+                    name: row.name,
+                    size: row.size,
+                    debt: debt
+                });
+            }
+
+            const debts = Object.values(grouped).sort(
+                (a, b) => b.total_debt - a.total_debt
+            );
+
+            res.json({
+                debts
+            });
+
+        } catch (err) {
+            console.error('Qarzlarni olish xatosi:', err);
+            res.status(500).json({
+                message: 'Serverda xatolik yuz berdi!'
             });
         }
     }
