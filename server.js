@@ -2243,6 +2243,7 @@ app.get(
                         json_build_object(
                             'local_id', local_id,
                             'name', name,
+                            'category', category,
                             'color', color,
                             'size', size,
                             'quantity', quantity,
