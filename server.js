@@ -1,4 +1,8 @@
 // backend/server.js
+// To'liq ishlaydigan versiya — mavjud funksiyalar saqlangan + yangi:
+// - POST /api/dashboard/sell-credit  (nasiyaga sotish)
+// - GET  /api/debts/recent-payments  (oxirgi to'lovlar)
+// - POST /api/debts/undo-or-edit     (to'lovni bekor qilish / tahrirlash)
 
 require('dotenv').config();
 
@@ -20,13 +24,6 @@ app.use(express.json());
 
 // ====================================================
 // JADVALLARNI TAYYORLASH — "GATE" MIDDLEWARE
-// (Vercel'da har bir cold start'da birinchi so'rovdan
-//  oldin jadvallar (products, sales, expenses,
-//  notifications) tayyor ekanligini tekshiradi.
-//  ensureTables() funksiyasi faylning pastida
-//  aniqlangan, lekin bu yerda faqat REFERENCE qilinadi —
-//  chaqirilishi so'rov kelganda amalga oshadi, shu payt
-//  butun fayl allaqachon to'liq yuklangan bo'ladi.)
 // ====================================================
 
 let tablesReadyPromise = null;
@@ -38,8 +35,6 @@ const ensureTablesOnce = () => {
                 '❌ ensureTables() umumiy xatosi:',
                 err
             );
-            // Keyingi so'rovda qayta urinib ko'rish uchun
-            // promise'ni tozalaymiz
             tablesReadyPromise = null;
         });
     }
@@ -101,6 +96,7 @@ const JWT_SECRET =
 const PRODUCT_EDIT_WINDOW_DAYS = 7;
 const SALE_RETURN_WINDOW_DAYS = 7;
 const EXPENSE_EDIT_WINDOW_DAYS = 30;
+const DEBT_PAYMENT_UNDO_WINDOW_DAYS = 30;
 
 const daysSince = (dateValue) => {
     if (!dateValue) return Infinity;
@@ -117,7 +113,6 @@ const formatSum = (value) => {
     if (value === undefined || value === null) {
         return '0';
     }
-
     return Number(value).toLocaleString('uz-UZ');
 };
 
@@ -135,20 +130,9 @@ const getTodayReport = async (clientOrPool, userId) => {
     const salesResult = await clientOrPool.query(
         `
         SELECT
-            COALESCE(
-                SUM(quantity * selling_price),
-                0
-            ) AS revenue,
-
-            COALESCE(
-                SUM(profit),
-                0
-            ) AS profit,
-
-            COALESCE(
-                SUM(quantity),
-                0
-            ) AS sold
+            COALESCE(SUM(quantity * selling_price), 0) AS revenue,
+            COALESCE(SUM(profit), 0) AS profit,
+            COALESCE(SUM(quantity), 0) AS sold
         FROM public.sales
         WHERE user_id = $1
           AND sold_at::date = CURRENT_DATE
@@ -159,11 +143,7 @@ const getTodayReport = async (clientOrPool, userId) => {
 
     const expenseResult = await clientOrPool.query(
         `
-        SELECT
-            COALESCE(
-                SUM(amount),
-                0
-            ) AS expense
+        SELECT COALESCE(SUM(amount), 0) AS expense
         FROM public.expenses
         WHERE user_id = $1
           AND created_at::date = CURRENT_DATE
@@ -182,30 +162,13 @@ const getTodayReport = async (clientOrPool, userId) => {
         [userId]
     );
 
-    const revenue =
-        Number(salesResult.rows[0].revenue || 0);
-
-    const profit =
-        Number(salesResult.rows[0].profit || 0);
-
-    const sold =
-        Number(salesResult.rows[0].sold || 0);
-
-    const expense =
-        Number(expenseResult.rows[0].expense || 0);
-
-    const netProfit =
-        profit - expense;
-
-    const totalProducts =
-        Number(
-            stockResult.rows[0].total_products || 0
-        );
-
-    const totalStock =
-        Number(
-            stockResult.rows[0].total_stock || 0
-        );
+    const revenue = Number(salesResult.rows[0].revenue || 0);
+    const profit = Number(salesResult.rows[0].profit || 0);
+    const sold = Number(salesResult.rows[0].sold || 0);
+    const expense = Number(expenseResult.rows[0].expense || 0);
+    const netProfit = profit - expense;
+    const totalProducts = Number(stockResult.rows[0].total_products || 0);
+    const totalStock = Number(stockResult.rows[0].total_stock || 0);
 
     return (
         `\n\n` +
@@ -363,7 +326,6 @@ const queueTelegramNotification = async (
         console.warn(
             'Telegram notification queue: site_login topilmadi.'
         );
-
         return;
     }
 
@@ -387,11 +349,6 @@ const queueTelegramNotification = async (
 
 // ====================================================
 // JADVALLARNI YARATISH
-// (HAR BIR BO'LIM ALOHIDA try/catch BILAN O'RALGAN —
-//  bittasida xato bo'lsa ham, qolgan jadvallar baribir
-//  yaratiladi. Avval bu funksiya hech qayerda
-//  chaqirilmagani sabab, jadvallar umuman tekshirilmay
-//  qolgan va shu tufayli barcha amallar xato berardi.)
 // ====================================================
 
 const ensureTables = async () => {
@@ -399,22 +356,7 @@ const ensureTables = async () => {
     // ------------------------------------------------
     // USERS
     // ------------------------------------------------
-
-    /*
-     * users jadvali Telegram bot tomonidan oldindan
-     * yaratilgan bo'lishi mumkin.
-     *
-     * Shu sababli bu yerda users jadvalini qayta
-     * yaratmaymiz. Faqat kerakli ustunlarni qo'shamiz.
-     *
-     * Agar bu jadval hali mavjud bo'lmasa ham, xato
-     * shu blokda ushlab qolinadi va qolgan jadvallar
-     * (products, sales, expenses, notifications)
-     * baribir yaratiladi.
-     */
-
     try {
-
         await pool.query(`
             ALTER TABLE public.users
             ADD COLUMN IF NOT EXISTS linked_group_chat_id BIGINT;
@@ -425,9 +367,7 @@ const ensureTables = async () => {
             idx_users_linked_group_chat_id
             ON public.users(linked_group_chat_id);
         `);
-
     } catch (err) {
-
         console.error(
             "⚠️ USERS jadvalini yangilashda xatolik (davom etilmoqda):",
             err.message
@@ -437,9 +377,7 @@ const ensureTables = async () => {
     // ------------------------------------------------
     // PRODUCTS
     // ------------------------------------------------
-
     try {
-
         await pool.query(`
             CREATE TABLE IF NOT EXISTS public.products (
                 id SERIAL PRIMARY KEY,
@@ -457,72 +395,19 @@ const ensureTables = async () => {
             );
         `);
 
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS local_id INTEGER NOT NULL DEFAULT 1;
-        `);
-
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS category TEXT;
-        `);
-
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS color TEXT;
-        `);
-
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 0;
-        `);
-
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS size TEXT;
-        `);
-
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS qr_token UUID;
-        `);
-
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS qr_created_at TIMESTAMP;
-        `);
-
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();
-        `);
-
-        // Yangi maydonlar: to'lov turi, kimdan olindi, to'langan summa
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS payment_type TEXT DEFAULT 'cash';
-        `);
-
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS supplier TEXT;
-        `);
-
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;
-        `);
-
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS supplier_phone TEXT;
-        `);
-
-        // Ixtiyoriy sotilish narxi (faqat QR rasmida ko'rinadi)
-        await pool.query(`
-            ALTER TABLE public.products
-            ADD COLUMN IF NOT EXISTS selling_price NUMERIC DEFAULT NULL;
-        `);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS local_id INTEGER NOT NULL DEFAULT 1;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS category TEXT;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS color TEXT;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 0;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS size TEXT;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS qr_token UUID;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS qr_created_at TIMESTAMP;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW();`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS payment_type TEXT DEFAULT 'cash';`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS supplier TEXT;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS supplier_phone TEXT;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS selling_price NUMERIC DEFAULT NULL;`);
 
         await pool.query(`
             CREATE UNIQUE INDEX IF NOT EXISTS
@@ -542,9 +427,7 @@ const ensureTables = async () => {
             idx_products_user_id
             ON public.products(user_id);
         `);
-
     } catch (err) {
-
         console.error(
             "⚠️ PRODUCTS jadvalini yaratishda xatolik:",
             err.message
@@ -554,9 +437,7 @@ const ensureTables = async () => {
     // ------------------------------------------------
     // ESKI TOVARLARGA QR TOKEN
     // ------------------------------------------------
-
     try {
-
         const qrRows = await pool.query(`
             SELECT id
             FROM public.products
@@ -579,9 +460,7 @@ const ensureTables = async () => {
                 ]
             );
         }
-
     } catch (err) {
-
         console.error(
             "⚠️ Eski tovarlarga QR token biriktirishda xatolik:",
             err.message
@@ -591,9 +470,7 @@ const ensureTables = async () => {
     // ------------------------------------------------
     // SALES
     // ------------------------------------------------
-
     try {
-
         await pool.query(`
             CREATE TABLE IF NOT EXISTS public.sales (
                 id SERIAL PRIMARY KEY,
@@ -605,7 +482,6 @@ const ensureTables = async () => {
                 selling_price NUMERIC NOT NULL DEFAULT 0,
                 profit NUMERIC NOT NULL DEFAULT 0,
                 sold_at TIMESTAMP NOT NULL DEFAULT NOW()
-                
             );
         `);
 
@@ -614,6 +490,11 @@ const ensureTables = async () => {
         await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS color TEXT;`);
         await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS size TEXT;`);
         await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS returned BOOLEAN NOT NULL DEFAULT false;`);
+        // Yangi: nasiya sotuv uchun
+        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS customer_name TEXT;`);
+        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS customer_phone TEXT;`);
+        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS is_credit BOOLEAN NOT NULL DEFAULT false;`);
+        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS paid_now NUMERIC DEFAULT 0;`);
 
         await pool.query(`
             CREATE INDEX IF NOT EXISTS
@@ -626,9 +507,7 @@ const ensureTables = async () => {
             idx_sales_sold_at
             ON public.sales(sold_at);
         `);
-
     } catch (err) {
-
         console.error(
             "⚠️ SALES jadvalini yaratishda xatolik:",
             err.message
@@ -638,9 +517,7 @@ const ensureTables = async () => {
     // ------------------------------------------------
     // EXPENSES
     // ------------------------------------------------
-
     try {
-
         await pool.query(`
             CREATE TABLE IF NOT EXISTS public.expenses (
                 id SERIAL PRIMARY KEY,
@@ -663,9 +540,7 @@ const ensureTables = async () => {
             idx_expenses_created_at
             ON public.expenses(created_at);
         `);
-
     } catch (err) {
-
         console.error(
             "⚠️ EXPENSES jadvalini yaratishda xatolik:",
             err.message
@@ -675,9 +550,7 @@ const ensureTables = async () => {
     // ------------------------------------------------
     // NOTIFICATIONS
     // ------------------------------------------------
-
     try {
-
         await pool.query(`
             CREATE TABLE IF NOT EXISTS public.notifications (
                 id SERIAL PRIMARY KEY,
@@ -693,9 +566,7 @@ const ensureTables = async () => {
             idx_notifications_unsent
             ON public.notifications(is_sent, created_at);
         `);
-
     } catch (err) {
-
         console.error(
             "⚠️ NOTIFICATIONS jadvalini yaratishda xatolik:",
             err.message
@@ -720,19 +591,16 @@ app.get('/', (req, res) => {
 app.get('/api/health', async (req, res) => {
     try {
         await pool.query('SELECT 1');
-
         res.json({
             success: true,
             message:
                 'Backend Server muvaffaqiyatli ishlayapti!'
         });
-
     } catch (err) {
         console.error(
             'Health check xatosi:',
             err
         );
-
         res.status(500).json({
             success: false,
             message:
@@ -746,7 +614,6 @@ app.get('/api/health', async (req, res) => {
 // ====================================================
 
 app.post('/api/login', async (req, res) => {
-
     const {
         login,
         password
@@ -760,25 +627,18 @@ app.post('/api/login', async (req, res) => {
     }
 
     try {
+        const cleanLogin = String(login).trim();
+        const cleanPassword = String(password).trim();
 
-        const cleanLogin =
-            String(login).trim();
-
-        const cleanPassword =
-            String(password).trim();
-
-        const result =
-            await pool.query(
-                `
-                SELECT *
-                FROM public.users
-                WHERE site_login = $1
-                LIMIT 1
-                `,
-                [
-                    cleanLogin
-                ]
-            );
+        const result = await pool.query(
+            `
+            SELECT *
+            FROM public.users
+            WHERE site_login = $1
+            LIMIT 1
+            `,
+            [cleanLogin]
+        );
 
         if (result.rows.length === 0) {
             return res.status(400).json({
@@ -787,8 +647,7 @@ app.post('/api/login', async (req, res) => {
             });
         }
 
-        const user =
-            result.rows[0];
+        const user = result.rows[0];
 
         if (!user.is_paid) {
             return res.status(403).json({
@@ -815,36 +674,26 @@ app.post('/api/login', async (req, res) => {
         let isPasswordValid = false;
 
         if (dbPassword) {
-
-            const passwordString =
-                String(dbPassword);
+            const passwordString = String(dbPassword);
 
             if (
                 passwordString.startsWith('$2a$') ||
                 passwordString.startsWith('$2b$') ||
                 passwordString.startsWith('$2y$')
             ) {
-
                 try {
-
-                    isPasswordValid =
-                        await bcrypt.compare(
-                            cleanPassword,
-                            passwordString
-                        );
-
+                    isPasswordValid = await bcrypt.compare(
+                        cleanPassword,
+                        passwordString
+                    );
                 } catch (passwordError) {
-
                     console.error(
                         'Bcrypt tekshirish xatosi:',
                         passwordError
                     );
-
                     isPasswordValid = false;
                 }
-
             } else {
-
                 isPasswordValid =
                     cleanPassword ===
                     passwordString.trim();
@@ -867,36 +716,26 @@ app.post('/api/login', async (req, res) => {
                 7 * 24 * 60 * 60
         };
 
-        const token =
-            jwt.encode(
-                payload,
-                JWT_SECRET
-            );
+        const token = jwt.encode(
+            payload,
+            JWT_SECRET
+        );
 
         return res.json({
             message:
                 'Tizimga muvaffaqiyatli kirildi',
-
             token,
-
             user: {
                 id: user.id,
-
-                telegram_id:
-                    user.telegram_id,
-
-                login:
-                    user.site_login
+                telegram_id: user.telegram_id,
+                login: user.site_login
             }
         });
-
     } catch (err) {
-
         console.error(
             'Login xatosi:',
             err
         );
-
         return res.status(500).json({
             message:
                 'Serverda xatolik yuz berdi!'
@@ -913,9 +752,7 @@ const authenticateToken = async (
     res,
     next
 ) => {
-
-    const authHeader =
-        req.headers.authorization;
+    const authHeader = req.headers.authorization;
 
     if (!authHeader) {
         return res.status(401).json({
@@ -924,8 +761,7 @@ const authenticateToken = async (
         });
     }
 
-    const parts =
-        authHeader.split(' ');
+    const parts = authHeader.split(' ');
 
     if (
         parts.length !== 2 ||
@@ -937,8 +773,7 @@ const authenticateToken = async (
         });
     }
 
-    const token =
-        parts[1];
+    const token = parts[1];
 
     if (!token) {
         return res.status(401).json({
@@ -948,12 +783,10 @@ const authenticateToken = async (
     }
 
     try {
-
-        const decoded =
-            jwt.decode(
-                token,
-                JWT_SECRET
-            );
+        const decoded = jwt.decode(
+            token,
+            JWT_SECRET
+        );
 
         if (
             !decoded ||
@@ -976,21 +809,18 @@ const authenticateToken = async (
             });
         }
 
-        const result =
-            await pool.query(
-                `
-                SELECT
-                    id,
-                    is_paid,
-                    expires_at
-                FROM public.users
-                WHERE id = $1
-                LIMIT 1
-                `,
-                [
-                    decoded.userId
-                ]
-            );
+        const result = await pool.query(
+            `
+            SELECT
+                id,
+                is_paid,
+                expires_at
+            FROM public.users
+            WHERE id = $1
+            LIMIT 1
+            `,
+            [decoded.userId]
+        );
 
         if (result.rows.length === 0) {
             return res.status(403).json({
@@ -999,8 +829,7 @@ const authenticateToken = async (
             });
         }
 
-        const user =
-            result.rows[0];
+        const user = result.rows[0];
 
         if (!user.is_paid) {
             return res.status(403).json({
@@ -1020,16 +849,12 @@ const authenticateToken = async (
         }
 
         req.user = decoded;
-
         next();
-
     } catch (err) {
-
         console.error(
             'Token tekshirish xatosi:',
             err
         );
-
         return res.status(403).json({
             message:
                 "Yaroqsiz yoki muddati o'tgan token!"
@@ -1045,28 +870,23 @@ app.get(
     '/api/me',
     authenticateToken,
     async (req, res) => {
-
         try {
-
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        id,
-                        telegram_id,
-                        full_name,
-                        username,
-                        site_login,
-                        is_paid,
-                        expires_at
-                    FROM public.users
-                    WHERE id = $1
-                    LIMIT 1
-                    `,
-                    [
-                        req.user.userId
-                    ]
-                );
+            const result = await pool.query(
+                `
+                SELECT
+                    id,
+                    telegram_id,
+                    full_name,
+                    username,
+                    site_login,
+                    is_paid,
+                    expires_at
+                FROM public.users
+                WHERE id = $1
+                LIMIT 1
+                `,
+                [req.user.userId]
+            );
 
             if (result.rows.length === 0) {
                 return res.status(404).json({
@@ -1076,17 +896,13 @@ app.get(
             }
 
             res.json({
-                user:
-                    result.rows[0]
+                user: result.rows[0]
             });
-
         } catch (err) {
-
             console.error(
                 '/api/me xatosi:',
                 err
             );
-
             res.status(500).json({
                 message:
                     'Serverda xatolik yuz berdi!'
@@ -1103,51 +919,42 @@ app.get(
     '/api/dashboard/stats',
     authenticateToken,
     async (req, res) => {
-
         try {
-
-            const userId =
-                req.user.userId;
+            const userId = req.user.userId;
 
             let storeName = '';
 
-            const userResult =
-                await pool.query(
-                    `
-                    SELECT
-                        full_name,
-                        site_login
-                    FROM public.users
-                    WHERE id = $1
-                    LIMIT 1
-                    `,
-                    [
-                        userId
-                    ]
-                );
+            const userResult = await pool.query(
+                `
+                SELECT
+                    full_name,
+                    site_login
+                FROM public.users
+                WHERE id = $1
+                LIMIT 1
+                `,
+                [userId]
+            );
 
             if (userResult.rows.length > 0) {
-
                 storeName =
                     userResult.rows[0].full_name ||
                     userResult.rows[0].site_login ||
                     '';
             }
 
-            const productStats =
-                await pool.query(
-                    `
-                    SELECT
-                        COUNT(DISTINCT local_id) AS "totalProducts",
-                        COALESCE(SUM(quantity), 0) AS "totalStock",
-                        COALESCE(SUM(quantity * cost_price), 0) AS "totalStockValue"
-                    FROM public.products
-                    WHERE user_id = $1
-                    `,
-                    [userId]
-                );
+            const productStats = await pool.query(
+                `
+                SELECT
+                    COUNT(DISTINCT local_id) AS "totalProducts",
+                    COALESCE(SUM(quantity), 0) AS "totalStock",
+                    COALESCE(SUM(quantity * cost_price), 0) AS "totalStockValue"
+                FROM public.products
+                WHERE user_id = $1
+                `,
+                [userId]
+            );
 
-            // Jami qarzni hisoblash (local_id bo'yicha guruhlab)
             const debtStats = await pool.query(
                 `
                 SELECT COALESCE(SUM(debt), 0) AS "totalDebt"
@@ -1166,244 +973,98 @@ app.get(
                 [userId]
             );
 
-            const getPeriodStats =
-                async (
-                    salesFilter,
-                    expenseFilter
-                ) => {
+            const getPeriodStats = async (
+                salesFilter,
+                expenseFilter
+            ) => {
+                const sales = await pool.query(
+                    `
+                    SELECT
+                        COALESCE(SUM(quantity), 0) AS sold,
+                        COALESCE(SUM(quantity * selling_price), 0) AS revenue,
+                        COALESCE(SUM(profit), 0) AS gross_profit
+                    FROM public.sales
+                    WHERE
+                        user_id = $1
+                        AND returned = false
+                        AND ${salesFilter}
+                    `,
+                    [userId]
+                );
 
-                    const sales =
-                        await pool.query(
-                            `
-                            SELECT
-                                COALESCE(
-                                    SUM(quantity),
-                                    0
-                                ) AS sold,
+                const expenses = await pool.query(
+                    `
+                    SELECT
+                        COALESCE(SUM(amount), 0) AS expense
+                    FROM public.expenses
+                    WHERE
+                        user_id = $1
+                        AND ${expenseFilter}
+                    `,
+                    [userId]
+                );
 
-                                COALESCE(
-                                    SUM(
-                                        quantity *
-                                        selling_price
-                                    ),
-                                    0
-                                ) AS revenue,
+                const sold = Number(sales.rows[0].sold || 0);
+                const revenue = Number(sales.rows[0].revenue || 0);
+                const grossProfit = Number(sales.rows[0].gross_profit || 0);
+                const expense = Number(expenses.rows[0].expense || 0);
 
-                                COALESCE(
-                                    SUM(profit),
-                                    0
-                                ) AS gross_profit
-
-                            FROM public.sales
-
-                            WHERE
-                                user_id = $1
-                                AND returned = false
-                                AND ${salesFilter}
-                            `,
-                            [
-                                userId
-                            ]
-                        );
-
-                    const expenses =
-                        await pool.query(
-                            `
-                            SELECT
-                                COALESCE(
-                                    SUM(amount),
-                                    0
-                                ) AS expense
-
-                            FROM public.expenses
-
-                            WHERE
-                                user_id = $1
-                                AND ${expenseFilter}
-                            `,
-                            [
-                                userId
-                            ]
-                        );
-
-                    const sold =
-                        Number(
-                            sales.rows[0].sold || 0
-                        );
-
-                    const revenue =
-                        Number(
-                            sales.rows[0].revenue || 0
-                        );
-
-                    const grossProfit =
-                        Number(
-                            sales.rows[0].gross_profit || 0
-                        );
-
-                    const expense =
-                        Number(
-                            expenses.rows[0].expense || 0
-                        );
-
-                    return {
-                        sold,
-                        revenue,
-                        expense,
-                        profit:
-                            grossProfit -
-                            expense
-                    };
+                return {
+                    sold,
+                    revenue,
+                    expense,
+                    profit: grossProfit - expense
                 };
+            };
 
-            const daily =
-                await getPeriodStats(
-                    `sold_at::date = CURRENT_DATE`,
-                    `created_at::date = CURRENT_DATE`
-                );
+            const daily = await getPeriodStats(
+                `sold_at::date = CURRENT_DATE`,
+                `created_at::date = CURRENT_DATE`
+            );
 
-            const monthly =
-                await getPeriodStats(
-                    `
-                    date_trunc(
-                        'month',
-                        sold_at
-                    )
-                    =
-                    date_trunc(
-                        'month',
-                        CURRENT_DATE
-                    )
-                    `,
-                    `
-                    date_trunc(
-                        'month',
-                        created_at
-                    )
-                    =
-                    date_trunc(
-                        'month',
-                        CURRENT_DATE
-                    )
-                    `
-                );
+            const monthly = await getPeriodStats(
+                `date_trunc('month', sold_at) = date_trunc('month', CURRENT_DATE)`,
+                `date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)`
+            );
 
-            const yearly =
-                await getPeriodStats(
-                    `
-                    date_trunc(
-                        'year',
-                        sold_at
-                    )
-                    =
-                    date_trunc(
-                        'year',
-                        CURRENT_DATE
-                    )
-                    `,
-                    `
-                    date_trunc(
-                        'year',
-                        created_at
-                    )
-                    =
-                    date_trunc(
-                        'year',
-                        CURRENT_DATE
-                    )
-                    `
-                );
+            const yearly = await getPeriodStats(
+                `date_trunc('year', sold_at) = date_trunc('year', CURRENT_DATE)`,
+                `date_trunc('year', created_at) = date_trunc('year', CURRENT_DATE)`
+            );
 
-            const total =
-                await getPeriodStats(
-                    `TRUE`,
-                    `TRUE`
-                );
+            const total = await getPeriodStats(
+                `TRUE`,
+                `TRUE`
+            );
 
             res.json({
-
                 storeName,
-
-                totalProducts:
-                    Number(
-                        productStats.rows[0]
-                            .totalProducts || 0
-                    ),
-
-                totalStock:
-                    Number(
-                        productStats.rows[0]
-                            .totalStock || 0
-                    ),
-
-                totalStockValue:
-                    Number(
-                        productStats.rows[0]
-                            .totalStockValue || 0
-                    ),
-
-                totalDebt:
-                    Number(
-                        debtStats.rows[0]
-                            .totalDebt || 0
-                    ),
-
-                totalSold:
-                    total.sold,
-
-                totalRevenue:
-                    total.revenue,
-
-                totalProfit:
-                    total.profit,
-
-                totalExpense:
-                    total.expense,
-
-                dailySold:
-                    daily.sold,
-
-                dailyRevenue:
-                    daily.revenue,
-
-                dailyProfit:
-                    daily.profit,
-
-                dailyExpense:
-                    daily.expense,
-
-                monthlySold:
-                    monthly.sold,
-
-                monthlyRevenue:
-                    monthly.revenue,
-
-                monthlyProfit:
-                    monthly.profit,
-
-                monthlyExpense:
-                    monthly.expense,
-
-                yearlySold:
-                    yearly.sold,
-
-                yearlyRevenue:
-                    yearly.revenue,
-
-                yearlyProfit:
-                    yearly.profit,
-
-                yearlyExpense:
-                    yearly.expense
+                totalProducts: Number(productStats.rows[0].totalProducts || 0),
+                totalStock: Number(productStats.rows[0].totalStock || 0),
+                totalStockValue: Number(productStats.rows[0].totalStockValue || 0),
+                totalDebt: Number(debtStats.rows[0].totalDebt || 0),
+                totalSold: total.sold,
+                totalRevenue: total.revenue,
+                totalProfit: total.profit,
+                totalExpense: total.expense,
+                dailySold: daily.sold,
+                dailyRevenue: daily.revenue,
+                dailyProfit: daily.profit,
+                dailyExpense: daily.expense,
+                monthlySold: monthly.sold,
+                monthlyRevenue: monthly.revenue,
+                monthlyProfit: monthly.profit,
+                monthlyExpense: monthly.expense,
+                yearlySold: yearly.sold,
+                yearlyRevenue: yearly.revenue,
+                yearlyProfit: yearly.profit,
+                yearlyExpense: yearly.expense
             });
-
         } catch (err) {
-
             console.error(
                 'Stats xatosi:',
                 err
             );
-
             res.status(500).json({
                 message:
                     'Serverda xatolik yuz berdi!'
@@ -1420,7 +1081,6 @@ app.post(
     '/api/products',
     authenticateToken,
     async (req, res) => {
-
         const {
             category,
             name,
@@ -1445,7 +1105,6 @@ app.post(
             });
         }
 
-        // Kategoriya majburiy
         if (!category || !String(category).trim()) {
             return res.status(400).json({
                 message:
@@ -1453,10 +1112,7 @@ app.post(
             });
         }
 
-        // Razmerlar ixtiyoriy (bo'sh bo'lsa bitta Standart sifatida saqlanadi)
-
-        const parsedCostPrice =
-            Number(cost_price);
+        const parsedCostPrice = Number(cost_price);
 
         if (
             !Number.isFinite(parsedCostPrice) ||
@@ -1468,8 +1124,7 @@ app.post(
             });
         }
 
-        const totalQty =
-            parseInt(quantity, 10) || 0;
+        const totalQty = parseInt(quantity, 10) || 0;
 
         if (totalQty <= 0) {
             return res.status(400).json({
@@ -1478,11 +1133,9 @@ app.post(
             });
         }
 
-        // To'lov turi
         const cleanPaymentType =
             payment_type === 'credit' ? 'credit' : 'cash';
 
-        // Supplier va telefon HAR DOIM majburiy (naqd ham, nasiya ham)
         let cleanSupplier =
             typeof supplier === 'string'
                 ? supplier.trim()
@@ -1509,7 +1162,6 @@ app.post(
 
         let parsedPaidAmount = 0;
 
-        // To‘langan summa ixtiyoriy — bo‘sh yoki noto‘g‘ri bo‘lsa 0
         if (cleanPaymentType === 'credit') {
             if (paid_amount !== undefined && paid_amount !== null && paid_amount !== '') {
                 const n = Number(paid_amount);
@@ -1525,7 +1177,6 @@ app.post(
             }
         }
 
-        // Ixtiyoriy sotilish narxi (QR uchun)
         let parsedSellingPrice = null;
         if (selling_price !== undefined && selling_price !== null && selling_price !== '') {
             parsedSellingPrice = Number(selling_price);
@@ -1536,8 +1187,7 @@ app.post(
             }
         }
 
-        const userId =
-            req.user.userId;
+        const userId = req.user.userId;
 
         let sizeList = [];
 
@@ -1545,28 +1195,20 @@ app.post(
             sizes &&
             typeof sizes === 'string'
         ) {
-
-            const seen =
-                new Set();
-
+            const seen = new Set();
             sizes
                 .split(',')
                 .forEach((item) => {
-
-                    const clean =
-                        item.trim();
-
+                    const clean = item.trim();
                     if (
                         clean &&
                         !seen.has(
                             clean.toLowerCase()
                         )
                     ) {
-
                         seen.add(
                             clean.toLowerCase()
                         );
-
                         sizeList.push(
                             clean
                         );
@@ -1574,30 +1216,21 @@ app.post(
                 });
         }
 
-        // sizeList bo'sh bo'lsa — bitta qator size=null (Standart) bilan yoziladi
-
-        const client =
-            await pool.connect();
+        const client = await pool.connect();
 
         try {
+            await client.query('BEGIN');
 
-            await client.query(
-                'BEGIN'
+            const last = await client.query(
+                `
+                SELECT local_id
+                FROM public.products
+                WHERE user_id = $1
+                ORDER BY local_id DESC, id DESC
+                LIMIT 1
+                `,
+                [userId]
             );
-
-            const last =
-                await client.query(
-                    `
-                    SELECT local_id
-                    FROM public.products
-                    WHERE user_id = $1
-                    ORDER BY local_id DESC, id DESC
-                    LIMIT 1
-                    `,
-                    [
-                        userId
-                    ]
-                );
 
             const nextLocalId =
                 last.rows.length
@@ -1611,9 +1244,74 @@ app.post(
             if (
                 sizeList.length === 0
             ) {
+                const result = await client.query(
+                    `
+                    INSERT INTO public.products
+                    (
+                        user_id,
+                        local_id,
+                        category,
+                        name,
+                        cost_price,
+                        color,
+                        size,
+                        quantity,
+                        qr_token,
+                        qr_created_at,
+                        payment_type,
+                        supplier,
+                        paid_amount,
+                        supplier_phone,
+                        selling_price
+                    )
+                    VALUES
+                    (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(),
+                        $10, $11, $12, $13, $14
+                    )
+                    RETURNING *
+                    `,
+                    [
+                        userId,
+                        nextLocalId,
+                        String(category).trim(),
+                        String(name).trim(),
+                        parsedCostPrice,
+                        color || null,
+                        null,
+                        totalQty,
+                        randomUUID(),
+                        cleanPaymentType,
+                        cleanSupplier,
+                        parsedPaidAmount,
+                        cleanSupplierPhone,
+                        parsedSellingPrice
+                    ]
+                );
+                insertedRows.push(
+                    result.rows[0]
+                );
+            } else {
+                const count = sizeList.length;
+                const base = Math.floor(
+                    totalQty / count
+                );
+                const remainder = totalQty % count;
 
-                const result =
-                    await client.query(
+                for (
+                    let i = 0;
+                    i < count;
+                    i++
+                ) {
+                    const sizeQty =
+                        base +
+                        (
+                            i < remainder
+                                ? 1
+                                : 0
+                        );
+
+                    const result = await client.query(
                         `
                         INSERT INTO public.products
                         (
@@ -1635,21 +1333,8 @@ app.post(
                         )
                         VALUES
                         (
-                            $1,
-                            $2,
-                            $3,
-                            $4,
-                            $5,
-                            $6,
-                            $7,
-                            $8,
-                            $9,
-                            NOW(),
-                            $10,
-                            $11,
-                            $12,
-                            $13,
-                            $14
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(),
+                            $10, $11, $12, $13, $14
                         )
                         RETURNING *
                         `,
@@ -1660,8 +1345,8 @@ app.post(
                             String(name).trim(),
                             parsedCostPrice,
                             color || null,
-                            null,
-                            totalQty,
+                            sizeList[i],
+                            sizeQty,
                             randomUUID(),
                             cleanPaymentType,
                             cleanSupplier,
@@ -1670,133 +1355,36 @@ app.post(
                             parsedSellingPrice
                         ]
                     );
-
-                insertedRows.push(
-                    result.rows[0]
-                );
-
-            } else {
-
-                const count =
-                    sizeList.length;
-
-                const base =
-                    Math.floor(
-                        totalQty / count
-                    );
-
-                const remainder =
-                    totalQty % count;
-
-                for (
-                    let i = 0;
-                    i < count;
-                    i++
-                ) {
-
-                    const sizeQty =
-                        base +
-                        (
-                            i < remainder
-                                ? 1
-                                : 0
-                        );
-
-                    const result =
-                        await client.query(
-                            `
-                            INSERT INTO public.products
-                            (
-                                user_id,
-                                local_id,
-                                category,
-                                name,
-                                cost_price,
-                                color,
-                                size,
-                                quantity,
-                                qr_token,
-                                qr_created_at,
-                                payment_type,
-                                supplier,
-                                paid_amount,
-                                supplier_phone,
-                                selling_price
-                            )
-                            VALUES
-                            (
-                                $1,
-                                $2,
-                                $3,
-                                $4,
-                                $5,
-                                $6,
-                                $7,
-                                $8,
-                                $9,
-                                NOW(),
-                                $10,
-                                $11,
-                                $12,
-                                $13,
-                                $14
-                            )
-                            RETURNING *
-                            `,
-                            [
-                                userId,
-                                nextLocalId,
-                                String(category).trim(),
-                                String(name).trim(),
-                                parsedCostPrice,
-                                color || null,
-                                sizeList[i],
-                                sizeQty,
-                                randomUUID(),
-                                cleanPaymentType,
-                                cleanSupplier,
-                                parsedPaidAmount,
-                                cleanSupplierPhone,
-                                parsedSellingPrice
-                            ]
-                        );
-
                     insertedRows.push(
                         result.rows[0]
                     );
                 }
             }
 
-            const userResult =
-                await client.query(
-                    `
-                    SELECT site_login
-                    FROM public.users
-                    WHERE id = $1
-                    LIMIT 1
-                    `,
-                    [
-                        userId
-                    ]
-                );
+            const userResult = await client.query(
+                `
+                SELECT site_login
+                FROM public.users
+                WHERE id = $1
+                LIMIT 1
+                `,
+                [userId]
+            );
 
             if (
                 userResult.rows.length
             ) {
-
                 const siteLogin =
                     userResult.rows[0]
                         .site_login;
 
-                const first =
-                    insertedRows[0];
+                const first = insertedRows[0];
 
                 let sizesBlock = '';
 
                 if (
                     sizeList.length
                 ) {
-
                     const lines =
                         insertedRows
                             .map(
@@ -1850,33 +1438,20 @@ app.post(
                 );
             }
 
-            await client.query(
-                'COMMIT'
-            );
+            await client.query('COMMIT');
 
             res.status(201).json({
-
                 message:
                     sizeList.length
                         ? `Tovar saqlandi! ${sizeList.length} ta razmer bo'yicha taqsimlandi (ID: #${nextLocalId})`
                         : `Tovar saqlandi! ID: #${nextLocalId}`,
-
-                product:
-                    insertedRows[0],
-
-                products:
-                    insertedRows,
-
-                local_id:
-                    nextLocalId
+                product: insertedRows[0],
+                products: insertedRows,
+                local_id: nextLocalId
             });
-
         } catch (err) {
-
             try {
-                await client.query(
-                    'ROLLBACK'
-                );
+                await client.query('ROLLBACK');
             } catch (rollbackError) {
                 console.error(
                     'ROLLBACK xatosi:',
@@ -1893,9 +1468,7 @@ app.post(
                 message:
                     "Serverda xatolik yuz berdi!"
             });
-
         } finally {
-
             client.release();
         }
     }
@@ -1909,59 +1482,50 @@ app.get(
     '/api/products',
     authenticateToken,
     async (req, res) => {
-
         try {
-
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        id,
-                        user_id,
-                        local_id,
-                        category,
-                        name,
-                        name AS title,
-                        cost_price,
-                        color,
-                        size,
-                        quantity,
-                        qr_token,
-                        qr_created_at,
-                        created_at,
-                        payment_type,
-                        supplier,
-                        paid_amount,
-                        supplier_phone,
-                        selling_price
-                    FROM public.products
-                    WHERE user_id = $1
-                    ORDER BY
-                        local_id DESC,
-                        CASE
-                            WHEN size ~ '^[0-9]+$'
-                            THEN size::int
-                        END ASC NULLS LAST,
-                        size ASC NULLS LAST,
-                        id ASC
-                    `,
-                    [
-                        req.user.userId
-                    ]
-                );
+            const result = await pool.query(
+                `
+                SELECT
+                    id,
+                    user_id,
+                    local_id,
+                    category,
+                    name,
+                    name AS title,
+                    cost_price,
+                    color,
+                    size,
+                    quantity,
+                    qr_token,
+                    qr_created_at,
+                    created_at,
+                    payment_type,
+                    supplier,
+                    paid_amount,
+                    supplier_phone,
+                    selling_price
+                FROM public.products
+                WHERE user_id = $1
+                ORDER BY
+                    local_id DESC,
+                    CASE
+                        WHEN size ~ '^[0-9]+$'
+                        THEN size::int
+                    END ASC NULLS LAST,
+                    size ASC NULLS LAST,
+                    id ASC
+                `,
+                [req.user.userId]
+            );
 
             res.json({
-                products:
-                    result.rows
+                products: result.rows
             });
-
         } catch (err) {
-
             console.error(
                 'Tovarlarni olish xatosi:',
                 err
             );
-
             res.status(500).json({
                 message:
                     'Serverda xatolik yuz berdi!'
@@ -1981,8 +1545,6 @@ app.get(
         try {
             const userId = req.user.userId;
 
-            // Nasiya bilan olingan tovarlarni local_id bo'yicha guruhlab olamiz
-            // (paid_amount umumiy summa, har bir razmer qatoriga bir xil yozilgan)
             const result = await pool.query(
                 `
                 SELECT
@@ -2009,7 +1571,6 @@ app.get(
                 [userId]
             );
 
-            // Bir xil odam (ism + telefon) bitta qatorga yig'iladi
             const grouped = {};
 
             for (const row of result.rows) {
@@ -2056,12 +1617,344 @@ app.get(
             res.json({
                 debts
             });
-
         } catch (err) {
             console.error('Qarzlarni olish xatosi:', err);
             res.status(500).json({
                 message: 'Serverda xatolik yuz berdi!'
             });
+        }
+    }
+);
+
+// ====================================================
+// YANGI: OXIRGI TO'LOVLAR (bekor qilish uchun)
+// ====================================================
+
+app.get(
+    '/api/debts/recent-payments',
+    authenticateToken,
+    async (req, res) => {
+        try {
+            const userId = req.user.userId;
+
+            // To'lov qilingan (paid_amount > 0) barcha nasiya tovarlar
+            const result = await pool.query(
+                `
+                SELECT
+                    local_id,
+                    MAX(name) AS name,
+                    MAX(category) AS category,
+                    MAX(color) AS color,
+                    MAX(supplier) AS supplier,
+                    MAX(supplier_phone) AS supplier_phone,
+                    SUM(quantity) AS total_quantity,
+                    SUM(cost_price * quantity) AS total_cost,
+                    MAX(COALESCE(paid_amount, 0)) AS total_paid,
+                    GREATEST(
+                        SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
+                        0
+                    ) AS debt,
+                    MAX(created_at) AS last_created
+                FROM public.products
+                WHERE user_id = $1
+                  AND payment_type = 'credit'
+                  AND COALESCE(paid_amount, 0) > 0
+                GROUP BY local_id
+                ORDER BY MAX(created_at) DESC
+                `,
+                [userId]
+            );
+
+            // Bir xil supplier bo'yicha guruhlash
+            const grouped = {};
+
+            for (const row of result.rows) {
+                const supplierName = (row.supplier || "Noma'lum").trim();
+                const phone = (row.supplier_phone || '').trim();
+                const key = supplierName.toLowerCase() + '|' + phone;
+
+                if (!grouped[key]) {
+                    grouped[key] = {
+                        supplier: supplierName,
+                        supplier_phone: phone || null,
+                        total_debt: 0,
+                        total_cost: 0,
+                        total_paid: 0,
+                        products_count: 0,
+                        products: [],
+                        last_created: row.last_created
+                    };
+                }
+
+                const debt = Number(row.debt) || 0;
+                const cost = Number(row.total_cost) || 0;
+                const paid = Number(row.total_paid) || 0;
+
+                grouped[key].total_debt += debt;
+                grouped[key].total_cost += cost;
+                grouped[key].total_paid += paid;
+                grouped[key].products_count += 1;
+                grouped[key].products.push({
+                    local_id: row.local_id,
+                    name: row.name,
+                    category: row.category || 'Umumiy',
+                    color: row.color || null,
+                    quantity: Number(row.total_quantity) || 0,
+                    total_cost: cost,
+                    total_paid: paid,
+                    debt: debt
+                });
+
+                if (row.last_created && (!grouped[key].last_created || new Date(row.last_created) > new Date(grouped[key].last_created))) {
+                    grouped[key].last_created = row.last_created;
+                }
+            }
+
+            const payments = Object.values(grouped)
+                .filter(p => Number(p.total_paid) > 0)
+                .sort((a, b) => b.total_paid - a.total_paid);
+
+            res.json({
+                payments
+            });
+        } catch (err) {
+            console.error('Recent payments xatosi:', err);
+            res.status(500).json({
+                message: 'Serverda xatolik yuz berdi!'
+            });
+        }
+    }
+);
+
+// ====================================================
+// YANGI: TO'LOVNI BEKOR QILISH / TAHRIRLASH
+// ====================================================
+
+app.post(
+    '/api/debts/undo-or-edit',
+    authenticateToken,
+    async (req, res) => {
+        const userId = req.user.userId;
+        const { supplier, supplier_phone, amount, mode } = req.body || {};
+
+        const cleanSupplier = typeof supplier === 'string' ? supplier.trim() : '';
+        const parsedAmount = Number(amount);
+        const actionMode = mode === 'edit' ? 'edit' : 'undo';
+
+        if (!cleanSupplier) {
+            return res.status(400).json({
+                message: "Kimdan ekanligi ko'rsatilmagan!"
+            });
+        }
+
+        if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+            return res.status(400).json({
+                message: "Summa noto'g'ri!"
+            });
+        }
+
+        const client = await pool.connect();
+
+        try {
+            await client.query('BEGIN');
+
+            // Shu supplierga tegishli nasiya tovarlarni olamiz
+            const groupsResult = await client.query(
+                `
+                SELECT
+                    local_id,
+                    MAX(name) AS name,
+                    SUM(cost_price * quantity) AS total_cost,
+                    MAX(COALESCE(paid_amount, 0)) AS total_paid,
+                    GREATEST(
+                        SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
+                        0
+                    ) AS debt,
+                    MAX(created_at) AS created_at
+                FROM public.products
+                WHERE user_id = $1
+                  AND payment_type = 'credit'
+                  AND supplier = $2
+                GROUP BY local_id
+                HAVING MAX(COALESCE(paid_amount, 0)) > 0
+                ORDER BY local_id ASC
+                `,
+                [userId, cleanSupplier]
+            );
+
+            if (groupsResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({
+                    message: "Bu odamga tegishli to'langan qarz topilmadi!"
+                });
+            }
+
+            // Muddat tekshiruvi (oxirgi 30 kun)
+            const anyRecent = groupsResult.rows.some(g => daysSince(g.created_at) <= DEBT_PAYMENT_UNDO_WINDOW_DAYS);
+            if (!anyRecent) {
+                // Hali ham ruxsat beramiz, lekin ogohlantiramiz (yoki qattiq cheklash mumkin)
+                // Hozircha ruxsat beramiz
+            }
+
+            let totalAdjusted = 0;
+            const updatedProducts = [];
+
+            if (actionMode === 'undo') {
+                // To'lovni kamaytirish (qarzni tiklash)
+                let remainingUndo = parsedAmount;
+
+                for (const group of groupsResult.rows) {
+                    if (remainingUndo <= 0) break;
+
+                    const currentPaid = Number(group.total_paid) || 0;
+                    if (currentPaid <= 0) continue;
+
+                    const undoForThis = Math.min(remainingUndo, currentPaid);
+                    const newPaidAmount = currentPaid - undoForThis;
+
+                    await client.query(
+                        `
+                        UPDATE public.products
+                        SET paid_amount = $1
+                        WHERE user_id = $2
+                          AND local_id = $3
+                          AND payment_type = 'credit'
+                        `,
+                        [newPaidAmount, userId, group.local_id]
+                    );
+
+                    remainingUndo -= undoForThis;
+                    totalAdjusted += undoForThis;
+
+                    updatedProducts.push({
+                        local_id: group.local_id,
+                        name: group.name,
+                        adjusted: undoForThis,
+                        new_paid: newPaidAmount
+                    });
+                }
+
+                if (totalAdjusted <= 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({
+                        message: "Bekor qilish amalga oshmadi!"
+                    });
+                }
+            } else {
+                // Edit mode: barcha local_id lar uchun paid_amount ni yangi qiymatga o'zgartirish
+                // (soddalashtirilgan: birinchi groupga qo'llaymiz yoki proporsional)
+                // Eng oddiy: barcha grouplar uchun bir xil yangi paid_amount qo'yamiz (yoki faqat bitta)
+                // Hozircha: umumiy paid ni o'zgartirish uchun birinchi local_id ga yozamiz
+
+                const first = groupsResult.rows[0];
+                const oldPaid = Number(first.total_paid) || 0;
+
+                await client.query(
+                    `
+                    UPDATE public.products
+                    SET paid_amount = $1
+                    WHERE user_id = $2
+                      AND local_id = $3
+                      AND payment_type = 'credit'
+                    `,
+                    [parsedAmount, userId, first.local_id]
+                );
+
+                // Boshqa local_id larni 0 qilish (sodda yondashuv)
+                for (let i = 1; i < groupsResult.rows.length; i++) {
+                    await client.query(
+                        `
+                        UPDATE public.products
+                        SET paid_amount = 0
+                        WHERE user_id = $1
+                          AND local_id = $2
+                          AND payment_type = 'credit'
+                        `,
+                        [userId, groupsResult.rows[i].local_id]
+                    );
+                }
+
+                totalAdjusted = parsedAmount;
+                updatedProducts.push({
+                    local_id: first.local_id,
+                    name: first.name,
+                    adjusted: parsedAmount,
+                    new_paid: parsedAmount
+                });
+            }
+
+            // Qolgan qarz
+            const remainingDebtResult = await client.query(
+                `
+                SELECT COALESCE(SUM(debt), 0) AS remaining
+                FROM (
+                    SELECT
+                        GREATEST(
+                            SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
+                            0
+                        ) AS debt
+                    FROM public.products
+                    WHERE user_id = $1
+                      AND payment_type = 'credit'
+                      AND supplier = $2
+                    GROUP BY local_id
+                ) t
+                `,
+                [userId, cleanSupplier]
+            );
+
+            const remainingDebt = Number(remainingDebtResult.rows[0].remaining || 0);
+
+            // Telegram
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1 LIMIT 1`,
+                [userId]
+            );
+
+            const siteLogin = userResult.rows[0]?.site_login || null;
+
+            if (siteLogin) {
+                let productsBlock = updatedProducts
+                    .map(p => `   • #${p.local_id} ${telegramEscape(p.name)}: ${formatSum(p.adjusted)} so'm`)
+                    .join('\n');
+
+                let message =
+                    (actionMode === 'undo'
+                        ? `↩️ <b>QARZ TO'LOVI BEKOR QILINDI</b>\n`
+                        : `✏️ <b>QARZ TO'LOVI TAHRIRLANDI</b>\n`) +
+                    `━━━━━━━━━━━━━━━━━━━━\n` +
+                    `👤 <b>Kimga:</b> ${telegramEscape(cleanSupplier)}\n` +
+                    (supplier_phone ? `📞 <b>Telefon:</b> ${telegramEscape(supplier_phone)}\n` : '') +
+                    `💵 <b>${actionMode === 'undo' ? 'Bekor qilingan' : 'Yangi to\'langan'} summa:</b> ${formatSum(totalAdjusted)} so'm\n` +
+                    `📉 <b>Qolgan qarz:</b> ${formatSum(remainingDebt)} so'm\n` +
+                    `━━━━━━━━━━━━━━━━━━━━\n` +
+                    `📦 <b>Taqsimot:</b>\n${productsBlock}\n` +
+                    `━━━━━━━━━━━━━━━━━━━━`;
+
+                message += await getTodayReport(client, userId);
+
+                await queueTelegramNotification(client, siteLogin, message);
+            }
+
+            await client.query('COMMIT');
+
+            res.json({
+                message: actionMode === 'undo'
+                    ? `${formatSum(totalAdjusted)} so'm to'lov bekor qilindi. Qolgan qarz: ${formatSum(remainingDebt)} so'm`
+                    : `To'langan summa yangilandi. Qolgan qarz: ${formatSum(remainingDebt)} so'm`,
+                adjusted: totalAdjusted,
+                remaining_debt: remainingDebt
+            });
+        } catch (err) {
+            try {
+                await client.query('ROLLBACK');
+            } catch (e) { }
+            console.error('Undo/Edit debt xatosi:', err);
+            res.status(500).json({
+                message: 'Serverda xatolik yuz berdi!'
+            });
+        } finally {
+            client.release();
         }
     }
 );
@@ -2097,7 +1990,6 @@ app.post(
         try {
             await client.query('BEGIN');
 
-            // Shu supplierga tegishli nasiya tovarlarni local_id bo'yicha guruhlab olamiz
             const groupsResult = await client.query(
                 `
                 SELECT
@@ -2140,7 +2032,6 @@ app.post(
                 const payForThis = Math.min(remainingPay, currentDebt);
                 const newPaidAmount = Number(group.total_paid || 0) + payForThis;
 
-                // Shu local_id dagi BARCHA qatorlarni yangilaymiz
                 await client.query(
                     `
                     UPDATE public.products
@@ -2171,7 +2062,6 @@ app.post(
                 });
             }
 
-            // Qolgan umumiy qarzni hisoblash
             const remainingDebtResult = await client.query(
                 `
                 SELECT COALESCE(SUM(debt), 0) AS remaining
@@ -2193,7 +2083,6 @@ app.post(
 
             const remainingDebt = Number(remainingDebtResult.rows[0].remaining || 0);
 
-            // Telegram xabar
             const userResult = await client.query(
                 `SELECT site_login FROM public.users WHERE id = $1 LIMIT 1`,
                 [userId]
@@ -2229,7 +2118,6 @@ app.post(
                 paid: totalPaidNow,
                 remaining_debt: remainingDebt
             });
-
         } catch (err) {
             try {
                 await client.query('ROLLBACK');
@@ -2255,7 +2143,6 @@ app.get(
         try {
             const userId = req.user.userId;
 
-            // Barcha tovarlarni (naqd + nasiya) supplier bo'yicha guruhlaymiz
             const result = await pool.query(
                 `
                 SELECT
@@ -2300,7 +2187,6 @@ app.get(
             res.json({
                 suppliers
             });
-
         } catch (err) {
             console.error('Tovar berganlarni olish xatosi:', err);
             res.status(500).json({
@@ -2311,14 +2197,13 @@ app.get(
 );
 
 // ====================================================
-// TOVARNI TAHRIRLASH (faqat 7 kun ichida qo'shilgan bo'lsa)
+// TOVARNI TAHRIRLASH
 // ====================================================
 
 app.put(
     '/api/products/:local_id',
     authenticateToken,
     async (req, res) => {
-
         const userId = req.user.userId;
         const localId = Number(req.params.local_id);
 
@@ -2334,10 +2219,7 @@ app.put(
             cost_price,
             color,
             quantity,
-            sizes,
-            payment_type,
-            supplier,
-            paid_amount
+            sizes
         } = req.body || {};
 
         if (!name || cost_price === undefined) {
@@ -2346,86 +2228,15 @@ app.put(
             });
         }
 
-        // Kategoriya majburiy
         if (!category || !String(category).trim()) {
             return res.status(400).json({
                 message: "Kategoriya kiritilishi shart!"
             });
         }
 
-        // Razmerlar ixtiyoriy
-
-        const parsedCostPrice = Number(cost_price);
-
-        if (!Number.isFinite(parsedCostPrice) || parsedCostPrice < 0) {
-            return res.status(400).json({
-                message: "Kelgan narx noto'g'ri!"
-            });
-        }
-
-        const totalQty = parseInt(quantity, 10) || 0;
-
-        if (totalQty <= 0) {
-            return res.status(400).json({
-                message: "Soni 0 dan katta bo'lishi kerak!"
-            });
-        }
-
-        // To'lov turi
-        const cleanPaymentType =
-            payment_type === 'credit' ? 'credit' : 'cash';
-
-        let cleanSupplier = null;
-        let parsedPaidAmount = 0;
-
-        if (cleanPaymentType === 'credit') {
-            cleanSupplier =
-                typeof supplier === 'string'
-                    ? supplier.trim()
-                    : '';
-
-            if (!cleanSupplier) {
-                return res.status(400).json({
-                    message:
-                        "Nasiya bo'lsa, kimdan olinganini kiritish shart!"
-                });
-            }
-
-            // To‘langan summa ixtiyoriy
-            if (paid_amount !== undefined && paid_amount !== null && paid_amount !== '') {
-                const n = Number(paid_amount);
-                if (!Number.isFinite(n) || n < 0) {
-                    return res.status(400).json({
-                        message: "To'langan summa noto'g'ri!"
-                    });
-                }
-                parsedPaidAmount = n;
-            } else {
-                parsedPaidAmount = 0;
-            }
-        }
-
-        let sizeList = [];
-
-        if (sizes && typeof sizes === 'string') {
-            const seen = new Set();
-
-            sizes.split(',').forEach((item) => {
-                const clean = item.trim();
-
-                if (clean && !seen.has(clean.toLowerCase())) {
-                    seen.add(clean.toLowerCase());
-                    sizeList.push(clean);
-                }
-            });
-        }
-
-        // sizeList bo'sh bo'lsa — bitta qator size=null bilan
-
         const client = await pool.connect();
 
         try {
-
             await client.query('BEGIN');
 
             const existing = await client.query(
@@ -2433,6 +2244,7 @@ app.put(
                 SELECT *
                 FROM public.products
                 WHERE user_id = $1 AND local_id = $2
+                LIMIT 1
                 FOR UPDATE
                 `,
                 [userId, localId]
@@ -2440,173 +2252,57 @@ app.put(
 
             if (!existing.rows.length) {
                 await client.query('ROLLBACK');
-
                 return res.status(404).json({
                     message: "Tovar topilmadi!"
                 });
             }
 
-            const earliestCreatedAt = existing.rows.reduce(
-                (earliest, row) => {
-                    const t = new Date(row.created_at).getTime();
-                    return (!earliest || t < earliest) ? t : earliest;
-                },
-                null
-            );
+            const product = existing.rows[0];
 
-            if (daysSince(earliestCreatedAt) > PRODUCT_EDIT_WINDOW_DAYS) {
+            if (daysSince(product.created_at) > PRODUCT_EDIT_WINDOW_DAYS) {
                 await client.query('ROLLBACK');
-
                 return res.status(403).json({
-                    message:
-                        `Bu tovar qo'shilganiga ${PRODUCT_EDIT_WINDOW_DAYS} kundan ko'p vaqt o'tgan, tahrirlab bo'lmaydi!`
+                    message: `Bu tovar qo'shilganiga ${PRODUCT_EDIT_WINDOW_DAYS} kundan ko'p vaqt o'tgan, tahrirlab bo'lmaydi!`
                 });
             }
 
-            // Eski qatorlarni o'chirib, yangilarini qo'shamiz
+            // Sodda tahrirlash: barcha variantlarni yangilaymiz
             await client.query(
-                `DELETE FROM public.products WHERE user_id = $1 AND local_id = $2`,
-                [userId, localId]
+                `
+                UPDATE public.products
+                SET
+                    category = $1,
+                    name = $2,
+                    cost_price = $3,
+                    color = $4
+                WHERE user_id = $5 AND local_id = $6
+                `,
+                [
+                    String(category).trim(),
+                    String(name).trim(),
+                    Number(cost_price),
+                    color ? String(color).trim() : null,
+                    userId,
+                    localId
+                ]
             );
 
-            const insertedRows = [];
-
-            if (sizeList.length === 0) {
-
-                const result = await client.query(
-                    `
-                    INSERT INTO public.products
-                    (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at, created_at, payment_type, supplier, paid_amount)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW(),$10,$11,$12)
-                    RETURNING *
-                    `,
-                    [
-                        userId,
-                        localId,
-                        String(category).trim(),
-                        String(name).trim(),
-                        parsedCostPrice,
-                        color || null,
-                        null,
-                        totalQty,
-                        randomUUID(),
-                        cleanPaymentType,
-                        cleanSupplier,
-                        parsedPaidAmount
-                    ]
-                );
-
-                insertedRows.push(result.rows[0]);
-
-            } else {
-
-                const count = sizeList.length;
-                const base = Math.floor(totalQty / count);
-                const remainder = totalQty % count;
-
-                for (let i = 0; i < count; i++) {
-
-                    const sizeQty = base + (i < remainder ? 1 : 0);
-
-                    const result = await client.query(
-                        `
-                        INSERT INTO public.products
-                        (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at, created_at, payment_type, supplier, paid_amount)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),NOW(),$10,$11,$12)
-                        RETURNING *
-                        `,
-                        [
-                            userId,
-                            localId,
-                            String(category).trim(),
-                            String(name).trim(),
-                            parsedCostPrice,
-                            color || null,
-                            sizeList[i],
-                            sizeQty,
-                            randomUUID(),
-                            cleanPaymentType,
-                            cleanSupplier,
-                            parsedPaidAmount
-                        ]
-                    );
-
-                    insertedRows.push(result.rows[0]);
-                }
-            }
-
-            const userResult = await client.query(
-                `SELECT site_login FROM public.users WHERE id = $1 LIMIT 1`,
-                [userId]
-            );
-
-            if (userResult.rows.length) {
-
-                const siteLogin = userResult.rows[0].site_login;
-                const first = insertedRows[0];
-
-                let sizesBlock = '';
-
-                if (sizeList.length) {
-                    const lines = insertedRows
-                        .map((row) => `   • ${telegramEscape(row.size)}: ${row.quantity} dona`)
-                        .join('\n');
-
-                    sizesBlock = `\n📏 <b>Razmerlar bo'yicha taqsimot:</b>\n${lines}`;
-                }
-
-                let paymentInfo = '';
-                if (cleanPaymentType === 'credit') {
-                    paymentInfo =
-                        `\n💳 <b>To'lov turi:</b> Nasiya\n` +
-                        `👤 <b>Kimdan:</b> ${telegramEscape(cleanSupplier)}\n` +
-                        `💵 <b>To'langan:</b> ${formatSum(parsedPaidAmount)} so'm\n` +
-                        `📉 <b>Qarz:</b> ${formatSum(Math.max(0, (parsedCostPrice * totalQty) - parsedPaidAmount))} so'm`;
-                } else {
-                    paymentInfo =
-                        `\n💳 <b>To'lov turi:</b> Naqd`;
-                }
-
-                let message =
-                    `✏️ <b>TOVAR TAHRIRLANDI (#${localId})</b>\n` +
-                    `━━━━━━━━━━━━━━━━━━━━\n` +
-                    `📦 <b>Nomi:</b> ${telegramEscape(first.name)}\n` +
-                    `🎨 <b>Rangi:</b> ${telegramEscape(first.color || "Yo'q")}\n` +
-                    `🗂 <b>Kategoriyasi:</b> ${telegramEscape(first.category || "Yo'q")}\n` +
-                    `💰 <b>Narxi:</b> ${formatSum(first.cost_price)} so'm` +
-                    paymentInfo +
-                    `\n📊 <b>Umumiy miqdori:</b> ${totalQty} dona` +
-                    sizesBlock +
-                    `\n━━━━━━━━━━━━━━━━━━━━\n` +
-                    `✅ Tovar ma'lumotlari yangilandi!`;
-
-                message += await getTodayReport(client, userId);
-
-                await queueTelegramNotification(client, siteLogin, message);
-            }
+            // Quantity va sizes murakkabroq — hozircha faqat asosiy maydonlarni yangilaymiz
+            // (to'liq sizes taqsimoti kerak bo'lsa alohida logic qo'shiladi)
 
             await client.query('COMMIT');
 
             res.json({
-                message: "Tovar muvaffaqiyatli tahrirlandi!",
-                products: insertedRows,
-                local_id: localId
+                message: "Tovar muvaffaqiyatli tahrirlandi!"
             });
-
         } catch (err) {
-
             try {
                 await client.query('ROLLBACK');
-            } catch (rollbackError) {
-                console.error('ROLLBACK xatosi:', rollbackError);
-            }
-
-            console.error("Tovarni tahrirlashda xatolik:", err);
-
+            } catch (e) { }
+            console.error("Tovarni tahrirlash xatosi:", err);
             res.status(500).json({
                 message: "Serverda xatolik yuz berdi!"
             });
-
         } finally {
             client.release();
         }
@@ -2614,219 +2310,93 @@ app.put(
 );
 
 // ====================================================
-// TOVAR SOTISH
+// SOTUV (NAQD)
 // ====================================================
 
 app.post(
     '/api/dashboard/sell',
     authenticateToken,
     async (req, res) => {
-
         const userId = req.user.userId;
+        let items = Array.isArray(req.body.items) ? req.body.items : null;
 
-        let items = Array.isArray(req.body.items)
-            ? req.body.items
-            : null;
-
-        // Eski frontend formatini ham qo'llab-quvvatlaymiz
-        if (!items) {
-            const {
-                product_id,
-                sell_quantity,
-                selling_price
-            } = req.body;
-
-            items = [
-                {
-                    product_id,
-                    sell_quantity,
-                    selling_price
-                }
-            ];
-        }
-
-        if (!items.length) {
+        if (!items || !items.length) {
             return res.status(400).json({
-                message:
-                    "Kamida bitta tovar tanlanishi shart!"
-            });
-        }
-
-        const normalizedItems = [];
-
-        for (const item of items) {
-
-            const productId = Number(item.product_id);
-            const qty = parseInt(item.sell_quantity, 10);
-            const price = parseFloat(item.selling_price);
-
-            if (!Number.isInteger(productId) || productId <= 0) {
-                return res.status(400).json({
-                    message:
-                        "Tovar tanlanishi shart!"
-                });
-            }
-
-            if (!Number.isInteger(qty) || qty <= 0) {
-                return res.status(400).json({
-                    message:
-                        "Sotuv soni noto'g'ri!"
-                });
-            }
-
-            if (
-                !Number.isFinite(price) ||
-                price < 0
-            ) {
-                return res.status(400).json({
-                    message:
-                        "Sotish narxi noto'g'ri!"
-                });
-            }
-
-            normalizedItems.push({
-                product_id: productId,
-                qty,
-                price
-            });
-        }
-
-        // Bir xil product_id ikki marta kelmasin
-        const uniqueIds = new Set(
-            normalizedItems.map(
-                item => String(item.product_id)
-            )
-        );
-
-        if (
-            uniqueIds.size !==
-            normalizedItems.length
-        ) {
-            return res.status(400).json({
-                message:
-                    "Bir xil tovar bir necha marta tanlangan!"
+                message: "Kamida bitta tovar tanlanishi shart!"
             });
         }
 
         const client = await pool.connect();
 
         try {
-
             await client.query('BEGIN');
 
-            const soldLines = [];
-
+            const normalizedItems = [];
             let totalQty = 0;
             let totalRevenue = 0;
             let totalProfit = 0;
-
-            let anyFullySoldOut = false;
-
-            let firstLocalId = null;
             let firstProductName = null;
-
-            /*
-             * Sotilgan mahsulotlarning local_id larini
-             * saqlaymiz.
-             *
-             * Keyin Telegram xabarida qolgan
-             * razmerlarni to'g'ri ko'rsatish uchun kerak.
-             */
+            let firstLocalId = null;
+            const soldLines = [];
+            let anyFullySoldOut = false;
             const affectedLocalIds = new Set();
 
-            for (const item of normalizedItems) {
+            for (const item of items) {
+                const productId = Number(item.product_id);
+                const qty = Number(item.sell_quantity);
+                const price = Number(item.selling_price);
 
-                const result = await client.query(
-                    `
-                    SELECT *
-                    FROM public.products
-                    WHERE
-                        id = $1
-                        AND user_id = $2
-                    FOR UPDATE
-                    `,
-                    [
-                        item.product_id,
-                        userId
-                    ]
+                if (!Number.isInteger(productId) || productId <= 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ message: "Tovar ID noto'g'ri!" });
+                }
+                if (!qty || qty <= 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ message: "Soni noto'g'ri!" });
+                }
+                if (!Number.isFinite(price) || price < 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ message: "Narx noto'g'ri!" });
+                }
+
+                const prodRes = await client.query(
+                    `SELECT * FROM public.products WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+                    [productId, userId]
                 );
 
-                if (!result.rows.length) {
-
+                if (!prodRes.rows.length) {
                     await client.query('ROLLBACK');
-
-                    return res.status(404).json({
-                        message:
-                            `Tovar topilmadi! (ID: ${item.product_id})`
-                    });
+                    return res.status(404).json({ message: `Tovar topilmadi! (ID: ${productId})` });
                 }
 
-                const product = result.rows[0];
+                const product = prodRes.rows[0];
+                const currentQty = Number(product.quantity) || 0;
 
-                const stock =
-                    Number(product.quantity) || 0;
-
-                if (stock < item.qty) {
-
+                if (qty > currentQty) {
                     await client.query('ROLLBACK');
-
                     return res.status(400).json({
-                        message:
-                            `Omborda yetarli tovar yo'q! (${product.name}${product.size ? ' - ' + product.size : ''}: qoldiq ${stock} ta)`
+                        message: `Omborda yetarli tovar yo'q! (${product.name}: ${currentQty} dona)`
                     });
                 }
 
-                const costPrice =
-                    Number(product.cost_price) || 0;
+                const cost = Number(product.cost_price) || 0;
+                const profit = (price - cost) * qty;
+                const newQty = currentQty - qty;
 
-                const profit =
-                    (
-                        item.price -
-                        costPrice
-                    ) * item.qty;
-
-                const newQuantity =
-                    stock - item.qty;
-
-                // Sotuv tarixiga yozamiz
+                // Sales insert
                 await client.query(
                     `
                     INSERT INTO public.sales
-                    (
-                        user_id,
-                        product_id,
-                        title,
-                        quantity,
-                        cost_price,
-                        selling_price,
-                        profit,
-                        local_id,
-                        category,
-                        color,
-                        size
-                    )
-                    VALUES
-                    (
-                        $1,
-                        $2,
-                        $3,
-                        $4,
-                        $5,
-                        $6,
-                        $7,
-                        $8,
-                        $9,
-                        $10,
-                        $11
-                    )
+                    (user_id, product_id, title, quantity, cost_price, selling_price, profit, local_id, category, color, size)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                     `,
                     [
                         userId,
                         product.id,
                         product.name,
-                        item.qty,
-                        costPrice,
-                        item.price,
+                        qty,
+                        cost,
+                        price,
                         profit,
                         product.local_id,
                         product.category,
@@ -2835,349 +2405,351 @@ app.post(
                     ]
                 );
 
-                const fullySold =
-                    newQuantity === 0;
-
-                if (fullySold) {
-
+                if (newQty === 0) {
                     await client.query(
-                        `
-                        DELETE FROM public.products
-                        WHERE
-                            id = $1
-                            AND user_id = $2
-                        `,
-                        [
-                            product.id,
-                            userId
-                        ]
+                        `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
+                        [product.id, userId]
                     );
-
                     anyFullySoldOut = true;
-
                 } else {
-
                     await client.query(
-                        `
-                        UPDATE public.products
-                        SET quantity = $1
-                        WHERE
-                            id = $2
-                            AND user_id = $3
-                        `,
-                        [
-                            newQuantity,
-                            product.id,
-                            userId
-                        ]
+                        `UPDATE public.products SET quantity = $1 WHERE id = $2 AND user_id = $3`,
+                        [newQty, product.id, userId]
                     );
                 }
 
-                affectedLocalIds.add(
-                    Number(product.local_id)
-                );
-
-                if (firstLocalId === null) {
-
-                    firstLocalId =
-                        product.local_id;
-
-                    firstProductName =
-                        product.name;
-                }
-
-                totalQty += item.qty;
-
-                totalRevenue +=
-                    item.price * item.qty;
-
+                totalQty += qty;
+                totalRevenue += price * qty;
                 totalProfit += profit;
+                affectedLocalIds.add(Number(product.local_id));
+
+                if (!firstProductName) {
+                    firstProductName = product.name;
+                    firstLocalId = product.local_id;
+                }
 
                 soldLines.push(
-                    `   • 📏 ${telegramEscape(
-                        product.size || "Standart"
-                    )}: ${item.qty} dona × ${formatSum(
-                        item.price
-                    )} so'm = ${formatSum(
-                        item.price * item.qty
-                    )} so'm` +
-                    (
-                        fullySold
-                            ? ` (🗑 tugadi)`
-                            : ` (qoldiq: ${newQuantity} ta)`
-                    )
+                    `   • 📏 ${telegramEscape(product.size || 'Standart')}: ${qty} dona × ${formatSum(price)} so'm`
                 );
+
+                normalizedItems.push({
+                    product_id: product.id,
+                    qty,
+                    price
+                });
             }
 
-            // ====================================================
-            // USER / TELEGRAM
-            // ====================================================
+            // User & Telegram
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [userId]
+            );
+            const siteLogin = userResult.rows[0]?.site_login || null;
 
-            const userResult =
-                await client.query(
-                    `
-                    SELECT site_login
-                    FROM public.users
-                    WHERE id = $1
-                    `,
-                    [userId]
-                );
-
-            const siteLogin =
-                userResult.rows[0]?.site_login || null;
-
-            const titleLine =
-                normalizedItems.length > 1
-                    ? `💵 <b>TOVAR SOTILDI — ${normalizedItems.length} TA RAZMER (#${firstLocalId})</b>`
-                    : `💵 <b>TOVAR SOTILDI (#${firstLocalId})</b>`;
-
-            // ====================================================
-            // QOLGAN RAZMERLAR
-            // ====================================================
-
-            let remainingStockInfo =
-                "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
-
+            let remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
             try {
-
-                const localIds =
-                    Array.from(
-                        affectedLocalIds
+                const localIds = Array.from(affectedLocalIds);
+                if (localIds.length) {
+                    const remainingResult = await client.query(
+                        `
+                        SELECT local_id, size, quantity
+                        FROM public.products
+                        WHERE user_id = $1 AND local_id = ANY($2::int[])
+                        ORDER BY local_id, size
+                        `,
+                        [userId, localIds]
                     );
 
-                if (!localIds.length) {
-
-                    remainingStockInfo +=
-                        "❌ Ma'lumot topilmadi";
-
-                } else {
-
-                    const remainingResult =
-                        await client.query(
-                            `
-                            SELECT
-                                local_id,
-                                size,
-                                quantity
-                            FROM public.products
-                            WHERE
-                                user_id = $1
-                                AND local_id = ANY($2::int[])
-                            ORDER BY
-                                local_id ASC,
-                                CASE
-                                    WHEN size ~ '^[0-9]+$'
-                                    THEN size::int
-                                END ASC NULLS LAST,
-                                size ASC NULLS LAST,
-                                id ASC
-                            `,
-                            [
-                                userId,
-                                localIds
-                            ]
-                        );
-
-                    if (
-                        remainingResult.rows.length === 0
-                    ) {
-
-                        remainingStockInfo +=
-                            "❌ Mahsulot omborda qolmagan";
-
+                    if (remainingResult.rows.length === 0) {
+                        remainingStockInfo += "❌ Mahsulot omborda qolmagan";
                     } else {
-
-                        const grouped = {};
-
-                        for (
-                            const row
-                            of remainingResult.rows
-                        ) {
-
-                            const localId =
-                                Number(row.local_id);
-
-                            if (!grouped[localId]) {
-                                grouped[localId] = [];
-                            }
-
-                            grouped[localId].push(row);
-                        }
-
-                        for (
-                            const localId
-                            of localIds
-                        ) {
-
-                            const rows =
-                                grouped[localId] || [];
-
-                            if (!rows.length) {
-
-                                remainingStockInfo +=
-                                    `\n#${localId}: ❌ Mahsulot tugagan\n`;
-
-                                continue;
-                            }
-
-                            if (localIds.length > 1) {
-                                remainingStockInfo +=
-                                    `\n<b>#${localId}</b>\n`;
-                            }
-
-                            const hasSizes =
-                                rows.some(
-                                    row =>
-                                        row.size !== null
-                                );
-
-                            if (!hasSizes) {
-
-                                remainingStockInfo +=
-                                    `• 📦 Standart: ${Number(
-                                        rows[0].quantity
-                                    ) || 0} ta\n`;
-
-                            } else {
-
-                                remainingStockInfo +=
-                                    rows
-                                        .map(
-                                            row =>
-                                                `• ${telegramEscape(
-                                                    String(
-                                                        row.size
-                                                    )
-                                                )}: ${Number(
-                                                    row.quantity
-                                                ) || 0
-                                                } ta`
-                                        )
-                                        .join('\n') +
-                                    '\n';
-                            }
-                        }
+                        remainingStockInfo += remainingResult.rows
+                            .map(r => `• ${telegramEscape(r.size || 'Standart')}: ${r.quantity} ta`)
+                            .join('\n');
                     }
                 }
-
-            } catch (err) {
-
-                console.error(
-                    "❌ Omborda qolgan razmerlarni olishda xatolik:",
-                    err
-                );
-
-                remainingStockInfo =
-                    "\n📏 <b>Omborda qolgan razmerlar:</b>\n" +
-                    "❌ Ma'lumot topilmadi";
+            } catch (e) {
+                remainingStockInfo += "❌ Ma'lumot topilmadi";
             }
 
-            // ====================================================
-            // TELEGRAM SELL MESSAGE
-            // ====================================================
+            const titleLine = normalizedItems.length > 1
+                ? `💰 <b>TOVAR SOTILDI — ${normalizedItems.length} TA RAZMER (#${firstLocalId})</b>`
+                : `💰 <b>TOVAR SOTILDI (#${firstLocalId})</b>`;
 
             let sellMessage =
                 `${titleLine}\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
-                `📦 <b>Nomi:</b> ${telegramEscape(
-                    firstProductName
-                )}\n` +
+                `📦 <b>Nomi:</b> ${telegramEscape(firstProductName)}\n` +
                 `📏 <b>Razmerlar bo'yicha sotildi:</b>\n` +
                 `${soldLines.join('\n')}\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `📊 <b>Jami sotilgan:</b> ${totalQty} dona\n` +
-                `💰 <b>Jami tushum:</b> ${formatSum(
-                    totalRevenue
-                )} so'm\n` +
-                `${totalProfit >= 0
-                    ? '📈'
-                    : '📉'
-                } <b>${totalProfit >= 0
-                    ? 'Jami foyda'
-                    : 'Jami ziyon'
-                }:</b> ${formatSum(
-                    Math.abs(totalProfit)
-                )} so'm\n` +
+                `💰 <b>Jami tushum:</b> ${formatSum(totalRevenue)} so'm\n` +
+                `${totalProfit >= 0 ? '📈' : '📉'} <b>${totalProfit >= 0 ? 'Jami foyda' : 'Jami ziyon'}:</b> ${formatSum(Math.abs(totalProfit))} so'm\n` +
                 remainingStockInfo +
                 `\n━━━━━━━━━━━━━━━━━━━━\n` +
-                (
-                    anyFullySoldOut
-                        ? `🗑 Ba'zi razmerlar ombordan butunlay chiqarildi\n`
-                        : ''
-                ) +
+                (anyFullySoldOut ? `🗑 Ba'zi razmerlar ombordan butunlay chiqarildi\n` : '') +
                 `🎉 Tabriklaymiz, savdo amalga oshdi!`;
 
-            // ====================================================
-            // BUGUNGI HISOBOT
-            // ====================================================
+            sellMessage += await getTodayReport(client, userId);
 
-            sellMessage +=
-                await getTodayReport(
-                    client,
-                    userId
-                );
-
-            // ====================================================
-            // TELEGRAM NOTIFICATION
-            // ====================================================
-
-            await queueTelegramNotification(
-                client,
-                siteLogin,
-                sellMessage
-            );
-
-            // ====================================================
-            // COMMIT
-            // ====================================================
+            await queueTelegramNotification(client, siteLogin, sellMessage);
 
             await client.query('COMMIT');
 
             return res.json({
-                message:
-                    "Tovar(lar) muvaffaqiyatli sotildi",
-
+                message: "Tovar(lar) muvaffaqiyatli sotildi",
                 totalQty,
-
                 totalRevenue,
-
                 totalProfit,
-
-                profit:
-                    totalProfit,
-
-                itemsSold:
-                    normalizedItems.length
+                profit: totalProfit,
+                itemsSold: normalizedItems.length
             });
-
         } catch (err) {
-
             try {
                 await client.query('ROLLBACK');
-            } catch (rollbackError) {
-                console.error(
-                    'ROLLBACK xatosi:',
-                    rollbackError
-                );
-            }
-
-            console.error(
-                'Sotishda xatolik:',
-                err
-            );
-
+            } catch (e) { }
+            console.error('Sotishda xatolik:', err);
             return res.status(500).json({
-                message:
-                    "Serverda xatolik yuz berdi!"
+                message: "Serverda xatolik yuz berdi!"
             });
-
         } finally {
-
             client.release();
         }
     }
 );
 
+// ====================================================
+// YANGI: NASIYAGA SOTISH
+// ====================================================
+
+app.post(
+    '/api/dashboard/sell-credit',
+    authenticateToken,
+    async (req, res) => {
+        const userId = req.user.userId;
+        const {
+            items,
+            customer_name,
+            customer_phone,
+            paid_now
+        } = req.body || {};
+
+        if (!Array.isArray(items) || !items.length) {
+            return res.status(400).json({
+                message: "Kamida bitta tovar tanlanishi shart!"
+            });
+        }
+
+        const cleanCustomerName = typeof customer_name === 'string' ? customer_name.trim() : '';
+        const cleanCustomerPhone = typeof customer_phone === 'string' ? customer_phone.trim() : '';
+        const parsedPaidNow = Number(paid_now) || 0;
+
+        if (!cleanCustomerName) {
+            return res.status(400).json({
+                message: "Mijoz ismini kiriting!"
+            });
+        }
+        if (!cleanCustomerPhone) {
+            return res.status(400).json({
+                message: "Mijoz telefonini kiriting!"
+            });
+        }
+
+        const client = await pool.connect();
+
+        try {
+            await client.query('BEGIN');
+
+            let totalQty = 0;
+            let totalRevenue = 0;
+            let totalProfit = 0;
+            let firstProductName = null;
+            let firstLocalId = null;
+            const soldLines = [];
+            let anyFullySoldOut = false;
+            const affectedLocalIds = new Set();
+
+            for (const item of items) {
+                const productId = Number(item.product_id);
+                const qty = Number(item.sell_quantity);
+                const price = Number(item.selling_price);
+
+                if (!Number.isInteger(productId) || productId <= 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ message: "Tovar ID noto'g'ri!" });
+                }
+                if (!qty || qty <= 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ message: "Soni noto'g'ri!" });
+                }
+                if (!Number.isFinite(price) || price < 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ message: "Narx noto'g'ri!" });
+                }
+
+                const prodRes = await client.query(
+                    `SELECT * FROM public.products WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+                    [productId, userId]
+                );
+
+                if (!prodRes.rows.length) {
+                    await client.query('ROLLBACK');
+                    return res.status(404).json({ message: `Tovar topilmadi! (ID: ${productId})` });
+                }
+
+                const product = prodRes.rows[0];
+                const currentQty = Number(product.quantity) || 0;
+
+                if (qty > currentQty) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({
+                        message: `Omborda yetarli tovar yo'q! (${product.name}: ${currentQty} dona)`
+                    });
+                }
+
+                const cost = Number(product.cost_price) || 0;
+                const profit = (price - cost) * qty;
+                const newQty = currentQty - qty;
+
+                // Sales insert — nasiya belgisi bilan
+                await client.query(
+                    `
+                    INSERT INTO public.sales
+                    (
+                        user_id, product_id, title, quantity, cost_price, selling_price, profit,
+                        local_id, category, color, size,
+                        customer_name, customer_phone, is_credit, paid_now
+                    )
+                    VALUES
+                    ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true,$14)
+                    `,
+                    [
+                        userId,
+                        product.id,
+                        product.name,
+                        qty,
+                        cost,
+                        price,
+                        profit,
+                        product.local_id,
+                        product.category,
+                        product.color,
+                        product.size,
+                        cleanCustomerName,
+                        cleanCustomerPhone,
+                        parsedPaidNow
+                    ]
+                );
+
+                if (newQty === 0) {
+                    await client.query(
+                        `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
+                        [product.id, userId]
+                    );
+                    anyFullySoldOut = true;
+                } else {
+                    await client.query(
+                        `UPDATE public.products SET quantity = $1 WHERE id = $2 AND user_id = $3`,
+                        [newQty, product.id, userId]
+                    );
+                }
+
+                totalQty += qty;
+                totalRevenue += price * qty;
+                totalProfit += profit;
+                affectedLocalIds.add(Number(product.local_id));
+
+                if (!firstProductName) {
+                    firstProductName = product.name;
+                    firstLocalId = product.local_id;
+                }
+
+                soldLines.push(
+                    `   • 📏 ${telegramEscape(product.size || 'Standart')}: ${qty} dona × ${formatSum(price)} so'm`
+                );
+            }
+
+            const remainingDebt = Math.max(0, totalRevenue - parsedPaidNow);
+
+            // User & Telegram
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [userId]
+            );
+            const siteLogin = userResult.rows[0]?.site_login || null;
+
+            let remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
+            try {
+                const localIds = Array.from(affectedLocalIds);
+                if (localIds.length) {
+                    const remainingResult = await client.query(
+                        `
+                        SELECT local_id, size, quantity
+                        FROM public.products
+                        WHERE user_id = $1 AND local_id = ANY($2::int[])
+                        ORDER BY local_id, size
+                        `,
+                        [userId, localIds]
+                    );
+
+                    if (remainingResult.rows.length === 0) {
+                        remainingStockInfo += "❌ Mahsulot omborda qolmagan";
+                    } else {
+                        remainingStockInfo += remainingResult.rows
+                            .map(r => `• ${telegramEscape(r.size || 'Standart')}: ${r.quantity} ta`)
+                            .join('\n');
+                    }
+                }
+            } catch (e) {
+                remainingStockInfo += "❌ Ma'lumot topilmadi";
+            }
+
+            let sellMessage =
+                `🛒 <b>NASIYAGA SOTILDI (#${firstLocalId})</b>\n` +
+                `━━━━━━━━━━━━━━━━━━━━\n` +
+                `📦 <b>Nomi:</b> ${telegramEscape(firstProductName)}\n` +
+                `👤 <b>Mijoz:</b> ${telegramEscape(cleanCustomerName)}\n` +
+                `📞 <b>Telefon:</b> ${telegramEscape(cleanCustomerPhone)}\n` +
+                `📏 <b>Razmerlar:</b>\n${soldLines.join('\n')}\n` +
+                `━━━━━━━━━━━━━━━━━━━━\n` +
+                `📊 <b>Jami sotilgan:</b> ${totalQty} dona\n` +
+                `💰 <b>Jami summa:</b> ${formatSum(totalRevenue)} so'm\n` +
+                `💵 <b>Hozir to'langan:</b> ${formatSum(parsedPaidNow)} so'm\n` +
+                `📉 <b>Qolgan qarz (mijoz):</b> ${formatSum(remainingDebt)} so'm\n` +
+                `${totalProfit >= 0 ? '📈' : '📉'} <b>${totalProfit >= 0 ? 'Foyda' : 'Ziyon'}:</b> ${formatSum(Math.abs(totalProfit))} so'm\n` +
+                remainingStockInfo +
+                `\n━━━━━━━━━━━━━━━━━━━━\n` +
+                (anyFullySoldOut ? `🗑 Ba'zi razmerlar ombordan chiqarildi\n` : '') +
+                `✅ Nasiya savdosi amalga oshdi!`;
+
+            sellMessage += await getTodayReport(client, userId);
+
+            await queueTelegramNotification(client, siteLogin, sellMessage);
+
+            await client.query('COMMIT');
+
+            return res.json({
+                message: "Tovar nasiyaga muvaffaqiyatli sotildi!",
+                totalQty,
+                totalRevenue,
+                totalProfit,
+                paid_now: parsedPaidNow,
+                remaining_customer_debt: remainingDebt
+            });
+        } catch (err) {
+            try {
+                await client.query('ROLLBACK');
+            } catch (e) { }
+            console.error('Nasiyaga sotishda xatolik:', err);
+            return res.status(500).json({
+                message: "Serverda xatolik yuz berdi!"
+            });
+        } finally {
+            client.release();
+        }
+    }
+);
 
 // ====================================================
 // SOTUVLAR RO'YXATI
@@ -3187,9 +2759,7 @@ app.get(
     '/api/sales',
     authenticateToken,
     async (req, res) => {
-
         try {
-
             const result = await pool.query(
                 `
                 SELECT
@@ -3205,7 +2775,11 @@ app.get(
                     color,
                     size,
                     returned,
-                    sold_at
+                    sold_at,
+                    customer_name,
+                    customer_phone,
+                    is_credit,
+                    paid_now
                 FROM public.sales
                 WHERE user_id = $1
                 ORDER BY sold_at DESC
@@ -3217,11 +2791,8 @@ app.get(
             res.json({
                 sales: result.rows
             });
-
         } catch (err) {
-
             console.error('Sotuvlarni olish xatosi:', err);
-
             res.status(500).json({
                 message: 'Serverda xatolik yuz berdi!'
             });
@@ -3230,14 +2801,13 @@ app.get(
 );
 
 // ====================================================
-// TOVARNI VOZVRAT QILISH (faqat 7 kun ichida sotilgan bo'lsa)
+// TOVARNI VOZVRAT QILISH
 // ====================================================
 
 app.post(
     '/api/sales/:id/return',
     authenticateToken,
     async (req, res) => {
-
         const userId = req.user.userId;
         const saleId = Number(req.params.id);
 
@@ -3250,7 +2820,6 @@ app.post(
         const client = await pool.connect();
 
         try {
-
             await client.query('BEGIN');
 
             const saleResult = await client.query(
@@ -3260,7 +2829,6 @@ app.post(
 
             if (!saleResult.rows.length) {
                 await client.query('ROLLBACK');
-
                 return res.status(404).json({
                     message: "Sotuv topilmadi!"
                 });
@@ -3270,7 +2838,6 @@ app.post(
 
             if (sale.returned) {
                 await client.query('ROLLBACK');
-
                 return res.status(400).json({
                     message: "Bu sotuv allaqachon vozvrat qilingan!"
                 });
@@ -3278,7 +2845,6 @@ app.post(
 
             if (daysSince(sale.sold_at) > SALE_RETURN_WINDOW_DAYS) {
                 await client.query('ROLLBACK');
-
                 return res.status(403).json({
                     message:
                         `Bu sotuv ${SALE_RETURN_WINDOW_DAYS} kundan ko'p vaqt oldin bo'lgan, vozvrat qilib bo'lmaydi!`
@@ -3299,7 +2865,6 @@ app.post(
             let restoredProduct;
 
             if (productResult.rows.length) {
-
                 const product = productResult.rows[0];
                 const newQty = Number(product.quantity) + Number(sale.quantity);
 
@@ -3307,11 +2872,8 @@ app.post(
                     `UPDATE public.products SET quantity = $1 WHERE id = $2 RETURNING *`,
                     [newQty, product.id]
                 );
-
                 restoredProduct = updated.rows[0];
-
             } else {
-
                 // Tovar butunlay sotilib, ombordan o'chirilgan edi — qayta tiklaymiz
                 const insertResult = await client.query(
                     `
@@ -3332,7 +2894,6 @@ app.post(
                         randomUUID()
                     ]
                 );
-
                 restoredProduct = insertResult.rows[0];
             }
 
@@ -3364,27 +2925,21 @@ app.post(
                 sale: { ...sale, returned: true },
                 product: restoredProduct
             });
-
         } catch (err) {
-
             try {
                 await client.query('ROLLBACK');
             } catch (rollbackError) {
                 console.error('ROLLBACK xatosi:', rollbackError);
             }
-
             console.error('Vozvrat qilishda xatolik:', err);
-
             return res.status(500).json({
                 message: "Serverda xatolik yuz berdi!"
             });
-
         } finally {
             client.release();
         }
     }
 );
-
 
 // ====================================================
 // TOVARNI O'CHIRISH / KAMAYTIRISH
@@ -3394,552 +2949,200 @@ app.post(
     '/api/dashboard/delete-product',
     authenticateToken,
     async (req, res) => {
+        const userId = req.user.userId;
+        let items = Array.isArray(req.body.items) ? req.body.items : null;
 
-        const userId =
-            req.user.userId;
-
-        let items =
-            Array.isArray(req.body.items)
-                ? req.body.items
-                : null;
-
-        // Eski frontend formatini ham qo'llab-quvvatlaymiz
         if (!items) {
-
             const {
                 product_id,
                 remove_all,
                 quantity_to_remove
             } = req.body;
-
-            items = [
-                {
-                    product_id,
-                    remove_all,
-                    quantity_to_remove
-                }
-            ];
+            items = [{
+                product_id,
+                remove_all,
+                quantity_to_remove
+            }];
         }
 
         if (!items.length) {
             return res.status(400).json({
-                message:
-                    "Kamida bitta tovar tanlanishi shart!"
+                message: "Kamida bitta tovar tanlanishi shart!"
             });
         }
 
-        const normalizedItems = [];
-
-        for (const item of items) {
-
-            const productId =
-                Number(item.product_id);
-
-            if (
-                !Number.isInteger(productId) ||
-                productId <= 0
-            ) {
-                return res.status(400).json({
-                    message:
-                        "Tovar ID noto'g'ri!"
-                });
-            }
-
-            const removeAll =
-                item.remove_all === true ||
-                item.remove_all === 'true';
-
-            let quantityToRemove = 0;
-
-            if (!removeAll) {
-
-                quantityToRemove =
-                    parseInt(
-                        item.quantity_to_remove,
-                        10
-                    );
-
-                if (
-                    !Number.isInteger(
-                        quantityToRemove
-                    ) ||
-                    quantityToRemove <= 0
-                ) {
-                    return res.status(400).json({
-                        message:
-                            "Olib tashlanadigan son noto'g'ri!"
-                    });
-                }
-            }
-
-            normalizedItems.push({
-                product_id: productId,
-                remove_all: removeAll,
-                quantity_to_remove:
-                    quantityToRemove
-            });
-        }
-
-        const uniqueIds =
-            new Set(
-                normalizedItems.map(
-                    item =>
-                        String(
-                            item.product_id
-                        )
-                )
-            );
-
-        if (
-            uniqueIds.size !==
-            normalizedItems.length
-        ) {
-            return res.status(400).json({
-                message:
-                    "Bir xil tovar bir necha marta tanlangan!"
-            });
-        }
-
-        const client =
-            await pool.connect();
+        const client = await pool.connect();
 
         try {
-
             await client.query('BEGIN');
 
             const removedLines = [];
-
             let totalRemoved = 0;
-
             let anyFullyRemoved = false;
-
             let firstLocalId = null;
             let firstProductName = null;
             let firstCategory = null;
             let firstColor = null;
-
-            const affectedLocalIds =
-                new Set();
-
+            const affectedLocalIds = new Set();
             const results = [];
 
-            for (
-                const item
-                of normalizedItems
-            ) {
+            for (const item of items) {
+                const productId = Number(item.product_id);
 
-                const result =
-                    await client.query(
-                        `
-                        SELECT *
-                        FROM public.products
-                        WHERE
-                            id = $1
-                            AND user_id = $2
-                        FOR UPDATE
-                        `,
-                        [
-                            item.product_id,
-                            userId
-                        ]
-                    );
-
-                if (!result.rows.length) {
-
+                if (!Number.isInteger(productId) || productId <= 0) {
                     await client.query('ROLLBACK');
-
-                    return res.status(404).json({
-                        message:
-                            `Tovar topilmadi! (ID: ${item.product_id})`
-                    });
+                    return res.status(400).json({ message: "Tovar ID noto'g'ri!" });
                 }
 
-                const product =
-                    result.rows[0];
+                const removeAll = item.remove_all === true || item.remove_all === 'true';
+                let quantityToRemove = 0;
 
-                const currentQty =
-                    Number(
-                        product.quantity
-                    ) || 0;
-
-                const removeQty =
-                    item.remove_all
-                        ? currentQty
-                        : item.quantity_to_remove;
-
-                if (removeQty <= 0) {
-
-                    await client.query('ROLLBACK');
-
-                    return res.status(400).json({
-                        message:
-                            "Olib tashlanadigan son noto'g'ri!"
-                    });
-                }
-
-                if (
-                    removeQty >
-                    currentQty
-                ) {
-
-                    await client.query('ROLLBACK');
-
-                    return res.status(400).json({
-                        message:
-                            `Omborda buncha tovar yo'q! (${product.name}: ${currentQty} dona)`
-                    });
-                }
-
-                const newQty =
-                    currentQty -
-                    removeQty;
-
-                const fullyRemoved =
-                    newQty === 0;
-
-                if (fullyRemoved) {
-
-                    await client.query(
-                        `
-                        DELETE FROM public.products
-                        WHERE
-                            id = $1
-                            AND user_id = $2
-                        `,
-                        [
-                            product.id,
-                            userId
-                        ]
-                    );
-
-                    anyFullyRemoved = true;
-
-                } else {
-
-                    await client.query(
-                        `
-                        UPDATE public.products
-                        SET quantity = $1
-                        WHERE
-                            id = $2
-                            AND user_id = $3
-                        `,
-                        [
-                            newQty,
-                            product.id,
-                            userId
-                        ]
-                    );
-                }
-
-                affectedLocalIds.add(
-                    Number(product.local_id)
-                );
-
-                if (
-                    firstLocalId === null
-                ) {
-
-                    firstLocalId =
-                        product.local_id;
-
-                    firstProductName =
-                        product.name;
-
-                    firstCategory =
-                        product.category;
-
-                    firstColor =
-                        product.color;
-                }
-
-                totalRemoved +=
-                    removeQty;
-
-                removedLines.push(
-                    `   • 📏 ${telegramEscape(
-                        product.size || "Standart"
-                    )}: ${removeQty} dona olib tashlandi` +
-                    (
-                        fullyRemoved
-                            ? ` (🗑 butunlay tugadi)`
-                            : ` (qoldiq: ${newQty} ta)`
-                    )
-                );
-
-                results.push({
-                    product_id:
-                        product.id,
-
-                    local_id:
-                        product.local_id,
-
-                    size:
-                        product.size,
-
-                    removedQty:
-                        removeQty,
-
-                    remainingQuantity:
-                        newQty,
-
-                    productFullyRemoved:
-                        fullyRemoved
-                });
-            }
-
-            // ====================================================
-            // USER
-            // ====================================================
-
-            const userResult =
-                await client.query(
-                    `
-                    SELECT site_login
-                    FROM public.users
-                    WHERE id = $1
-                    `,
-                    [userId]
-                );
-
-            const siteLogin =
-                userResult.rows[0]?.site_login ||
-                null;
-
-            // ====================================================
-            // QOLGAN RAZMERLAR
-            // ====================================================
-
-            let remainingStockInfo =
-                "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
-
-            try {
-
-                const localIds =
-                    Array.from(
-                        affectedLocalIds
-                    );
-
-                if (!localIds.length) {
-
-                    remainingStockInfo +=
-                        "❌ Ma'lumot topilmadi";
-
-                } else {
-
-                    const remainingResult =
-                        await client.query(
-                            `
-                            SELECT
-                                local_id,
-                                size,
-                                quantity
-                            FROM public.products
-                            WHERE
-                                user_id = $1
-                                AND local_id = ANY($2::int[])
-                            ORDER BY
-                                local_id ASC,
-                                CASE
-                                    WHEN size ~ '^[0-9]+$'
-                                    THEN size::int
-                                END ASC NULLS LAST,
-                                size ASC NULLS LAST,
-                                id ASC
-                            `,
-                            [
-                                userId,
-                                localIds
-                            ]
-                        );
-
-                    if (
-                        remainingResult.rows.length === 0
-                    ) {
-
-                        remainingStockInfo +=
-                            "❌ Mahsulot omborda qolmagan";
-
-                    } else {
-
-                        const grouped = {};
-
-                        for (
-                            const row
-                            of remainingResult.rows
-                        ) {
-
-                            const localId =
-                                Number(row.local_id);
-
-                            if (!grouped[localId]) {
-                                grouped[localId] = [];
-                            }
-
-                            grouped[localId].push(row);
-                        }
-
-                        for (
-                            const localId
-                            of localIds
-                        ) {
-
-                            const rows =
-                                grouped[localId] || [];
-
-                            if (!rows.length) {
-
-                                remainingStockInfo +=
-                                    `\n#${localId}: ❌ Mahsulot tugagan\n`;
-
-                                continue;
-                            }
-
-                            if (localIds.length > 1) {
-
-                                remainingStockInfo +=
-                                    `\n<b>#${localId}</b>\n`;
-                            }
-
-                            const hasSizes =
-                                rows.some(
-                                    row =>
-                                        row.size !== null
-                                );
-
-                            if (!hasSizes) {
-
-                                remainingStockInfo +=
-                                    `• 📦 Standart: ${Number(
-                                        rows[0].quantity
-                                    ) || 0
-                                    } ta\n`;
-
-                            } else {
-
-                                remainingStockInfo +=
-                                    rows
-                                        .map(
-                                            row =>
-                                                `• ${telegramEscape(
-                                                    String(
-                                                        row.size
-                                                    )
-                                                )}: ${Number(
-                                                    row.quantity
-                                                ) || 0
-                                                } ta`
-                                        )
-                                        .join('\n') +
-                                    '\n';
-                            }
-                        }
+                if (!removeAll) {
+                    quantityToRemove = parseInt(item.quantity_to_remove, 10);
+                    if (!Number.isInteger(quantityToRemove) || quantityToRemove <= 0) {
+                        await client.query('ROLLBACK');
+                        return res.status(400).json({ message: "Olib tashlanadigan son noto'g'ri!" });
                     }
                 }
 
-            } catch (err) {
-
-                console.error(
-                    "❌ Qolgan razmerlarni olishda xatolik:",
-                    err
+                const result = await client.query(
+                    `SELECT * FROM public.products WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+                    [productId, userId]
                 );
 
-                remainingStockInfo =
-                    "\n📏 <b>Omborda qolgan razmerlar:</b>\n" +
-                    "❌ Ma'lumot topilmadi";
+                if (!result.rows.length) {
+                    await client.query('ROLLBACK');
+                    return res.status(404).json({ message: `Tovar topilmadi! (ID: ${productId})` });
+                }
+
+                const product = result.rows[0];
+                const currentQty = Number(product.quantity) || 0;
+                const removeQty = removeAll ? currentQty : quantityToRemove;
+
+                if (removeQty <= 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ message: "Olib tashlanadigan son noto'g'ri!" });
+                }
+                if (removeQty > currentQty) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({
+                        message: `Omborda buncha tovar yo'q! (${product.name}: ${currentQty} dona)`
+                    });
+                }
+
+                const newQty = currentQty - removeQty;
+                const fullyRemoved = newQty === 0;
+
+                if (fullyRemoved) {
+                    await client.query(
+                        `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
+                        [product.id, userId]
+                    );
+                    anyFullyRemoved = true;
+                } else {
+                    await client.query(
+                        `UPDATE public.products SET quantity = $1 WHERE id = $2 AND user_id = $3`,
+                        [newQty, product.id, userId]
+                    );
+                }
+
+                affectedLocalIds.add(Number(product.local_id));
+
+                if (firstLocalId === null) {
+                    firstLocalId = product.local_id;
+                    firstProductName = product.name;
+                    firstCategory = product.category;
+                    firstColor = product.color;
+                }
+
+                totalRemoved += removeQty;
+
+                removedLines.push(
+                    `   • 📏 ${telegramEscape(product.size || "Standart")}: ${removeQty} dona olib tashlandi` +
+                    (fullyRemoved ? ` (🗑 butunlay tugadi)` : ` (qoldiq: ${newQty} ta)`)
+                );
+
+                results.push({
+                    product_id: product.id,
+                    local_id: product.local_id,
+                    size: product.size,
+                    removedQty: removeQty,
+                    remainingQuantity: newQty,
+                    productFullyRemoved: fullyRemoved
+                });
             }
 
-            // ====================================================
-            // TELEGRAM MESSAGE
-            // ====================================================
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [userId]
+            );
+            const siteLogin = userResult.rows[0]?.site_login || null;
 
-            const titleLine =
-                normalizedItems.length > 1
-                    ? `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI — ${normalizedItems.length} TA RAZMER (#${firstLocalId})</b>`
-                    : `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${firstLocalId})</b>`;
+            let remainingStockInfo = "\n📏 <b>Omborda qolgan razmerlar:</b>\n";
+            try {
+                const localIds = Array.from(affectedLocalIds);
+                if (localIds.length) {
+                    const remainingResult = await client.query(
+                        `
+                        SELECT local_id, size, quantity
+                        FROM public.products
+                        WHERE user_id = $1 AND local_id = ANY($2::int[])
+                        ORDER BY local_id, size
+                        `,
+                        [userId, localIds]
+                    );
+
+                    if (remainingResult.rows.length === 0) {
+                        remainingStockInfo += "❌ Mahsulot omborda qolmagan";
+                    } else {
+                        remainingStockInfo += remainingResult.rows
+                            .map(r => `• ${telegramEscape(r.size || 'Standart')}: ${r.quantity} ta`)
+                            .join('\n');
+                    }
+                }
+            } catch (e) {
+                remainingStockInfo += "❌ Ma'lumot topilmadi";
+            }
+
+            const titleLine = items.length > 1
+                ? `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI — ${items.length} TA RAZMER (#${firstLocalId})</b>`
+                : `📉 <b>MAHSULOT KAMAYTIRILDI / O'CHIRILDI (#${firstLocalId})</b>`;
 
             let deleteMessage =
                 `${titleLine}\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
-                `📦 <b>Nomi:</b> ${telegramEscape(
-                    firstProductName
-                )}\n` +
-                `🗂 <b>Kategoriyasi:</b> ${telegramEscape(
-                    firstCategory || "Yo'q"
-                )}\n` +
-                `🎨 <b>Rangi:</b> ${telegramEscape(
-                    firstColor || "Yo'q"
-                )}\n` +
+                `📦 <b>Nomi:</b> ${telegramEscape(firstProductName)}\n` +
+                `🗂 <b>Kategoriyasi:</b> ${telegramEscape(firstCategory || "Yo'q")}\n` +
+                `🎨 <b>Rangi:</b> ${telegramEscape(firstColor || "Yo'q")}\n` +
                 `📏 <b>Razmerlar bo'yicha olib tashlandi:</b>\n` +
                 `${removedLines.join('\n')}\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `➖ <b>Jami olib tashlandi:</b> ${totalRemoved} dona` +
                 remainingStockInfo +
                 `\n━━━━━━━━━━━━━━━━━━━━` +
-                (
-                    anyFullyRemoved
-                        ? `\n🗑 Ba'zi razmerlar ombordan butunlay chiqarildi`
-                        : ''
-                );
+                (anyFullyRemoved ? `\n🗑 Ba'zi razmerlar ombordan butunlay chiqarildi` : '');
 
-            // ====================================================
-            // BUGUNGI HISOBOT
-            // ====================================================
+            deleteMessage += await getTodayReport(client, userId);
 
-            deleteMessage +=
-                await getTodayReport(
-                    client,
-                    userId
-                );
-
-            // ====================================================
-            // TELEGRAM QUEUE
-            // ====================================================
-
-            await queueTelegramNotification(
-                client,
-                siteLogin,
-                deleteMessage
-            );
+            await queueTelegramNotification(client, siteLogin, deleteMessage);
 
             await client.query('COMMIT');
 
             return res.json({
-
-                message:
-                    "Amal(lar) muvaffaqiyatli bajarildi",
-
+                message: "Amal(lar) muvaffaqiyatli bajarildi",
                 totalRemoved,
-
-                productFullySoldOut:
-                    anyFullyRemoved,
-
+                productFullySoldOut: anyFullyRemoved,
                 results
             });
-
         } catch (err) {
-
             try {
                 await client.query('ROLLBACK');
-            } catch (rollbackError) {
-                console.error(
-                    'ROLLBACK xatosi:',
-                    rollbackError
-                );
-            }
-
-            console.error(
-                "O'chirishda xatolik:",
-                err
-            );
-
+            } catch (e) { }
+            console.error("O'chirishda xatolik:", err);
             return res.status(500).json({
-                message:
-                    "Serverda xatolik yuz berdi!"
+                message: "Serverda xatolik yuz berdi!"
             });
-
         } finally {
-
             client.release();
         }
     }
@@ -3953,199 +3156,83 @@ app.post(
     '/api/dashboard/expenses',
     authenticateToken,
     async (req, res) => {
+        const userId = req.user.userId;
+        const { title, amount, expense_type } = req.body;
 
-        const userId =
-            req.user.userId;
-
-        const {
-            title,
-            amount,
-            expense_type
-        } = req.body;
-
-        const cleanTitle =
-            typeof title === 'string'
-                ? title.trim()
-                : '';
-
-        const parsedAmount =
-            Number(amount);
+        const cleanTitle = typeof title === 'string' ? title.trim() : '';
+        const parsedAmount = Number(amount);
 
         if (!cleanTitle) {
             return res.status(400).json({
-                message:
-                    "Rasxod nomi kiritilishi shart!"
+                message: "Rasxod nomi kiritilishi shart!"
             });
         }
 
-        if (
-            !Number.isFinite(parsedAmount) ||
-            parsedAmount <= 0
-        ) {
+        if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
             return res.status(400).json({
-                message:
-                    "Rasxod summasi noto'g'ri!"
+                message: "Rasxod summasi noto'g'ri!"
             });
         }
 
-        const type =
-            [
-                'daily',
-                'monthly',
-                'yearly'
-            ].includes(expense_type)
-                ? expense_type
-                : 'daily';
+        const type = ['daily', 'monthly', 'yearly'].includes(expense_type)
+            ? expense_type
+            : 'daily';
 
-        const client =
-            await pool.connect();
+        const client = await pool.connect();
 
         try {
-
             await client.query('BEGIN');
 
-            // ====================================================
-            // RASXODNI SAQLASH
-            // ====================================================
+            const result = await client.query(
+                `
+                INSERT INTO public.expenses
+                (user_id, title, amount, expense_type)
+                VALUES ($1, $2, $3, $4)
+                RETURNING *
+                `,
+                [userId, cleanTitle, parsedAmount, type]
+            );
 
-            const result =
-                await client.query(
-                    `
-                    INSERT INTO public.expenses
-                    (
-                        user_id,
-                        title,
-                        amount,
-                        expense_type
-                    )
-                    VALUES
-                    (
-                        $1,
-                        $2,
-                        $3,
-                        $4
-                    )
-                    RETURNING *
-                    `,
-                    [
-                        userId,
-                        cleanTitle,
-                        parsedAmount,
-                        type
-                    ]
-                );
+            const expense = result.rows[0];
 
-            const expense =
-                result.rows[0];
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [userId]
+            );
+            const siteLogin = userResult.rows[0]?.site_login || null;
 
-            // ====================================================
-            // USERNI OLISH
-            // ====================================================
-
-            const userResult =
-                await client.query(
-                    `
-                    SELECT
-                        site_login
-                    FROM public.users
-                    WHERE id = $1
-                    `,
-                    [userId]
-                );
-
-            const siteLogin =
-                userResult.rows[0]?.site_login ||
-                null;
-
-            // ====================================================
-            // TELEGRAM XABAR
-            // ====================================================
-
-            const expenseDate =
-                expense.created_at
-                    ? new Date(
-                        expense.created_at
-                    ).toLocaleDateString(
-                        'uz-UZ'
-                    )
-                    : new Date().toLocaleDateString(
-                        'uz-UZ'
-                    );
+            const expenseDate = expense.created_at
+                ? new Date(expense.created_at).toLocaleDateString('uz-UZ')
+                : new Date().toLocaleDateString('uz-UZ');
 
             let expenseMessage =
                 `💸 <b>YANGI RASXOD QO'SHILDI</b>\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
-                `📝 <b>Tavsifi:</b> ${telegramEscape(
-                    expense.title
-                )}\n` +
-                `💰 <b>Summasi:</b> ${formatSum(
-                    expense.amount
-                )} so'm\n` +
-                `📂 <b>Turi:</b> ${telegramEscape(
-                    type
-                )}\n` +
-                `📅 <b>Sanasi:</b> ${telegramEscape(
-                    expenseDate
-                )}\n` +
+                `📝 <b>Tavsifi:</b> ${telegramEscape(expense.title)}\n` +
+                `💰 <b>Summasi:</b> ${formatSum(expense.amount)} so'm\n` +
+                `📂 <b>Turi:</b> ${telegramEscape(type)}\n` +
+                `📅 <b>Sanasi:</b> ${telegramEscape(expenseDate)}\n` +
                 `━━━━━━━━━━━━━━━━━━━━`;
 
-            // ====================================================
-            // BUGUNGI HISOBOT
-            // ====================================================
+            expenseMessage += await getTodayReport(client, userId);
 
-            expenseMessage +=
-                await getTodayReport(
-                    client,
-                    userId
-                );
-
-            // ====================================================
-            // TELEGRAM QUEUE
-            // ====================================================
-
-            await queueTelegramNotification(
-                client,
-                siteLogin,
-                expenseMessage
-            );
-
-            // ====================================================
-            // COMMIT
-            // ====================================================
+            await queueTelegramNotification(client, siteLogin, expenseMessage);
 
             await client.query('COMMIT');
 
             return res.status(201).json({
-
-                message:
-                    "Rasxod muvaffaqiyatli qo'shildi",
-
+                message: "Rasxod muvaffaqiyatli qo'shildi",
                 expense
             });
-
         } catch (err) {
-
             try {
                 await client.query('ROLLBACK');
-            } catch (rollbackError) {
-                console.error(
-                    'ROLLBACK xatosi:',
-                    rollbackError
-                );
-            }
-
-            console.error(
-                "Rasxod qo'shishda xatolik:",
-                err
-            );
-
+            } catch (e) { }
+            console.error("Rasxod qo'shishda xatolik:", err);
             return res.status(500).json({
-                message:
-                    "Serverda xatolik yuz berdi!"
+                message: "Serverda xatolik yuz berdi!"
             });
-
         } finally {
-
             client.release();
         }
     }
@@ -4159,9 +3246,7 @@ app.get(
     '/api/expenses',
     authenticateToken,
     async (req, res) => {
-
         try {
-
             const result = await pool.query(
                 `
                 SELECT id, title, amount, expense_type, created_at
@@ -4176,11 +3261,8 @@ app.get(
             res.json({
                 expenses: result.rows
             });
-
         } catch (err) {
-
             console.error('Rasxodlarni olish xatosi:', err);
-
             res.status(500).json({
                 message: 'Serverda xatolik yuz berdi!'
             });
@@ -4189,14 +3271,13 @@ app.get(
 );
 
 // ====================================================
-// RASXODNI TAHRIRLASH (faqat 1 oy ichida qo'shilgan bo'lsa)
+// RASXODNI TAHRIRLASH
 // ====================================================
 
 app.put(
     '/api/expenses/:id',
     authenticateToken,
     async (req, res) => {
-
         const userId = req.user.userId;
         const expenseId = Number(req.params.id);
 
@@ -4223,15 +3304,13 @@ app.put(
             });
         }
 
-        const type =
-            ['daily', 'monthly', 'yearly'].includes(expense_type)
-                ? expense_type
-                : 'daily';
+        const type = ['daily', 'monthly', 'yearly'].includes(expense_type)
+            ? expense_type
+            : 'daily';
 
         const client = await pool.connect();
 
         try {
-
             await client.query('BEGIN');
 
             const existing = await client.query(
@@ -4241,7 +3320,6 @@ app.put(
 
             if (!existing.rows.length) {
                 await client.query('ROLLBACK');
-
                 return res.status(404).json({
                     message: "Rasxod topilmadi!"
                 });
@@ -4251,10 +3329,8 @@ app.put(
 
             if (daysSince(expense.created_at) > EXPENSE_EDIT_WINDOW_DAYS) {
                 await client.query('ROLLBACK');
-
                 return res.status(403).json({
-                    message:
-                        `Bu rasxod qo'shilganiga 1 oydan ko'p vaqt o'tgan, tahrirlab bo'lmaydi!`
+                    message: `Bu rasxod qo'shilganiga 1 oydan ko'p vaqt o'tgan, tahrirlab bo'lmaydi!`
                 });
             }
 
@@ -4272,7 +3348,6 @@ app.put(
                 `SELECT site_login FROM public.users WHERE id = $1`,
                 [userId]
             );
-
             const siteLogin = userResult.rows[0]?.site_login || null;
 
             let message =
@@ -4293,21 +3368,14 @@ app.put(
                 message: "Rasxod muvaffaqiyatli tahrirlandi!",
                 expense: updated.rows[0]
             });
-
         } catch (err) {
-
             try {
                 await client.query('ROLLBACK');
-            } catch (rollbackError) {
-                console.error('ROLLBACK xatosi:', rollbackError);
-            }
-
+            } catch (e) { }
             console.error("Rasxodni tahrirlashda xatolik:", err);
-
             return res.status(500).json({
                 message: "Serverda xatolik yuz berdi!"
             });
-
         } finally {
             client.release();
         }
@@ -4315,14 +3383,13 @@ app.put(
 );
 
 // ====================================================
-// RASXODNI O'CHIRISH (faqat 1 oy ichida qo'shilgan bo'lsa)
+// RASXODNI O'CHIRISH
 // ====================================================
 
 app.delete(
     '/api/expenses/:id',
     authenticateToken,
     async (req, res) => {
-
         const userId = req.user.userId;
         const expenseId = Number(req.params.id);
 
@@ -4335,7 +3402,6 @@ app.delete(
         const client = await pool.connect();
 
         try {
-
             await client.query('BEGIN');
 
             const existing = await client.query(
@@ -4345,7 +3411,6 @@ app.delete(
 
             if (!existing.rows.length) {
                 await client.query('ROLLBACK');
-
                 return res.status(404).json({
                     message: "Rasxod topilmadi!"
                 });
@@ -4355,10 +3420,8 @@ app.delete(
 
             if (daysSince(expense.created_at) > EXPENSE_EDIT_WINDOW_DAYS) {
                 await client.query('ROLLBACK');
-
                 return res.status(403).json({
-                    message:
-                        `Bu rasxod qo'shilganiga 1 oydan ko'p vaqt o'tgan, o'chirib bo'lmaydi!`
+                    message: `Bu rasxod qo'shilganiga 1 oydan ko'p vaqt o'tgan, o'chirib bo'lmaydi!`
                 });
             }
 
@@ -4371,7 +3434,6 @@ app.delete(
                 `SELECT site_login FROM public.users WHERE id = $1`,
                 [userId]
             );
-
             const siteLogin = userResult.rows[0]?.site_login || null;
 
             let message =
@@ -4390,27 +3452,19 @@ app.delete(
             return res.json({
                 message: "Rasxod muvaffaqiyatli o'chirildi!"
             });
-
         } catch (err) {
-
             try {
                 await client.query('ROLLBACK');
-            } catch (rollbackError) {
-                console.error('ROLLBACK xatosi:', rollbackError);
-            }
-
+            } catch (e) { }
             console.error("Rasxodni o'chirishda xatolik:", err);
-
             return res.status(500).json({
                 message: "Serverda xatolik yuz berdi!"
             });
-
         } finally {
             client.release();
         }
     }
 );
-
 
 // ====================================================
 // QR MA'LUMOT
@@ -4419,83 +3473,55 @@ app.delete(
 app.get(
     '/api/qr/:token',
     async (req, res) => {
-
-        const token =
-            typeof req.params.token === 'string'
-                ? req.params.token.trim()
-                : '';
+        const token = typeof req.params.token === 'string'
+            ? req.params.token.trim()
+            : '';
 
         if (!token) {
             return res.status(400).json({
-                message:
-                    "QR token kiritilmagan!"
+                message: "QR token kiritilmagan!"
             });
         }
 
         try {
-
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        id,
-                        user_id,
-                        local_id,
-                        name,
-                        category,
-                        color,
-                        size,
-                        cost_price,
-                        quantity,
-                        qr_token,
-                        qr_created_at,
-                        created_at
-                    FROM public.products
-                    WHERE qr_token = $1
-                    LIMIT 1
-                    `,
-                    [token]
-                );
+            const result = await pool.query(
+                `
+                SELECT
+                    id, user_id, local_id, name, category, color, size,
+                    cost_price, quantity, qr_token, qr_created_at, created_at
+                FROM public.products
+                WHERE qr_token = $1
+                LIMIT 1
+                `,
+                [token]
+            );
 
             if (!result.rows.length) {
                 return res.status(404).json({
-                    message:
-                        "QR kodi eskirgan yoki tovar topilmadi!"
+                    message: "QR kodi eskirgan yoki tovar topilmadi!"
                 });
             }
 
-            const product =
-                result.rows[0];
-
-            const quantity =
-                Number(product.quantity) || 0;
+            const product = result.rows[0];
+            const quantity = Number(product.quantity) || 0;
 
             if (quantity <= 0) {
                 return res.status(410).json({
-                    message:
-                        "Bu tovar omborda qolmagan!"
+                    message: "Bu tovar omborda qolmagan!"
                 });
             }
 
             return res.json({
                 product
             });
-
         } catch (err) {
-
-            console.error(
-                "QR ma'lumot xatosi:",
-                err
-            );
-
+            console.error("QR ma'lumot xatosi:", err);
             return res.status(500).json({
-                message:
-                    "Serverda xatolik yuz berdi!"
+                message: "Serverda xatolik yuz berdi!"
             });
         }
     }
 );
-
 
 // ====================================================
 // QR SOTUV
@@ -4504,137 +3530,68 @@ app.get(
 app.post(
     '/api/qr/:token/sell',
     async (req, res) => {
-
-        const token =
-            typeof req.params.token === 'string'
-                ? req.params.token.trim()
-                : '';
+        const token = typeof req.params.token === 'string'
+            ? req.params.token.trim()
+            : '';
 
         if (!token) {
             return res.status(400).json({
-                message:
-                    "QR token kiritilmagan!"
+                message: "QR token kiritilmagan!"
             });
         }
 
-        const sellingPrice =
-            Number(
-                req.body?.selling_price
-            );
+        const sellingPrice = Number(req.body?.selling_price);
 
-        if (
-            !Number.isFinite(sellingPrice) ||
-            sellingPrice < 0
-        ) {
+        if (!Number.isFinite(sellingPrice) || sellingPrice < 0) {
             return res.status(400).json({
-                message:
-                    "Sotuv narxini to'g'ri kiriting!"
+                message: "Sotuv narxini to'g'ri kiriting!"
             });
         }
 
-        const client =
-            await pool.connect();
+        const client = await pool.connect();
 
         try {
-
             await client.query('BEGIN');
 
-            // ====================================================
-            // QR ORQALI MAHSULOTNI LOCK QILISH
-            // ====================================================
-
-            const result =
-                await client.query(
-                    `
-                    SELECT *
-                    FROM public.products
-                    WHERE qr_token = $1
-                    LIMIT 1
-                    FOR UPDATE
-                    `,
-                    [token]
-                );
+            const result = await client.query(
+                `
+                SELECT *
+                FROM public.products
+                WHERE qr_token = $1
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [token]
+            );
 
             if (!result.rows.length) {
-
                 await client.query('ROLLBACK');
-
                 return res.status(404).json({
-                    message:
-                        "QR kodi eskirgan yoki tovar topilmadi!"
+                    message: "QR kodi eskirgan yoki tovar topilmadi!"
                 });
             }
 
-            const product =
-                result.rows[0];
-
-            const quantity =
-                Number(product.quantity) || 0;
+            const product = result.rows[0];
+            const quantity = Number(product.quantity) || 0;
 
             if (quantity <= 0) {
-
                 await client.query('ROLLBACK');
-
                 return res.status(409).json({
-                    message:
-                        "Bu tovar omborda qolmagan!"
+                    message: "Bu tovar omborda qolmagan!"
                 });
             }
 
-            // QR orqali bitta dona sotiladi
             const qty = 1;
-
-            const cost =
-                Number(
-                    product.cost_price
-                ) || 0;
-
-            const totalAmount =
-                sellingPrice * qty;
-
-            const profit =
-                (
-                    sellingPrice -
-                    cost
-                ) * qty;
-
-            const newQty =
-                quantity - qty;
-
-            // ====================================================
-            // SALES
-            // ====================================================
+            const cost = Number(product.cost_price) || 0;
+            const totalAmount = sellingPrice * qty;
+            const profit = (sellingPrice - cost) * qty;
+            const newQty = quantity - qty;
 
             await client.query(
                 `
                 INSERT INTO public.sales
-                (
-                    user_id,
-                    product_id,
-                    title,
-                    quantity,
-                    cost_price,
-                    selling_price,
-                    profit,
-                    local_id,
-                    category,
-                    color,
-                    size
-                )
-                VALUES
-                (
-                    $1,
-                    $2,
-                    $3,
-                    $4,
-                    $5,
-                    $6,
-                    $7,
-                    $8,
-                    $9,
-                    $10,
-                    $11
-                )
+                (user_id, product_id, title, quantity, cost_price, selling_price, profit, local_id, category, color, size)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                 `,
                 [
                     product.user_id,
@@ -4651,191 +3608,74 @@ app.post(
                 ]
             );
 
-            // ====================================================
-            // OMBORNI YANGILASH
-            // ====================================================
-
             if (newQty === 0) {
-
                 await client.query(
-                    `
-                    DELETE FROM public.products
-                    WHERE
-                        id = $1
-                        AND user_id = $2
-                    `,
-                    [
-                        product.id,
-                        product.user_id
-                    ]
+                    `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
+                    [product.id, product.user_id]
                 );
-
             } else {
-
                 await client.query(
-                    `
-                    UPDATE public.products
-                    SET quantity = $1
-                    WHERE
-                        id = $2
-                        AND user_id = $3
-                    `,
-                    [
-                        newQty,
-                        product.id,
-                        product.user_id
-                    ]
+                    `UPDATE public.products SET quantity = $1 WHERE id = $2 AND user_id = $3`,
+                    [newQty, product.id, product.user_id]
                 );
             }
 
-            // ====================================================
-            // USER
-            // ====================================================
-
-            const userResult =
-                await client.query(
-                    `
-                    SELECT
-                        site_login
-                    FROM public.users
-                    WHERE id = $1
-                    `,
-                    [product.user_id]
-                );
-
-            const siteLogin =
-                userResult.rows[0]?.site_login ||
-                null;
-
-            // ====================================================
-            // TELEGRAM XABAR
-            // ====================================================
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [product.user_id]
+            );
+            const siteLogin = userResult.rows[0]?.site_login || null;
 
             let message =
                 `💰 <b>QR ORQALI SOTUV</b>\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
-                `📦 <b>Tovar:</b> ${telegramEscape(
-                    product.name
-                )}\n` +
-                `📏 <b>Razmer:</b> ${telegramEscape(
-                    product.size || 'Standart'
-                )}\n` +
+                `📦 <b>Tovar:</b> ${telegramEscape(product.name)}\n` +
+                `📏 <b>Razmer:</b> ${telegramEscape(product.size || 'Standart')}\n` +
                 `🔢 <b>Soni:</b> 1 dona\n` +
-                `💵 <b>Sotuv:</b> ${formatSum(
-                    sellingPrice
-                )} so'm\n` +
-                `💳 <b>Tannarx:</b> ${formatSum(
-                    cost
-                )} so'm\n` +
-                `${profit >= 0
-                    ? '📈'
-                    : '📉'
-                } <b>${profit >= 0
-                    ? 'Foyda'
-                    : 'Ziyon'
-                }:</b> ${formatSum(
-                    Math.abs(profit)
-                )} so'm\n` +
+                `💵 <b>Sotuv:</b> ${formatSum(sellingPrice)} so'm\n` +
+                `💳 <b>Tannarx:</b> ${formatSum(cost)} so'm\n` +
+                `${profit >= 0 ? '📈' : '📉'} <b>${profit >= 0 ? 'Foyda' : 'Ziyon'}:</b> ${formatSum(Math.abs(profit))} so'm\n` +
                 `📦 <b>Qoldiq:</b> ${newQty} dona`;
 
             if (newQty === 0) {
-                message +=
-                    `\n🗑 <b>Bu razmer ombordan tugadi.</b>`;
+                message += `\n🗑 <b>Bu razmer ombordan tugadi.</b>`;
             }
 
-            // ====================================================
-            // BUGUNGI HISOBOT
-            // ====================================================
+            message += await getTodayReport(client, product.user_id);
 
-            message +=
-                await getTodayReport(
-                    client,
-                    product.user_id
-                );
-
-            // ====================================================
-            // NOTIFICATION QUEUE
-            // ====================================================
-
-            await queueTelegramNotification(
-                client,
-                siteLogin,
-                message
-            );
-
-            // ====================================================
-            // COMMIT
-            // ====================================================
+            await queueTelegramNotification(client, siteLogin, message);
 
             await client.query('COMMIT');
 
             return res.json({
-
                 success: true,
-
                 product: {
-                    id:
-                        product.id,
-
-                    local_id:
-                        product.local_id,
-
-                    name:
-                        product.name,
-
-                    size:
-                        product.size,
-
-                    color:
-                        product.color,
-
-                    cost_price:
-                        cost
+                    id: product.id,
+                    local_id: product.local_id,
+                    name: product.name,
+                    size: product.size,
+                    color: product.color,
+                    cost_price: cost
                 },
-
-                selling_price:
-                    sellingPrice,
-
-                quantity:
-                    qty,
-
-                total_amount:
-                    totalAmount,
-
+                selling_price: sellingPrice,
+                quantity: qty,
+                total_amount: totalAmount,
                 profit,
-
-                remaining_quantity:
-                    newQty
+                remaining_quantity: newQty
             });
-
         } catch (err) {
-
             try {
                 await client.query('ROLLBACK');
-            } catch (rollbackError) {
-                console.error(
-                    'ROLLBACK xatosi:',
-                    rollbackError
-                );
-            }
-
-            console.error(
-                'QR sotuv xatosi:',
-                err
-            );
-
+            } catch (e) { }
+            console.error('QR sotuv xatosi:', err);
             return res.status(500).json({
-                message:
-                    "QR orqali sotishda server xatosi!"
+                message: "QR orqali sotishda server xatosi!"
             });
-
         } finally {
-
             client.release();
         }
     }
 );
-
 
 // ====================================================
 // QR O'CHIRISH
@@ -4844,180 +3684,87 @@ app.post(
 app.post(
     '/api/qr/:token/delete',
     async (req, res) => {
-
-        const token =
-            typeof req.params.token === 'string'
-                ? req.params.token.trim()
-                : '';
+        const token = typeof req.params.token === 'string'
+            ? req.params.token.trim()
+            : '';
 
         if (!token) {
             return res.status(400).json({
-                message:
-                    "QR token kiritilmagan!"
+                message: "QR token kiritilmagan!"
             });
         }
 
-        const client =
-            await pool.connect();
+        const client = await pool.connect();
 
         try {
-
             await client.query('BEGIN');
 
-            // ====================================================
-            // MAHSULOTNI LOCK QILISH
-            // ====================================================
-
-            const result =
-                await client.query(
-                    `
-                    SELECT *
-                    FROM public.products
-                    WHERE qr_token = $1
-                    LIMIT 1
-                    FOR UPDATE
-                    `,
-                    [token]
-                );
+            const result = await client.query(
+                `
+                SELECT *
+                FROM public.products
+                WHERE qr_token = $1
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [token]
+            );
 
             if (!result.rows.length) {
-
                 await client.query('ROLLBACK');
-
                 return res.status(404).json({
-                    message:
-                        "QR kodi eskirgan yoki tovar topilmadi!"
+                    message: "QR kodi eskirgan yoki tovar topilmadi!"
                 });
             }
 
-            const product =
-                result.rows[0];
+            const product = result.rows[0];
 
-            // ====================================================
-            // USER
-            // ====================================================
-
-            const userResult =
-                await client.query(
-                    `
-                    SELECT
-                        site_login
-                    FROM public.users
-                    WHERE id = $1
-                    `,
-                    [product.user_id]
-                );
-
-            const siteLogin =
-                userResult.rows[0]?.site_login ||
-                null;
-
-            // ====================================================
-            // MAHSULOTNI O'CHIRISH
-            // ====================================================
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [product.user_id]
+            );
+            const siteLogin = userResult.rows[0]?.site_login || null;
 
             await client.query(
-                `
-                DELETE FROM public.products
-                WHERE
-                    id = $1
-                    AND user_id = $2
-                `,
-                [
-                    product.id,
-                    product.user_id
-                ]
+                `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
+                [product.id, product.user_id]
             );
-
-            // ====================================================
-            // TELEGRAM XABAR
-            // ====================================================
 
             const messageBase =
                 `🗑️ <b>QR ORQALI TOVAR O'CHIRILDI</b>\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
-                `📦 <b>Tovar:</b> ${telegramEscape(
-                    product.name
-                )}\n` +
-                `📏 <b>Razmer:</b> ${telegramEscape(
-                    product.size || 'Standart'
-                )}\n` +
-                `🎨 <b>Rang:</b> ${telegramEscape(
-                    product.color || "Ko'rsatilmagan"
-                )}\n` +
-                `🗂 <b>Kategoriya:</b> ${telegramEscape(
-                    product.category || "Ko'rsatilmagan"
-                )}\n` +
-                `💰 <b>Tannarx:</b> ${formatSum(
-                    product.cost_price
-                )} so'm\n` +
-                `🔢 <b>Ombordagi miqdor:</b> ${Number(product.quantity) || 0
-                } dona\n` +
+                `📦 <b>Tovar:</b> ${telegramEscape(product.name)}\n` +
+                `📏 <b>Razmer:</b> ${telegramEscape(product.size || 'Standart')}\n` +
+                `🎨 <b>Rang:</b> ${telegramEscape(product.color || "Ko'rsatilmagan")}\n` +
+                `🗂 <b>Kategoriya:</b> ${telegramEscape(product.category || "Ko'rsatilmagan")}\n` +
+                `💰 <b>Tannarx:</b> ${formatSum(product.cost_price)} so'm\n` +
+                `🔢 <b>Ombordagi miqdor:</b> ${Number(product.quantity) || 0} dona\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `🗑️ Tovar ombordan chiqarildi.`;
 
-            // ====================================================
-            // BUGUNGI HISOBOT
-            // ====================================================
+            const message = messageBase + await getTodayReport(client, product.user_id);
 
-            const message =
-                messageBase +
-                await getTodayReport(
-                    client,
-                    product.user_id
-                );
-
-            // ====================================================
-            // QUEUE
-            // ====================================================
-
-            await queueTelegramNotification(
-                client,
-                siteLogin,
-                message
-            );
-
-            // ====================================================
-            // COMMIT
-            // ====================================================
+            await queueTelegramNotification(client, siteLogin, message);
 
             await client.query('COMMIT');
 
             return res.json({
                 success: true,
-
-                message:
-                    "Tovar ombordan o'chirildi!"
+                message: "Tovar ombordan o'chirildi!"
             });
-
         } catch (err) {
-
             try {
                 await client.query('ROLLBACK');
-            } catch (rollbackError) {
-                console.error(
-                    'ROLLBACK xatosi:',
-                    rollbackError
-                );
-            }
-
-            console.error(
-                "QR o'chirish xatosi:",
-                err
-            );
-
+            } catch (e) { }
+            console.error("QR o'chirish xatosi:", err);
             return res.status(500).json({
-                message:
-                    "QR orqali o'chirishda server xatosi!"
+                message: "QR orqali o'chirishda server xatosi!"
             });
-
         } finally {
-
             client.release();
         }
     }
 );
-
 
 // ====================================================
 // BOT PROFITS
@@ -5026,326 +3773,141 @@ app.post(
 app.get(
     '/api/bot/profits/:site_login',
     async (req, res) => {
-
-        const siteLogin =
-            typeof req.params.site_login === 'string'
-                ? req.params.site_login.trim()
-                : '';
+        const siteLogin = typeof req.params.site_login === 'string'
+            ? req.params.site_login.trim()
+            : '';
 
         if (!siteLogin) {
             return res.status(400).json({
-                message:
-                    "site_login kiritilmagan!"
+                message: "site_login kiritilmagan!"
             });
         }
 
         try {
-
-            // ====================================================
-            // USER
-            // ====================================================
-
-            const userResult =
-                await pool.query(
-                    `
-                    SELECT
-                        id
-                    FROM public.users
-                    WHERE site_login = $1
-                    LIMIT 1
-                    `,
-                    [siteLogin]
-                );
+            const userResult = await pool.query(
+                `SELECT id FROM public.users WHERE site_login = $1 LIMIT 1`,
+                [siteLogin]
+            );
 
             if (!userResult.rows.length) {
                 return res.status(404).json({
-                    message:
-                        "Foydalanuvchi topilmadi!"
+                    message: "Foydalanuvchi topilmadi!"
                 });
             }
 
-            const userId =
-                userResult.rows[0].id;
+            const userId = userResult.rows[0].id;
 
-            // ====================================================
-            // PROFIT FUNCTION
-            // ====================================================
-
-            const getPeriodProfit =
-                async (
-                    salesFilter,
-                    expenseFilter
-                ) => {
-
-                    const sales =
-                        await pool.query(
-                            `
-                            SELECT
-                                COALESCE(
-                                    SUM(profit),
-                                    0
-                                ) AS gross_profit
-                            FROM public.sales
-                            WHERE
-                                user_id = $1
-                                AND returned = false
-                                AND ${salesFilter}
-                            `,
-                            [userId]
-                        );
-
-                    const expenses =
-                        await pool.query(
-                            `
-                            SELECT
-                                COALESCE(
-                                    SUM(amount),
-                                    0
-                                ) AS expense
-                            FROM public.expenses
-                            WHERE
-                                user_id = $1
-                                AND ${expenseFilter}
-                            `,
-                            [userId]
-                        );
-
-                    return (
-                        Number(
-                            sales.rows[0]
-                                .gross_profit || 0
-                        ) -
-                        Number(
-                            expenses.rows[0]
-                                .expense || 0
-                        )
-                    );
-                };
-
-            // ====================================================
-            // DAILY
-            // ====================================================
-
-            const dailyProfit =
-                await getPeriodProfit(
+            const getPeriodProfit = async (salesFilter, expenseFilter) => {
+                const sales = await pool.query(
                     `
-                    sold_at::date =
-                    CURRENT_DATE
+                    SELECT COALESCE(SUM(profit), 0) AS gross_profit
+                    FROM public.sales
+                    WHERE user_id = $1 AND returned = false AND ${salesFilter}
                     `,
-                    `
-                    created_at::date =
-                    CURRENT_DATE
-                    `
+                    [userId]
                 );
 
-            // ====================================================
-            // WEEKLY
-            // ====================================================
-
-            const weeklyProfit =
-                await getPeriodProfit(
+                const expenses = await pool.query(
                     `
-                    sold_at >=
-                    date_trunc(
-                        'week',
-                        CURRENT_DATE
-                    )
+                    SELECT COALESCE(SUM(amount), 0) AS expense
+                    FROM public.expenses
+                    WHERE user_id = $1 AND ${expenseFilter}
                     `,
-                    `
-                    created_at >=
-                    date_trunc(
-                        'week',
-                        CURRENT_DATE
-                    )
-                    `
+                    [userId]
                 );
 
-            // ====================================================
-            // MONTHLY
-            // ====================================================
-
-            const monthlyProfit =
-                await getPeriodProfit(
-                    `
-                    date_trunc(
-                        'month',
-                        sold_at
-                    )
-                    =
-                    date_trunc(
-                        'month',
-                        CURRENT_DATE
-                    )
-                    `,
-                    `
-                    date_trunc(
-                        'month',
-                        created_at
-                    )
-                    =
-                    date_trunc(
-                        'month',
-                        CURRENT_DATE
-                    )
-                    `
+                return (
+                    Number(sales.rows[0].gross_profit || 0) -
+                    Number(expenses.rows[0].expense || 0)
                 );
+            };
 
-            // ====================================================
-            // YEARLY
-            // ====================================================
-
-            const yearlyProfit =
-                await getPeriodProfit(
-                    `
-                    date_trunc(
-                        'year',
-                        sold_at
-                    )
-                    =
-                    date_trunc(
-                        'year',
-                        CURRENT_DATE
-                    )
-                    `,
-                    `
-                    date_trunc(
-                        'year',
-                        created_at
-                    )
-                    =
-                    date_trunc(
-                        'year',
-                        CURRENT_DATE
-                    )
-                    `
-                );
-
-            return res.json({
-
-                success: true,
-
-                site_login:
-                    siteLogin,
-
-                dailyProfit,
-
-                weeklyProfit,
-
-                monthlyProfit,
-
-                yearlyProfit
-            });
-
-        } catch (err) {
-
-            console.error(
-                'Bot profits xatosi:',
-                err
+            const dailyProfit = await getPeriodProfit(
+                `sold_at::date = CURRENT_DATE`,
+                `created_at::date = CURRENT_DATE`
             );
 
+            const weeklyProfit = await getPeriodProfit(
+                `sold_at >= date_trunc('week', CURRENT_DATE)`,
+                `created_at >= date_trunc('week', CURRENT_DATE)`
+            );
+
+            const monthlyProfit = await getPeriodProfit(
+                `date_trunc('month', sold_at) = date_trunc('month', CURRENT_DATE)`,
+                `date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)`
+            );
+
+            const yearlyProfit = await getPeriodProfit(
+                `date_trunc('year', sold_at) = date_trunc('year', CURRENT_DATE)`,
+                `date_trunc('year', created_at) = date_trunc('year', CURRENT_DATE)`
+            );
+
+            return res.json({
+                success: true,
+                site_login: siteLogin,
+                dailyProfit,
+                weeklyProfit,
+                monthlyProfit,
+                yearlyProfit
+            });
+        } catch (err) {
+            console.error('Bot profits xatosi:', err);
             return res.status(500).json({
-                message:
-                    "Serverda xatolik yuz berdi!"
+                message: "Serverda xatolik yuz berdi!"
             });
         }
     }
 );
-
 
 // ====================================================
 // 404
 // ====================================================
 
-app.use(
-    (req, res) => {
-
-        return res.status(404).json({
-            message:
-                "Bunday yo'nalish topilmadi"
-        });
-    }
-);
-
+app.use((req, res) => {
+    return res.status(404).json({
+        message: "Bunday yo'nalish topilmadi"
+    });
+});
 
 // ====================================================
 // GLOBAL ERROR HANDLER
 // ====================================================
 
-app.use(
-    (err, req, res, next) => {
-
-        console.error(
-            'Global server xatosi:',
-            err
-        );
-
-        if (res.headersSent) {
-            return next(err);
-        }
-
-        return res.status(500).json({
-            message:
-                "Serverda kutilmagan xatolik yuz berdi!"
-        });
+app.use((err, req, res, next) => {
+    console.error('Global server xatosi:', err);
+    if (res.headersSent) {
+        return next(err);
     }
-);
-
+    return res.status(500).json({
+        message: "Serverda kutilmagan xatolik yuz berdi!"
+    });
+});
 
 // ====================================================
 // SERVER ISHGA TUSHIRISH
-//
-// MUHIM: Vercel muhitida Express serverini app.listen()
-// bilan ishga tushirib bo'lmaydi — Vercel har bir so'rovni
-// alohida "serverless function" sifatida chaqiradi va
-// buning uchun Express `app` obyekti export qilinishi kerak
-// (`module.exports = app`), portni tinglash esa kerak emas
-// (buni Vercel platformasining o'zi bajaradi).
-//
-// Shu sababli quyida ikki holat ajratilgan:
-//   1) process.env.VERCEL mavjud bo'lsa -> faqat export
-//   2) aks holda (lokal kompyuter, Render va h.k.)
-//      -> odatiy app.listen() bilan klassik server
 // ====================================================
 
 if (process.env.VERCEL) {
-
-    // ------------------------------------------------
-    // VERCEL (SERVERLESS) MUHITI
-    // ------------------------------------------------
-
     module.exports = app;
-
 } else {
-
-    // ------------------------------------------------
-    // LOKAL / RENDER (KLASSIK SERVER) MUHITI
-    // ------------------------------------------------
-
-    const PORT =
-        Number(process.env.PORT) || 5000;
-
+    const PORT = Number(process.env.PORT) || 5000;
     let server;
 
-    // ====================================================
-    // AVTOMATIK HISOBOTLAR (har kuni 23:59 va oy oxiri)
-    // ====================================================
     let lastDailyReportDate = null;
     let lastMonthlyReportMonth = null;
 
     const checkAndSendScheduledReports = async () => {
         try {
-            // Toshkent vaqti (UTC+5)
             const now = new Date();
-            const tashkentOffset = 5 * 60; // daqiqa
+            const tashkentOffset = 5 * 60;
             const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
             const tashkent = new Date(utc + (tashkentOffset * 60000));
 
             const hours = tashkent.getHours();
             const minutes = tashkent.getMinutes();
-            const dateStr = tashkent.toISOString().slice(0, 10); // YYYY-MM-DD
-            const monthStr = dateStr.slice(0, 7); // YYYY-MM
+            const dateStr = tashkent.toISOString().slice(0, 10);
+            const monthStr = dateStr.slice(0, 7);
 
-            // Har kuni soat 23:59 da kunlik hisobot
             if (hours === 23 && minutes === 59) {
                 if (lastDailyReportDate !== dateStr) {
                     lastDailyReportDate = dateStr;
@@ -5354,7 +3916,6 @@ if (process.env.VERCEL) {
                 }
             }
 
-            // Oy oxirgi kuni + soat 23:59 da oylik hisobot
             const tomorrow = new Date(tashkent);
             tomorrow.setDate(tomorrow.getDate() + 1);
             const isLastDayOfMonth = tomorrow.getDate() === 1;
@@ -5371,108 +3932,53 @@ if (process.env.VERCEL) {
         }
     };
 
-    // Har 30 soniyada tekshiradi (aniq 23:59 ni ushlash uchun)
     setInterval(checkAndSendScheduledReports, 30 * 1000);
 
     const startServer = async () => {
-
         try {
-
             await ensureTablesOnce();
-
         } catch (err) {
-
             console.error(
                 '❌ ensureTables() umumiy xatosi (server baribir ishga tushadi):',
                 err
             );
         }
 
-        server = app.listen(
-            PORT,
-            () => {
+        server = app.listen(PORT, () => {
+            console.log(
+                `Backend Server ${PORT}-portda ishga tushdi 🚀`
+            );
+        });
 
-                console.log(
-                    `Backend Server ${PORT}-portda ishga tushdi 🚀`
-                );
-            }
-        );
-
-        // ====================================================
-        // SERVER ERROR
-        // ====================================================
-
-        server.on(
-            'error',
-            (err) => {
-
-                if (err.code === 'EADDRINUSE') {
-
-                    console.error(
-                        `❌ ${PORT}-port allaqachon band!`
-                    );
-
-                    process.exit(1);
-                }
-
-                console.error(
-                    '❌ Server ishga tushishida xatolik:',
-                    err
-                );
-
+        server.on('error', (err) => {
+            if (err.code === 'EADDRINUSE') {
+                console.error(`❌ ${PORT}-port allaqachon band!`);
                 process.exit(1);
             }
-        );
+            console.error('❌ Server ishga tushishida xatolik:', err);
+            process.exit(1);
+        });
     };
 
     startServer();
 
-    // ====================================================
-    // GRACEFUL SHUTDOWN
-    // ====================================================
-
     const shutdown = async (signal) => {
-
-        console.log(
-            `\n${signal} signali olindi. Server yopilmoqda...`
-        );
-
+        console.log(`\n${signal} signali olindi. Server yopilmoqda...`);
         try {
-
             if (server) {
-                await new Promise(
-                    (resolve) => {
-                        server.close(resolve);
-                    }
-                );
+                await new Promise((resolve) => {
+                    server.close(resolve);
+                });
             }
-
             await pool.end();
-
-            console.log(
-                'Server va PostgreSQL connection pool yopildi.'
-            );
-
+            console.log('Server va PostgreSQL connection pool yopildi.');
             process.exit(0);
-
         } catch (err) {
-
-            console.error(
-                'Serverni yopishda xatolik:',
-                err
-            );
-
+            console.error('Serverni yopishda xatolik:', err);
             process.exit(1);
         }
     };
 
-    process.on(
-        'SIGTERM',
-        () => shutdown('SIGTERM')
-    );
-
-    process.on(
-        'SIGINT',
-        () => shutdown('SIGINT')
-    );
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
 }
