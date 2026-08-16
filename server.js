@@ -123,7 +123,7 @@ const getTodayReport = async (clientOrPool, userId) => {
             ) AS expense
         FROM public.expenses
         WHERE user_id = $1
-          AND created_at::date = CURRENT_DATE
+            AND created_at >= NOW() - INTERVAL '7 days'
         `,
         [userId]
     );
@@ -3279,33 +3279,22 @@ app.get(
     '/api/dashboard/expenses',
     authenticateToken,
     async (req, res) => {
-
         try {
-
             const result = await pool.query(
                 `
                 SELECT *
                 FROM public.expenses
                 WHERE user_id = $1
+                  AND created_at >= NOW() - INTERVAL '7 days'
                 ORDER BY created_at DESC, id DESC
                 `,
                 [req.user.userId]
             );
 
-            res.json({
-                expenses: result.rows
-            });
-
+            res.json({ expenses: result.rows });
         } catch (err) {
-
-            console.error(
-                'Rasxodlarni olish xatosi:',
-                err
-            );
-
-            res.status(500).json({
-                message: 'Serverda xatolik yuz berdi!'
-            });
+            console.error('Rasxodlarni olish xatosi:', err);
+            res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
         }
     }
 );
@@ -3542,51 +3531,30 @@ app.get(
     '/api/dashboard/sales',
     authenticateToken,
     async (req, res) => {
-
         try {
-
             const result = await pool.query(
                 `
                 SELECT
-                    id,
-                    product_id,
-                    title,
-                    title AS name,
-                    size,
-                    local_id,
-                    category,
-                    color,
-                    quantity,
+                    id, product_id, title, title AS name, size,
+                    local_id, category, color, quantity,
                     COALESCE(returned_quantity, 0) AS returned_quantity,
                     (quantity - COALESCE(returned_quantity, 0)) AS sell_quantity,
-                    cost_price,
-                    selling_price,
-                    profit,
-                    sold_at
+                    cost_price, selling_price, profit, sold_at
                 FROM public.sales
                 WHERE
                     user_id = $1
                     AND quantity > COALESCE(returned_quantity, 0)
+                    AND sold_at >= NOW() - INTERVAL '7 days'
                 ORDER BY sold_at DESC, id DESC
                 LIMIT 300
                 `,
                 [req.user.userId]
             );
 
-            res.json({
-                sales: result.rows
-            });
-
+            res.json({ sales: result.rows });
         } catch (err) {
-
-            console.error(
-                'Sotuvlarni olish xatosi:',
-                err
-            );
-
-            res.status(500).json({
-                message: 'Serverda xatolik yuz berdi!'
-            });
+            console.error('Sotuvlarni olish xatosi:', err);
+            res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
         }
     }
 );
