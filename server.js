@@ -518,6 +518,12 @@ const ensureTables = async () => {
             ADD COLUMN IF NOT EXISTS supplier_phone TEXT;
         `);
 
+        // Ixtiyoriy sotilish narxi (faqat QR rasmida ko'rinadi)
+        await pool.query(`
+            ALTER TABLE public.products
+            ADD COLUMN IF NOT EXISTS selling_price NUMERIC DEFAULT NULL;
+        `);
+
         await pool.query(`
             CREATE UNIQUE INDEX IF NOT EXISTS
             idx_products_qr_token
@@ -1425,7 +1431,8 @@ app.post(
             payment_type,
             supplier,
             paid_amount,
-            supplier_phone
+            supplier_phone,
+            selling_price
         } = req.body || {};
 
         if (
@@ -1518,6 +1525,17 @@ app.post(
                 return res.status(400).json({
                     message:
                         "To'langan summa noto'g'ri!"
+                });
+            }
+        }
+
+        // Ixtiyoriy sotilish narxi (QR uchun)
+        let parsedSellingPrice = null;
+        if (selling_price !== undefined && selling_price !== null && selling_price !== '') {
+            parsedSellingPrice = Number(selling_price);
+            if (!Number.isFinite(parsedSellingPrice) || parsedSellingPrice < 0) {
+                return res.status(400).json({
+                    message: "Sotilish narxi noto'g'ri!"
                 });
             }
         }
@@ -1621,7 +1639,8 @@ app.post(
                             payment_type,
                             supplier,
                             paid_amount,
-                            supplier_phone
+                            supplier_phone,
+                            selling_price
                         )
                         VALUES
                         (
@@ -1638,7 +1657,8 @@ app.post(
                             $10,
                             $11,
                             $12,
-                            $13
+                            $13,
+                            $14
                         )
                         RETURNING *
                         `,
@@ -1655,7 +1675,8 @@ app.post(
                             cleanPaymentType,
                             cleanSupplier,
                             parsedPaidAmount,
-                            cleanSupplierPhone
+                            cleanSupplierPhone,
+                            parsedSellingPrice
                         ]
                     );
 
@@ -1708,7 +1729,8 @@ app.post(
                                 payment_type,
                                 supplier,
                                 paid_amount,
-                                supplier_phone
+                                supplier_phone,
+                                selling_price
                             )
                             VALUES
                             (
@@ -1725,7 +1747,8 @@ app.post(
                                 $10,
                                 $11,
                                 $12,
-                                $13
+                                $13,
+                                $14
                             )
                             RETURNING *
                             `,
@@ -1742,7 +1765,8 @@ app.post(
                                 cleanPaymentType,
                                 cleanSupplier,
                                 parsedPaidAmount,
-                                cleanSupplierPhone
+                                cleanSupplierPhone,
+                                parsedSellingPrice
                             ]
                         );
 
@@ -1917,7 +1941,8 @@ app.get(
                         payment_type,
                         supplier,
                         paid_amount,
-                        supplier_phone
+                        supplier_phone,
+                        selling_price
                     FROM public.products
                     WHERE user_id = $1
                     ORDER BY
