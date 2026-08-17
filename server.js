@@ -325,7 +325,8 @@ const sendReportToAllUsers = async (type = 'daily') => {
 const queueTelegramNotification = async (
     clientOrPool,
     siteLogin,
-    message
+    message,
+    photoUrl = null
 ) => {
     if (!siteLogin) {
         console.warn(
@@ -340,14 +341,16 @@ const queueTelegramNotification = async (
         (
             site_login,
             message,
-            is_sent
+            is_sent,
+            photo_url
         )
         VALUES
-        ($1, $2, false)
+        ($1, $2, false, $3)
         `,
         [
             siteLogin,
-            message
+            message,
+            photoUrl || null
         ]
     );
 };
@@ -413,6 +416,7 @@ const ensureTables = async () => {
         await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS paid_amount NUMERIC DEFAULT 0;`);
         await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS supplier_phone TEXT;`);
         await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS selling_price NUMERIC DEFAULT NULL;`);
+        await pool.query(`ALTER TABLE public.products ADD COLUMN IF NOT EXISTS image_url TEXT;`);
 
         await pool.query(`
             CREATE UNIQUE INDEX IF NOT EXISTS
@@ -567,6 +571,11 @@ const ensureTables = async () => {
         `);
 
         await pool.query(`
+            ALTER TABLE public.notifications
+            ADD COLUMN IF NOT EXISTS photo_url TEXT;
+        `);
+
+        await pool.query(`
             CREATE INDEX IF NOT EXISTS
             idx_notifications_unsent
             ON public.notifications(is_sent, created_at);
@@ -600,8 +609,13 @@ const ensureTables = async () => {
                 supplier_phone TEXT,
                 selling_price NUMERIC,
                 qr_token UUID,
+                image_url TEXT,
                 deleted_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
+        `);
+        await pool.query(`
+            ALTER TABLE public.deleted_products
+            ADD COLUMN IF NOT EXISTS image_url TEXT;
         `);
         await pool.query(`
             CREATE INDEX IF NOT EXISTS idx_deleted_products_user_id
@@ -1150,7 +1164,8 @@ app.post(
             supplier,
             paid_amount,
             supplier_phone,
-            selling_price
+            selling_price,
+            image_url
         } = req.body || {};
 
         if (
@@ -1245,6 +1260,18 @@ app.post(
             }
         }
 
+        // Rasm (ixtiyoriy) — data:image/... yoki https URL
+        let cleanImageUrl = null;
+        if (typeof image_url === 'string' && image_url.trim()) {
+            cleanImageUrl = image_url.trim();
+            // ~700KB limit (base64)
+            if (cleanImageUrl.length > 900000) {
+                return res.status(400).json({
+                    message: "Rasm juda katta! Iltimos, kichikroq rasm yuklang."
+                });
+            }
+        }
+
         const userId = req.user.userId;
 
         let sizeList = [];
@@ -1320,12 +1347,13 @@ app.post(
                         supplier,
                         paid_amount,
                         supplier_phone,
-                        selling_price
+                        selling_price,
+                        image_url
                     )
                     VALUES
                     (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(),
-                        $10, $11, $12, $13, $14
+                        $10, $11, $12, $13, $14, $15
                     )
                     RETURNING *
                     `,
@@ -1343,7 +1371,8 @@ app.post(
                         cleanSupplier,
                         parsedPaidAmount,
                         cleanSupplierPhone,
-                        parsedSellingPrice
+                        parsedSellingPrice,
+                        cleanImageUrl
                     ]
                 );
                 insertedRows.push(
@@ -1387,12 +1416,13 @@ app.post(
                             supplier,
                             paid_amount,
                             supplier_phone,
-                            selling_price
+                            selling_price,
+                            image_url
                         )
                         VALUES
                         (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(),
-                            $10, $11, $12, $13, $14
+                            $10, $11, $12, $13, $14, $15
                         )
                         RETURNING *
                         `,
@@ -1410,7 +1440,8 @@ app.post(
                             cleanSupplier,
                             parsedPaidAmount,
                             cleanSupplierPhone,
-                            parsedSellingPrice
+                            parsedSellingPrice,
+                            cleanImageUrl
                         ]
                     );
                     insertedRows.push(
@@ -1492,7 +1523,8 @@ app.post(
                 await queueTelegramNotification(
                     client,
                     siteLogin,
-                    message
+                    message,
+                    cleanImageUrl
                 );
             }
 
@@ -1561,7 +1593,8 @@ app.get(
                     supplier,
                     paid_amount,
                     supplier_phone,
-                    selling_price
+                    selling_price,
+                    image_url
                 FROM public.products
                 WHERE user_id = $1
                 ORDER BY
@@ -2360,6 +2393,7 @@ app.post(
             let totalProfit = 0;
             let firstProductName = null;
             let firstLocalId = null;
+            let firstImageUrl = null;
             const soldLines = [];
             let anyFullySoldOut = false;
             const affectedLocalIds = new Set();
@@ -2449,6 +2483,7 @@ app.post(
                 if (!firstProductName) {
                     firstProductName = product.name;
                     firstLocalId = product.local_id;
+                    firstImageUrl = product.image_url || null;
                 }
 
                 soldLines.push(
@@ -2516,7 +2551,7 @@ app.post(
 
             sellMessage += await getTodayReport(client, userId);
 
-            await queueTelegramNotification(client, siteLogin, sellMessage);
+            await queueTelegramNotification(client, siteLogin, sellMessage, firstImageUrl);
 
             await client.query('COMMIT');
 
@@ -2589,6 +2624,7 @@ app.post(
             let totalProfit = 0;
             let firstProductName = null;
             let firstLocalId = null;
+            let firstImageUrl = null;
             const soldLines = [];
             let anyFullySoldOut = false;
             const affectedLocalIds = new Set();
@@ -2686,6 +2722,7 @@ app.post(
                 if (!firstProductName) {
                     firstProductName = product.name;
                     firstLocalId = product.local_id;
+                    firstImageUrl = product.image_url || null;
                 }
 
                 soldLines.push(
@@ -2748,7 +2785,7 @@ app.post(
 
             sellMessage += await getTodayReport(client, userId);
 
-            await queueTelegramNotification(client, siteLogin, sellMessage);
+            await queueTelegramNotification(client, siteLogin, sellMessage, firstImageUrl);
 
             await client.query('COMMIT');
 
@@ -2939,7 +2976,7 @@ app.post(
 
             message += await getTodayReport(client, userId);
 
-            await queueTelegramNotification(client, siteLogin, message);
+            await queueTelegramNotification(client, siteLogin, message, restoredProduct.image_url || null);
 
             await client.query('COMMIT');
 
@@ -3006,6 +3043,7 @@ app.post(
             let firstProductName = null;
             let firstCategory = null;
             let firstColor = null;
+            let firstImageUrl = null;
             const affectedLocalIds = new Set();
             const results = [];
 
@@ -3064,10 +3102,10 @@ app.post(
                         (
                             original_id, user_id, local_id, category, name, cost_price,
                             color, size, quantity, payment_type, supplier, paid_amount,
-                            supplier_phone, selling_price, qr_token, deleted_at
+                            supplier_phone, selling_price, qr_token, image_url, deleted_at
                         )
                         VALUES
-                        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
+                        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
                         `,
                         [
                             product.id,
@@ -3084,7 +3122,8 @@ app.post(
                             product.paid_amount || 0,
                             product.supplier_phone,
                             product.selling_price,
-                            product.qr_token
+                            product.qr_token,
+                            product.image_url || null
                         ]
                     );
                     await client.query(
@@ -3106,6 +3145,7 @@ app.post(
                     firstProductName = product.name;
                     firstCategory = product.category;
                     firstColor = product.color;
+                    firstImageUrl = product.image_url || null;
                 }
 
                 totalRemoved += removeQty;
@@ -3177,7 +3217,7 @@ app.post(
 
             deleteMessage += await getTodayReport(client, userId);
 
-            await queueTelegramNotification(client, siteLogin, deleteMessage);
+            await queueTelegramNotification(client, siteLogin, deleteMessage, firstImageUrl);
 
             await client.query('COMMIT');
 
@@ -3696,7 +3736,7 @@ app.post(
 
             message += await getTodayReport(client, product.user_id);
 
-            await queueTelegramNotification(client, siteLogin, message);
+            await queueTelegramNotification(client, siteLogin, message, product.image_url || null);
 
             await client.query('COMMIT');
 
@@ -3797,7 +3837,7 @@ app.post(
 
             const message = messageBase + await getTodayReport(client, product.user_id);
 
-            await queueTelegramNotification(client, siteLogin, message);
+            await queueTelegramNotification(client, siteLogin, message, product.image_url || null);
 
             await client.query('COMMIT');
 
@@ -3970,7 +4010,7 @@ app.post(
 
             message += await getTodayReport(client, product.user_id);
 
-            await queueTelegramNotification(client, siteLogin, message);
+            await queueTelegramNotification(client, siteLogin, message, product.image_url || null);
 
             await client.query('COMMIT');
 
@@ -4319,10 +4359,10 @@ app.post('/api/products/restore', authenticateToken, async (req, res) => {
             (
                 user_id, local_id, category, name, cost_price, color, size,
                 quantity, qr_token, qr_created_at, payment_type, supplier,
-                paid_amount, supplier_phone, selling_price
+                paid_amount, supplier_phone, selling_price, image_url
             )
             VALUES
-            ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11,$12,$13,$14)
+            ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11,$12,$13,$14,$15)
             RETURNING *
             `,
             [
@@ -4339,7 +4379,8 @@ app.post('/api/products/restore', authenticateToken, async (req, res) => {
                 row.supplier,
                 row.paid_amount || 0,
                 row.supplier_phone,
-                row.selling_price
+                row.selling_price,
+                row.image_url || null
             ]
         );
 
@@ -4363,7 +4404,7 @@ app.post('/api/products/restore', authenticateToken, async (req, res) => {
                 `🔢 <b>Soni:</b> ${row.quantity} dona\n` +
                 `━━━━━━━━━━━━━━━━━━━━`;
             msg += await getTodayReport(client, userId);
-            await queueTelegramNotification(client, siteLogin, msg);
+            await queueTelegramNotification(client, siteLogin, msg, row.image_url || null);
         }
 
         await client.query('COMMIT');
