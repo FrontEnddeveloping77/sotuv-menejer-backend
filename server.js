@@ -23,7 +23,9 @@ const app = express();
 // ====================================================
 
 app.use(cors());
-app.use(express.json());
+// Rasm (base64) uchun body limit oshirilgan
+app.use(express.json({ limit: '3mb' }));
+app.use(express.urlencoded({ extended: true, limit: '3mb' }));
 
 // ====================================================
 // JADVALLARNI TAYYORLASH — "GATE" MIDDLEWARE
@@ -319,8 +321,98 @@ const sendReportToAllUsers = async (type = 'daily') => {
 };
 
 // ====================================================
-// TELEGRAM NOTIFICATION QUEUE
+// TELEGRAM NOTIFICATION QUEUE + TO'G'RIDAN-TO'G'RI YUBORISH
 // ====================================================
+
+const TELEGRAM_BOT_TOKEN =
+    process.env.TELEGRAM_BOT_TOKEN ||
+    process.env.BOT_TOKEN ||
+    process.env.TG_BOT_TOKEN ||
+    '';
+
+const telegramApi = async (method, formData) => {
+    if (!TELEGRAM_BOT_TOKEN) {
+        throw new Error('TELEGRAM_BOT_TOKEN / BOT_TOKEN env topilmadi');
+    }
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
+    const res = await fetch(url, { method: 'POST', body: formData });
+    const data = await res.json().catch(() => ({}));
+    if (!data.ok) {
+        throw new Error(data.description || `Telegram API xato: ${method}`);
+    }
+    return data;
+};
+
+/** data:image/...;base64,XXXX → Buffer */
+const dataUrlToBuffer = (dataUrl) => {
+    if (!dataUrl || typeof dataUrl !== 'string') return null;
+    if (!dataUrl.startsWith('data:image')) return null;
+    const parts = dataUrl.split(',');
+    if (parts.length < 2) return null;
+    return Buffer.from(parts[1], 'base64');
+};
+
+const sendTelegramNow = async (chatId, message, photoUrl = null) => {
+    if (!chatId) throw new Error('chat_id yo\'q');
+    const text = String(message || '');
+    const hasPhoto = !!(photoUrl && String(photoUrl).trim());
+
+    if (hasPhoto) {
+        const form = new FormData();
+        form.append('chat_id', String(chatId));
+        form.append('parse_mode', 'HTML');
+
+        const buf = dataUrlToBuffer(photoUrl);
+        if (buf) {
+            // Node 18+ FormData + Blob
+            const blob = new Blob([buf], { type: 'image/jpeg' });
+            form.append('photo', blob, 'product.jpg');
+        } else if (String(photoUrl).startsWith('http')) {
+            form.append('photo', String(photoUrl));
+        } else {
+            // noma'lum format — faqat matn
+            const f2 = new FormData();
+            f2.append('chat_id', String(chatId));
+            f2.append('text', text);
+            f2.append('parse_mode', 'HTML');
+            await telegramApi('sendMessage', f2);
+            return;
+        }
+
+        // Caption max 1024
+        if (text.length <= 1024) {
+            form.append('caption', text);
+            await telegramApi('sendPhoto', form);
+        } else {
+            form.append('caption', text.slice(0, 1024));
+            await telegramApi('sendPhoto', form);
+            const f2 = new FormData();
+            f2.append('chat_id', String(chatId));
+            f2.append('text', text.slice(1024));
+            f2.append('parse_mode', 'HTML');
+            await telegramApi('sendMessage', f2);
+        }
+        return;
+    }
+
+    // Rasm yo'q — oddiy matn (4096 limit)
+    if (text.length <= 4096) {
+        const form = new FormData();
+        form.append('chat_id', String(chatId));
+        form.append('text', text);
+        form.append('parse_mode', 'HTML');
+        await telegramApi('sendMessage', form);
+    } else {
+        // bo'lib yuborish
+        for (let i = 0; i < text.length; i += 4096) {
+            const form = new FormData();
+            form.append('chat_id', String(chatId));
+            form.append('text', text.slice(i, i + 4096));
+            form.append('parse_mode', 'HTML');
+            await telegramApi('sendMessage', form);
+        }
+    }
+};
 
 const queueTelegramNotification = async (
     clientOrPool,
@@ -329,30 +421,89 @@ const queueTelegramNotification = async (
     photoUrl = null
 ) => {
     if (!siteLogin) {
-        console.warn(
-            'Telegram notification queue: site_login topilmadi.'
-        );
+        console.warn('Telegram notification queue: site_login topilmadi.');
         return;
     }
 
-    await clientOrPool.query(
-        `
-        INSERT INTO public.notifications
-        (
-            site_login,
-            message,
-            is_sent,
-            photo_url
-        )
-        VALUES
-        ($1, $2, false, $3)
-        `,
-        [
-            siteLogin,
-            message,
-            photoUrl || null
-        ]
+    const hasPhoto = !!(photoUrl && String(photoUrl).trim());
+
+    // 1) Navbatga yozish (backup)
+    let inserted = false;
+    try {
+        await clientOrPool.query(
+            `
+            INSERT INTO public.notifications
+            (
+                site_login,
+                message,
+                is_sent,
+                photo_url
+            )
+            VALUES
+            ($1, $2, false, $3)
+            `,
+            [
+                siteLogin,
+                message,
+                hasPhoto ? photoUrl : null
+            ]
+        );
+        inserted = true;
+    } catch (err) {
+        console.error('[Telegram queue] INSERT xato:', err.message);
+    }
+
+    console.log(
+        `[Telegram queue] site=${siteLogin} photo=${hasPhoto ? 'YES (' + Math.round(String(photoUrl).length / 1024) + 'KB)' : 'NO'}`
     );
+
+    // 2) To'g'ridan-to'g'ri Telegramga yuborish (rasm ishlashi uchun)
+    if (!TELEGRAM_BOT_TOKEN) {
+        console.warn('[Telegram] BOT_TOKEN yo\'q — faqat navbatga yozildi. Env: TELEGRAM_BOT_TOKEN yoki BOT_TOKEN');
+        return;
+    }
+
+    try {
+        const u = await clientOrPool.query(
+            `
+            SELECT linked_group_chat_id
+            FROM public.users
+            WHERE site_login = $1
+            LIMIT 1
+            `,
+            [siteLogin]
+        );
+        const chatId = u.rows[0]?.linked_group_chat_id;
+        if (!chatId) {
+            console.warn(`[Telegram] ${siteLogin} uchun linked_group_chat_id topilmadi`);
+            return;
+        }
+
+        await sendTelegramNow(chatId, message, photoUrl);
+        console.log(`[Telegram] YUBORILDI chat=${chatId} photo=${hasPhoto}`);
+
+        // Muvaffaqiyatli yuborilsa — is_sent = true
+        if (inserted) {
+            try {
+                await clientOrPool.query(
+                    `
+                    UPDATE public.notifications
+                    SET is_sent = true
+                    WHERE id = (
+                        SELECT id FROM public.notifications
+                        WHERE site_login = $1 AND is_sent = false
+                        ORDER BY id DESC
+                        LIMIT 1
+                    )
+                    `,
+                    [siteLogin]
+                );
+            } catch (e) { /* ignore */ }
+        }
+    } catch (err) {
+        console.error('[Telegram] Yuborish xatosi:', err.message);
+        // Navbatda qoladi — bot keyin yuborishi mumkin
+    }
 };
 
 // ====================================================
