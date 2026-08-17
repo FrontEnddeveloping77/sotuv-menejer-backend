@@ -1548,96 +1548,56 @@ app.get(
 );
 
 // ====================================================
-// QARZLAR RO'YXATI
+// QARZLAR RO'YXATI (Tovar berganlar — to'g'ri hisob)
 // ====================================================
+app.get('/api/debts', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
 
-app.get(
-    '/api/debts',
-    authenticateToken,
-    async (req, res) => {
-        try {
-            const userId = req.user.userId;
+        const result = await pool.query(
+            `
+            SELECT
+                COALESCE(NULLIF(TRIM(supplier), ''), 'Noma''lum') AS supplier,
+                MAX(NULLIF(TRIM(supplier_phone), '')) AS supplier_phone,
+                SUM(cost_price * quantity) AS total_cost,
+                MAX(COALESCE(paid_amount, 0)) AS total_paid,
+                GREATEST(
+                    SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
+                    0
+                ) AS debt,
+                COUNT(DISTINCT local_id) AS products_count,
+                array_agg(DISTINCT category) FILTER (WHERE category IS NOT NULL AND TRIM(category) <> '') AS categories
+            FROM public.products
+            WHERE user_id = $1
+              AND payment_type = 'credit'
+              AND supplier IS NOT NULL
+              AND TRIM(supplier) <> ''
+            GROUP BY COALESCE(NULLIF(TRIM(supplier), ''), 'Noma''lum')
+            HAVING GREATEST(
+                SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
+                0
+            ) > 0
+            ORDER BY debt DESC
+            `,
+            [userId]
+        );
 
-            const result = await pool.query(
-                `
-                SELECT
-                    local_id,
-                    MAX(name) AS name,
-                    MAX(category) AS category,
-                    MAX(color) AS color,
-                    MAX(supplier) AS supplier,
-                    MAX(supplier_phone) AS supplier_phone,
-                    SUM(quantity) AS total_quantity,
-                    SUM(cost_price * quantity) AS total_cost,
-                    MAX(COALESCE(paid_amount, 0)) AS total_paid,
-                    GREATEST(
-                        SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
-                        0
-                    ) AS debt
-                FROM public.products
-                WHERE user_id = $1
-                  AND payment_type = 'credit'
-                GROUP BY local_id
-                HAVING SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)) > 0
-                ORDER BY supplier, local_id
-                `,
-                [userId]
-            );
+        const debts = result.rows.map((row) => ({
+            supplier: row.supplier,
+            supplier_phone: row.supplier_phone || null,
+            total_cost: Number(row.total_cost) || 0,
+            total_paid: Number(row.total_paid) || 0,
+            debt: Number(row.debt) || 0,
+            products_count: Number(row.products_count) || 0,
+            categories: row.categories || []
+        }));
 
-            const grouped = {};
-
-            for (const row of result.rows) {
-                const supplierName = (row.supplier || "Noma'lum").trim();
-                const phone = (row.supplier_phone || '').trim();
-                const key = supplierName.toLowerCase() + '|' + phone;
-
-                if (!grouped[key]) {
-                    grouped[key] = {
-                        supplier: supplierName,
-                        supplier_phone: phone || null,
-                        total_debt: 0,
-                        total_cost: 0,
-                        total_paid: 0,
-                        products_count: 0,
-                        products: []
-                    };
-                }
-
-                const debt = Number(row.debt) || 0;
-                const cost = Number(row.total_cost) || 0;
-                const paid = Number(row.total_paid) || 0;
-
-                grouped[key].total_debt += debt;
-                grouped[key].total_cost += cost;
-                grouped[key].total_paid += paid;
-                grouped[key].products_count += 1;
-                grouped[key].products.push({
-                    local_id: row.local_id,
-                    name: row.name,
-                    category: row.category || 'Umumiy',
-                    color: row.color || null,
-                    quantity: Number(row.total_quantity) || 0,
-                    total_cost: cost,
-                    total_paid: paid,
-                    debt: debt
-                });
-            }
-
-            const debts = Object.values(grouped).sort(
-                (a, b) => b.total_debt - a.total_debt
-            );
-
-            res.json({
-                debts
-            });
-        } catch (err) {
-            console.error('Qarzlarni olish xatosi:', err);
-            res.status(500).json({
-                message: 'Serverda xatolik yuz berdi!'
-            });
-        }
+        res.json({ debts });
+    } catch (err) {
+        console.error('Qarzlarni olish xatosi:', err);
+        res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
     }
-);
+});
 
 // ====================================================
 // YANGI: OXIRGI TO'LOVLAR (bekor qilish uchun)
@@ -4019,7 +3979,7 @@ app.post('/api/customer-debts/pay', authenticateToken, async (req, res) => {
             remaining_debt: remainingDebt
         });
     } catch (err) {
-        try { await client.query('ROLLBACK'); } catch (e) {}
+        try { await client.query('ROLLBACK'); } catch (e) { }
         console.error('Mijoz qarzini to\'lashda xatolik:', err);
         res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
     } finally {
