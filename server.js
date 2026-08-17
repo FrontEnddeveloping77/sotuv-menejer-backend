@@ -676,6 +676,7 @@ const ensureTables = async () => {
         await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS customer_phone TEXT;`);
         await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS is_credit BOOLEAN NOT NULL DEFAULT false;`);
         await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS paid_now NUMERIC DEFAULT 0;`);
+        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS image_url TEXT;`);
 
         await pool.query(`
             CREATE INDEX IF NOT EXISTS
@@ -2844,26 +2845,15 @@ app.post(
                     (
                         user_id, product_id, title, quantity, cost_price, selling_price, profit,
                         local_id, category, color, size,
-                        customer_name, customer_phone, is_credit, paid_now
+                        customer_name, customer_phone, is_credit, paid_now, image_url
                     )
                     VALUES
-                    ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true,$14)
+                    ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true,$14,$15)
                     `,
                     [
-                        userId,
-                        product.id,
-                        product.name,
-                        qty,
-                        cost,
-                        price,
-                        profit,
-                        product.local_id,
-                        product.category,
-                        product.color,
-                        product.size,
-                        cleanCustomerName,
-                        cleanCustomerPhone,
-                        parsedPaidNow
+                        userId, product.id, product.name, qty, cost, price, profit,
+                        product.local_id, product.category, product.color, product.size,
+                        cleanCustomerName, cleanCustomerPhone, parsedPaidNow, product.image_url || null
                     ]
                 );
 
@@ -3104,20 +3094,13 @@ app.post(
                 const insertResult = await client.query(
                     `
                     INSERT INTO public.products
-                    (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at, payment_type, supplier, paid_amount)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),'cash',NULL,0)
+                    (user_id, local_id, category, name, cost_price, color, size, quantity, qr_token, qr_created_at, payment_type, supplier, paid_amount, image_url)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),'cash',NULL,0,$10)
                     RETURNING *
                     `,
                     [
-                        userId,
-                        sale.local_id,
-                        sale.category,
-                        sale.title,
-                        sale.cost_price,
-                        sale.color,
-                        sale.size,
-                        sale.quantity,
-                        randomUUID()
+                        userId, sale.local_id, sale.category, sale.title, sale.cost_price,
+                        sale.color, sale.size, sale.quantity, randomUUID(), sale.image_url || null
                     ]
                 );
                 restoredProduct = insertResult.rows[0];
@@ -3848,22 +3831,13 @@ app.post(
 
             await client.query(
                 `
-                INSERT INTO public.sales
-                (user_id, product_id, title, quantity, cost_price, selling_price, profit, local_id, category, color, size)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-                `,
+    INSERT INTO public.sales
+    (user_id, product_id, title, quantity, cost_price, selling_price, profit, local_id, category, color, size, image_url)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    `,
                 [
-                    product.user_id,
-                    product.id,
-                    product.name,
-                    qty,
-                    cost,
-                    sellingPrice,
-                    profit,
-                    product.local_id,
-                    product.category,
-                    product.color,
-                    product.size
+                    userId, product.id, product.name, qty, cost, price, profit,
+                    product.local_id, product.category, product.color, product.size, product.image_url || null
                 ]
             );
 
@@ -4611,6 +4585,227 @@ app.use((err, req, res, next) => {
         message: "Serverda kutilmagan xatolik yuz berdi!"
     });
 });
+
+// ====================================================
+// TOVARNI TAHRIRLASH
+// ====================================================
+
+app.put(
+    '/api/products/:local_id',
+    authenticateToken,
+    async (req, res) => {
+        const userId = req.user.userId;
+        const localId = Number(req.params.local_id);
+
+        if (!Number.isInteger(localId) || localId <= 0) {
+            return res.status(400).json({
+                message: "Tovar ID noto'g'ri!"
+            });
+        }
+
+        const {
+            category,
+            name,
+            cost_price,
+            color,
+            quantity,
+            sizes
+        } = req.body || {};
+
+        if (!name || cost_price === undefined) {
+            return res.status(400).json({
+                message: "Tovar nomi va kelgan narxi kiritilishi shart!"
+            });
+        }
+
+        if (!category || !String(category).trim()) {
+            return res.status(400).json({
+                message: "Kategoriya kiritilishi shart!"
+            });
+        }
+
+        const parsedCostPrice = Number(cost_price);
+        if (!Number.isFinite(parsedCostPrice) || parsedCostPrice < 0) {
+            return res.status(400).json({
+                message: "Tannarx noto'g'ri!"
+            });
+        }
+
+        const totalQty = parseInt(quantity, 10) || 0;
+        if (totalQty <= 0) {
+            return res.status(400).json({
+                message: "Soni 0 dan katta bo'lishi kerak!"
+            });
+        }
+
+        let sizeList = [];
+        if (sizes && typeof sizes === 'string') {
+            const seen = new Set();
+            sizes.split(',').forEach((item) => {
+                const clean = item.trim();
+                if (clean && !seen.has(clean.toLowerCase())) {
+                    seen.add(clean.toLowerCase());
+                    sizeList.push(clean);
+                }
+            });
+        }
+
+        const client = await pool.connect();
+
+        try {
+            await client.query('BEGIN');
+
+            // Shu local_id ga tegishli BARCHA variant qatorlarini bloklab olamiz
+            const existingRows = await client.query(
+                `
+                SELECT *
+                FROM public.products
+                WHERE user_id = $1 AND local_id = $2
+                ORDER BY id ASC
+                FOR UPDATE
+                `,
+                [userId, localId]
+            );
+
+            if (!existingRows.rows.length) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({
+                    message: "Tovar topilmadi!"
+                });
+            }
+
+            const firstRow = existingRows.rows[0];
+
+            if (daysSince(firstRow.created_at) > PRODUCT_EDIT_WINDOW_DAYS) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({
+                    message: `Bu tovar qo'shilganiga ${PRODUCT_EDIT_WINDOW_DAYS} kundan ko'p vaqt o'tgan, tahrirlab bo'lmaydi!`
+                });
+            }
+
+            // Naqd/nasiya, ta'minotchi va h.k. — o'zgarmasdan saqlab qolinadi
+            const paymentType = firstRow.payment_type || 'cash';
+            const supplier = firstRow.supplier || null;
+            const paidAmount = firstRow.paid_amount || 0;
+            const supplierPhone = firstRow.supplier_phone || null;
+            const sellingPrice = firstRow.selling_price ?? null;
+            const imageUrl = firstRow.image_url || null;
+            const createdAt = firstRow.created_at;
+
+            const cleanCategory = String(category).trim();
+            const cleanName = String(name).trim();
+            const cleanColor = color ? String(color).trim() : null;
+
+            // Eski variantlarni o'chirib, yangi son/razmer bo'yicha qayta yaratamiz
+            await client.query(
+                `DELETE FROM public.products WHERE user_id = $1 AND local_id = $2`,
+                [userId, localId]
+            );
+
+            const insertedRows = [];
+
+            if (sizeList.length === 0) {
+                const result = await client.query(
+                    `
+                    INSERT INTO public.products
+                    (
+                        user_id, local_id, category, name, cost_price, color, size, quantity,
+                        qr_token, qr_created_at, created_at,
+                        payment_type, supplier, paid_amount, supplier_phone, selling_price, image_url
+                    )
+                    VALUES
+                    ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11,$12,$13,$14,$15,$16)
+                    RETURNING *
+                    `,
+                    [
+                        userId, localId, cleanCategory, cleanName, parsedCostPrice, cleanColor, null, totalQty,
+                        randomUUID(), createdAt,
+                        paymentType, supplier, paidAmount, supplierPhone, sellingPrice, imageUrl
+                    ]
+                );
+                insertedRows.push(result.rows[0]);
+            } else {
+                const count = sizeList.length;
+                const base = Math.floor(totalQty / count);
+                const remainder = totalQty % count;
+
+                for (let i = 0; i < count; i++) {
+                    const sizeQty = base + (i < remainder ? 1 : 0);
+                    const result = await client.query(
+                        `
+                        INSERT INTO public.products
+                        (
+                            user_id, local_id, category, name, cost_price, color, size, quantity,
+                            qr_token, qr_created_at, created_at,
+                            payment_type, supplier, paid_amount, supplier_phone, selling_price, image_url
+                        )
+                        VALUES
+                        ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11,$12,$13,$14,$15,$16)
+                        RETURNING *
+                        `,
+                        [
+                            userId, localId, cleanCategory, cleanName, parsedCostPrice, cleanColor, sizeList[i], sizeQty,
+                            randomUUID(), createdAt,
+                            paymentType, supplier, paidAmount, supplierPhone, sellingPrice, imageUrl
+                        ]
+                    );
+                    insertedRows.push(result.rows[0]);
+                }
+            }
+
+            // ---- Telegramga xabar ----
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1 LIMIT 1`,
+                [userId]
+            );
+
+            if (userResult.rows.length) {
+                const siteLogin = userResult.rows[0].site_login;
+
+                let sizesBlock = '';
+                if (sizeList.length) {
+                    const lines = insertedRows
+                        .map((row) => `   • ${telegramEscape(row.size)}: ${row.quantity} dona`)
+                        .join('\n');
+                    sizesBlock = `\n📏 <b>Razmerlar bo'yicha taqsimot:</b>\n${lines}`;
+                }
+
+                let message =
+                    `✏️ <b>TOVAR TAHRIRLANDI (#${localId})</b>\n` +
+                    `━━━━━━━━━━━━━━━━━━━━\n` +
+                    `📦 <b>Nomi:</b> ${telegramEscape(cleanName)}\n` +
+                    `🎨 <b>Rangi:</b> ${telegramEscape(cleanColor || "Yo'q")}\n` +
+                    `🗂 <b>Kategoriyasi:</b> ${telegramEscape(cleanCategory)}\n` +
+                    `💰 <b>Narxi:</b> ${formatSum(parsedCostPrice)} so'm\n` +
+                    `📊 <b>Yangi umumiy miqdori:</b> ${totalQty} dona` +
+                    sizesBlock +
+                    `\n━━━━━━━━━━━━━━━━━━━━\n` +
+                    `✅ Tovar ma'lumotlari yangilandi!`;
+
+                message += await getTodayReport(client, userId);
+
+                await queueTelegramNotification(client, siteLogin, message, imageUrl);
+            }
+
+            await client.query('COMMIT');
+
+            res.json({
+                message: "Tovar muvaffaqiyatli tahrirlandi!",
+                products: insertedRows
+            });
+        } catch (err) {
+            try {
+                await client.query('ROLLBACK');
+            } catch (e) { }
+            console.error("Tovarni tahrirlash xatosi:", err);
+            res.status(500).json({
+                message: "Serverda xatolik yuz berdi!"
+            });
+        } finally {
+            client.release();
+        }
+    }
+);
 
 // ====================================================
 // SERVER ISHGA TUSHIRISH
