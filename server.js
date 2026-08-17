@@ -3,6 +3,9 @@
 // - POST /api/dashboard/sell-credit  (nasiyaga sotish)
 // - GET  /api/debts/recent-payments  (oxirgi to'lovlar)
 // - POST /api/debts/undo-or-edit     (to'lovni bekor qilish / tahrirlash)
+// - POST /api/qr/:token/sell-credit  (QR orqali nasiyaga sotish)
+// - GET  /api/products/deleted       (o'chirilgan tovarlar)
+// - POST /api/products/restore       (omborga qaytarish)
 
 require('dotenv').config();
 
@@ -97,6 +100,8 @@ const PRODUCT_EDIT_WINDOW_DAYS = 7;
 const SALE_RETURN_WINDOW_DAYS = 7;
 const EXPENSE_EDIT_WINDOW_DAYS = 30;
 const DEBT_PAYMENT_UNDO_WINDOW_DAYS = 30;
+const DELETED_RESTORE_WINDOW_DAYS = 7;
+
 
 const daysSince = (dateValue) => {
     if (!dateValue) return Infinity;
@@ -573,8 +578,48 @@ const ensureTables = async () => {
         );
     }
 
+    // ------------------------------------------------
+    // DELETED_PRODUCTS (o'chirilgan tovarlar arxivi — 7 kun ichida qaytarish)
+    // ------------------------------------------------
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS public.deleted_products (
+                id SERIAL PRIMARY KEY,
+                original_id INTEGER,
+                user_id INTEGER NOT NULL,
+                local_id INTEGER,
+                category TEXT,
+                name TEXT NOT NULL,
+                cost_price NUMERIC NOT NULL DEFAULT 0,
+                color TEXT,
+                size TEXT,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                payment_type TEXT DEFAULT 'cash',
+                supplier TEXT,
+                paid_amount NUMERIC DEFAULT 0,
+                supplier_phone TEXT,
+                selling_price NUMERIC,
+                qr_token UUID,
+                deleted_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_deleted_products_user_id
+            ON public.deleted_products(user_id);
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_deleted_products_deleted_at
+            ON public.deleted_products(deleted_at);
+        `);
+    } catch (err) {
+        console.error(
+            "⚠️ DELETED_PRODUCTS jadvalini yaratishda xatolik:",
+            err.message
+        );
+    }
+
     console.log(
-        '✅ Jadvallar tekshirildi/tayyorlandi (products, sales, expenses, notifications).'
+        '✅ Jadvallar tekshirildi/tayyorlandi (products, sales, expenses, notifications, deleted_products).'
     );
 };
 
@@ -3007,6 +3052,36 @@ app.post(
                 const fullyRemoved = newQty === 0;
 
                 if (fullyRemoved) {
+                    // Arxivga saqlash (7 kun ichida qaytarish uchun)
+                    await client.query(
+                        `
+                        INSERT INTO public.deleted_products
+                        (
+                            original_id, user_id, local_id, category, name, cost_price,
+                            color, size, quantity, payment_type, supplier, paid_amount,
+                            supplier_phone, selling_price, qr_token, deleted_at
+                        )
+                        VALUES
+                        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
+                        `,
+                        [
+                            product.id,
+                            product.user_id,
+                            product.local_id,
+                            product.category,
+                            product.name,
+                            product.cost_price,
+                            product.color,
+                            product.size,
+                            removeQty,
+                            product.payment_type || 'cash',
+                            product.supplier,
+                            product.paid_amount || 0,
+                            product.supplier_phone,
+                            product.selling_price,
+                            product.qr_token
+                        ]
+                    );
                     await client.query(
                         `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
                         [product.id, userId]
@@ -4171,6 +4246,131 @@ app.post('/api/customer-debts/pay', authenticateToken, async (req, res) => {
         try { await client.query('ROLLBACK'); } catch (e) { }
         console.error('Mijoz qarzini to\'lashda xatolik:', err);
         res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
+    } finally {
+        client.release();
+    }
+});
+
+// ====================================================
+// O'CHIRILGAN TOVARLAR (7 kun ichida qaytarish)
+// ====================================================
+app.get('/api/products/deleted', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+        const result = await pool.query(
+            `
+            SELECT *
+            FROM public.deleted_products
+            WHERE user_id = $1
+              AND deleted_at >= NOW() - ($2 || ' days')::interval
+            ORDER BY deleted_at DESC
+            `,
+            [userId, String(DELETED_RESTORE_WINDOW_DAYS)]
+        );
+        res.json({ products: result.rows });
+    } catch (err) {
+        console.error("O'chirilgan tovarlarni olish xatosi:", err);
+        res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
+    }
+});
+
+// ====================================================
+// TOVARNI OMBORGA QAYTARISH
+// ====================================================
+app.post('/api/products/restore', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const deletedId = Number(req.body?.deleted_id);
+
+    if (!Number.isInteger(deletedId) || deletedId <= 0) {
+        return res.status(400).json({ message: "ID noto'g'ri!" });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const delRes = await client.query(
+            `SELECT * FROM public.deleted_products WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+            [deletedId, userId]
+        );
+
+        if (!delRes.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ message: "O'chirilgan tovar topilmadi!" });
+        }
+
+        const row = delRes.rows[0];
+
+        if (daysSince(row.deleted_at) > DELETED_RESTORE_WINDOW_DAYS) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({
+                message: `Bu tovar ${DELETED_RESTORE_WINDOW_DAYS} kundan ko'p vaqt oldin o'chirilgan, qaytarib bo'lmaydi!`
+            });
+        }
+
+        const insertRes = await client.query(
+            `
+            INSERT INTO public.products
+            (
+                user_id, local_id, category, name, cost_price, color, size,
+                quantity, qr_token, qr_created_at, payment_type, supplier,
+                paid_amount, supplier_phone, selling_price
+            )
+            VALUES
+            ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11,$12,$13,$14)
+            RETURNING *
+            `,
+            [
+                userId,
+                row.local_id,
+                row.category,
+                row.name,
+                row.cost_price,
+                row.color,
+                row.size,
+                row.quantity,
+                row.qr_token || randomUUID(),
+                row.payment_type || 'cash',
+                row.supplier,
+                row.paid_amount || 0,
+                row.supplier_phone,
+                row.selling_price
+            ]
+        );
+
+        await client.query(
+            `DELETE FROM public.deleted_products WHERE id = $1`,
+            [deletedId]
+        );
+
+        const userRes = await client.query(
+            `SELECT site_login FROM public.users WHERE id = $1`,
+            [userId]
+        );
+        const siteLogin = userRes.rows[0]?.site_login || null;
+
+        if (siteLogin) {
+            let msg =
+                `↩️ <b>O'CHIRILGAN TOVAR QAYTARILDI</b>\n` +
+                `━━━━━━━━━━━━━━━━━━━━\n` +
+                `📦 <b>Nomi:</b> ${telegramEscape(row.name)}\n` +
+                `📏 <b>Razmer:</b> ${telegramEscape(row.size || 'Standart')}\n` +
+                `🔢 <b>Soni:</b> ${row.quantity} dona\n` +
+                `━━━━━━━━━━━━━━━━━━━━`;
+            msg += await getTodayReport(client, userId);
+            await queueTelegramNotification(client, siteLogin, msg);
+        }
+
+        await client.query('COMMIT');
+
+        res.json({
+            message: "Tovar muvaffaqiyatli omborga qaytarildi!",
+            product: insertRes.rows[0]
+        });
+    } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (e) { }
+        console.error("Tovarni qaytarishda xatolik:", err);
+        res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
     } finally {
         client.release();
     }
