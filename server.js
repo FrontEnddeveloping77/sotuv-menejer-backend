@@ -973,6 +973,18 @@ app.get(
                 [userId]
             );
 
+            // Mijoz qarzi (nasiyaga sotilganlardan)
+            const customerDebtStats = await pool.query(
+                `
+                SELECT COALESCE(SUM(quantity * selling_price - COALESCE(paid_now, 0)), 0) AS "totalCustomerDebt"
+                FROM public.sales
+                WHERE user_id = $1
+                  AND is_credit = true
+                  AND returned = false
+                `,
+                [userId]
+            );
+
             const getPeriodStats = async (
                 salesFilter,
                 expenseFilter
@@ -1043,6 +1055,7 @@ app.get(
                 totalStock: Number(productStats.rows[0].totalStock || 0),
                 totalStockValue: Number(productStats.rows[0].totalStockValue || 0),
                 totalDebt: Number(debtStats.rows[0].totalDebt || 0),
+                totalCustomerDebt: Number(customerDebtStats.rows[0].totalCustomerDebt || 0),
                 totalSold: total.sold,
                 totalRevenue: total.revenue,
                 totalProfit: total.profit,
@@ -3858,6 +3871,161 @@ app.get(
         }
     }
 );
+
+// ====================================================
+// MIJOZ QARZLARI RO'YXATI
+// ====================================================
+app.get('/api/customer-debts', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+
+        const result = await pool.query(`
+            SELECT
+                customer_name,
+                customer_phone,
+                SUM(quantity * selling_price) AS total_amount,
+                SUM(COALESCE(paid_now, 0)) AS total_paid,
+                GREATEST(SUM(quantity * selling_price) - SUM(COALESCE(paid_now, 0)), 0) AS debt,
+                COUNT(*) AS sales_count,
+                json_agg(
+                    json_build_object(
+                        'id', id,
+                        'title', title,
+                        'size', size,
+                        'quantity', quantity,
+                        'selling_price', selling_price,
+                        'paid_now', paid_now,
+                        'sold_at', sold_at
+                    ) ORDER BY sold_at DESC
+                ) AS sales
+            FROM public.sales
+            WHERE user_id = $1
+              AND is_credit = true
+              AND returned = false
+              AND customer_name IS NOT NULL
+            GROUP BY customer_name, customer_phone
+            HAVING SUM(quantity * selling_price) - SUM(COALESCE(paid_now, 0)) > 0
+            ORDER BY debt DESC
+        `, [userId]);
+
+        res.json({ debts: result.rows });
+    } catch (err) {
+        console.error('Mijoz qarzlarini olish xatosi:', err);
+        res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
+    }
+});
+
+// ====================================================
+// MIJOZ QARZINI TO'LASH
+// ====================================================
+app.post('/api/customer-debts/pay', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const { customer_name, customer_phone, amount } = req.body || {};
+
+    const cleanName = typeof customer_name === 'string' ? customer_name.trim() : '';
+    const cleanPhone = typeof customer_phone === 'string' ? customer_phone.trim() : '';
+    const parsedAmount = Number(amount);
+
+    if (!cleanName) {
+        return res.status(400).json({ message: "Mijoz ismi ko'rsatilmagan!" });
+    }
+    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+        return res.status(400).json({ message: "To'lov summasi noto'g'ri!" });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const salesRes = await client.query(`
+            SELECT id, quantity, selling_price, COALESCE(paid_now, 0) AS paid_now
+            FROM public.sales
+            WHERE user_id = $1
+              AND is_credit = true
+              AND returned = false
+              AND customer_name = $2
+              AND (customer_phone = $3 OR ($3 = '' AND (customer_phone IS NULL OR customer_phone = '')))
+            ORDER BY sold_at ASC
+            FOR UPDATE
+        `, [userId, cleanName, cleanPhone]);
+
+        if (salesRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ message: "Bu mijozga tegishli qarz topilmadi!" });
+        }
+
+        let remainingPay = parsedAmount;
+        let totalPaidNow = 0;
+
+        for (const sale of salesRes.rows) {
+            if (remainingPay <= 0) break;
+
+            const saleTotal = Number(sale.quantity) * Number(sale.selling_price);
+            const alreadyPaid = Number(sale.paid_now) || 0;
+            const saleDebt = saleTotal - alreadyPaid;
+
+            if (saleDebt <= 0) continue;
+
+            const payForThis = Math.min(remainingPay, saleDebt);
+            const newPaid = alreadyPaid + payForThis;
+
+            await client.query(
+                `UPDATE public.sales SET paid_now = $1 WHERE id = $2`,
+                [newPaid, sale.id]
+            );
+
+            remainingPay -= payForThis;
+            totalPaidNow += payForThis;
+        }
+
+        if (totalPaidNow <= 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: "To'lov amalga oshmadi!" });
+        }
+
+        const remainRes = await client.query(`
+            SELECT COALESCE(SUM(quantity * selling_price - COALESCE(paid_now, 0)), 0) AS remaining
+            FROM public.sales
+            WHERE user_id = $1
+              AND is_credit = true
+              AND returned = false
+              AND customer_name = $2
+        `, [userId, cleanName]);
+
+        const remainingDebt = Number(remainRes.rows[0].remaining || 0);
+
+        const userRes = await client.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
+        const siteLogin = userRes.rows[0]?.site_login || null;
+
+        if (siteLogin) {
+            let msg =
+                `💰 <b>MIJOZ QARZI TO'LANDI</b>\n` +
+                `━━━━━━━━━━━━━━━━━━━━\n` +
+                `👤 <b>Mijoz:</b> ${telegramEscape(cleanName)}\n` +
+                (cleanPhone ? `📞 <b>Telefon:</b> ${telegramEscape(cleanPhone)}\n` : '') +
+                `💵 <b>To'langan:</b> ${formatSum(totalPaidNow)} so'm\n` +
+                `📉 <b>Qolgan qarz:</b> ${formatSum(remainingDebt)} so'm\n` +
+                `━━━━━━━━━━━━━━━━━━━━`;
+
+            msg += await getTodayReport(client, userId);
+            await queueTelegramNotification(client, siteLogin, msg);
+        }
+
+        await client.query('COMMIT');
+
+        res.json({
+            message: `${formatSum(totalPaidNow)} so'm muvaffaqiyatli qabul qilindi! Qolgan qarz: ${formatSum(remainingDebt)} so'm`,
+            paid: totalPaidNow,
+            remaining_debt: remainingDebt
+        });
+    } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (e) {}
+        console.error('Mijoz qarzini to\'lashda xatolik:', err);
+        res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
+    } finally {
+        client.release();
+    }
+});
 
 // ====================================================
 // 404
