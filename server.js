@@ -3740,6 +3740,195 @@ app.post(
 );
 
 // ====================================================
+// QR NASIYAGA SOTISH
+// ====================================================
+
+app.post(
+    '/api/qr/:token/sell-credit',
+    async (req, res) => {
+        const token = typeof req.params.token === 'string'
+            ? req.params.token.trim()
+            : '';
+
+        if (!token) {
+            return res.status(400).json({
+                message: "QR token kiritilmagan!"
+            });
+        }
+
+        const sellingPrice = Number(req.body?.selling_price);
+        const cleanCustomerName = typeof req.body?.customer_name === 'string'
+            ? req.body.customer_name.trim()
+            : '';
+        const cleanCustomerPhone = typeof req.body?.customer_phone === 'string'
+            ? req.body.customer_phone.trim()
+            : '';
+        const parsedPaidNow = Number(req.body?.paid_now) || 0;
+
+        if (!Number.isFinite(sellingPrice) || sellingPrice < 0) {
+            return res.status(400).json({
+                message: "Sotuv narxini to'g'ri kiriting!"
+            });
+        }
+        if (!cleanCustomerName) {
+            return res.status(400).json({
+                message: "Mijoz ismini kiriting!"
+            });
+        }
+        if (!cleanCustomerPhone) {
+            return res.status(400).json({
+                message: "Mijoz telefonini kiriting!"
+            });
+        }
+
+        const client = await pool.connect();
+
+        try {
+            await client.query('BEGIN');
+
+            const result = await client.query(
+                `
+                SELECT *
+                FROM public.products
+                WHERE qr_token = $1
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [token]
+            );
+
+            if (!result.rows.length) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({
+                    message: "QR kodi eskirgan yoki tovar topilmadi!"
+                });
+            }
+
+            const product = result.rows[0];
+            const quantity = Number(product.quantity) || 0;
+
+            if (quantity <= 0) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({
+                    message: "Bu tovar omborda qolmagan!"
+                });
+            }
+
+            const qty = 1;
+            const cost = Number(product.cost_price) || 0;
+            const totalAmount = sellingPrice * qty;
+            const profit = (sellingPrice - cost) * qty;
+            const newQty = quantity - qty;
+            const remainingDebt = Math.max(0, totalAmount - parsedPaidNow);
+
+            // Sales — nasiya belgisi bilan
+            await client.query(
+                `
+                INSERT INTO public.sales
+                (
+                    user_id, product_id, title, quantity, cost_price, selling_price, profit,
+                    local_id, category, color, size,
+                    customer_name, customer_phone, is_credit, paid_now
+                )
+                VALUES
+                ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true,$14)
+                `,
+                [
+                    product.user_id,
+                    product.id,
+                    product.name,
+                    qty,
+                    cost,
+                    sellingPrice,
+                    profit,
+                    product.local_id,
+                    product.category,
+                    product.color,
+                    product.size,
+                    cleanCustomerName,
+                    cleanCustomerPhone,
+                    parsedPaidNow
+                ]
+            );
+
+            if (newQty === 0) {
+                await client.query(
+                    `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
+                    [product.id, product.user_id]
+                );
+            } else {
+                await client.query(
+                    `UPDATE public.products SET quantity = $1 WHERE id = $2 AND user_id = $3`,
+                    [newQty, product.id, product.user_id]
+                );
+            }
+
+            const userResult = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [product.user_id]
+            );
+            const siteLogin = userResult.rows[0]?.site_login || null;
+
+            let message =
+                `🛒 <b>QR ORQALI NASIYAGA SOTILDI</b>\n` +
+                `━━━━━━━━━━━━━━━━━━━━\n` +
+                `📦 <b>Tovar:</b> ${telegramEscape(product.name)}\n` +
+                `📏 <b>Razmer:</b> ${telegramEscape(product.size || 'Standart')}\n` +
+                `👤 <b>Mijoz:</b> ${telegramEscape(cleanCustomerName)}\n` +
+                `📞 <b>Telefon:</b> ${telegramEscape(cleanCustomerPhone)}\n` +
+                `🔢 <b>Soni:</b> 1 dona\n` +
+                `💵 <b>Jami summa:</b> ${formatSum(sellingPrice)} so'm\n` +
+                `💰 <b>Hozir to'langan:</b> ${formatSum(parsedPaidNow)} so'm\n` +
+                `📉 <b>Qolgan qarz (mijoz):</b> ${formatSum(remainingDebt)} so'm\n` +
+                `💳 <b>Tannarx:</b> ${formatSum(cost)} so'm\n` +
+                `${profit >= 0 ? '📈' : '📉'} <b>${profit >= 0 ? 'Foyda' : 'Ziyon'}:</b> ${formatSum(Math.abs(profit))} so'm\n` +
+                `📦 <b>Qoldiq:</b> ${newQty} dona`;
+
+            if (newQty === 0) {
+                message += `\n🗑 <b>Bu razmer ombordan tugadi.</b>`;
+            }
+
+            message += await getTodayReport(client, product.user_id);
+
+            await queueTelegramNotification(client, siteLogin, message);
+
+            await client.query('COMMIT');
+
+            return res.json({
+                success: true,
+                product: {
+                    id: product.id,
+                    local_id: product.local_id,
+                    name: product.name,
+                    size: product.size,
+                    color: product.color,
+                    cost_price: cost
+                },
+                selling_price: sellingPrice,
+                quantity: qty,
+                total_amount: totalAmount,
+                profit,
+                remaining_quantity: newQty,
+                customer_name: cleanCustomerName,
+                customer_phone: cleanCustomerPhone,
+                paid_now: parsedPaidNow,
+                remaining_customer_debt: remainingDebt
+            });
+        } catch (err) {
+            try {
+                await client.query('ROLLBACK');
+            } catch (e) { }
+            console.error('QR nasiyaga sotish xatosi:', err);
+            return res.status(500).json({
+                message: "QR orqali nasiyaga sotishda server xatosi!"
+            });
+        } finally {
+            client.release();
+        }
+    }
+);
+
+// ====================================================
 // BOT PROFITS
 // ====================================================
 
