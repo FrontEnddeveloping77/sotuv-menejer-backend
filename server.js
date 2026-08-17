@@ -330,6 +330,13 @@ const TELEGRAM_BOT_TOKEN =
     process.env.TG_BOT_TOKEN ||
     '';
 
+// Bitta guruh uchun (ixtiyoriy) — users.linked_group_chat_id bo'lmasa ishlatiladi
+const TELEGRAM_CHAT_ID =
+    process.env.TELEGRAM_CHAT_ID ||
+    process.env.TG_CHAT_ID ||
+    process.env.CHAT_ID ||
+    '';
+
 const telegramApi = async (method, formData) => {
     if (!TELEGRAM_BOT_TOKEN) {
         throw new Error('TELEGRAM_BOT_TOKEN / BOT_TOKEN env topilmadi');
@@ -464,18 +471,32 @@ const queueTelegramNotification = async (
     }
 
     try {
-        const u = await clientOrPool.query(
-            `
-            SELECT linked_group_chat_id
-            FROM public.users
-            WHERE site_login = $1
-            LIMIT 1
-            `,
-            [siteLogin]
-        );
-        const chatId = u.rows[0]?.linked_group_chat_id;
+        let chatId = null;
+        try {
+            const u = await clientOrPool.query(
+                `
+                SELECT linked_group_chat_id
+                FROM public.users
+                WHERE site_login = $1
+                LIMIT 1
+                `,
+                [siteLogin]
+            );
+            chatId = u.rows[0]?.linked_group_chat_id || null;
+        } catch (colErr) {
+            // Ustun bo'lmasa — env dan olamiz
+            console.warn('[Telegram] linked_group_chat_id o\'qib bo\'lmadi:', colErr.message);
+        }
+
+        if (!chatId && TELEGRAM_CHAT_ID) {
+            chatId = TELEGRAM_CHAT_ID;
+        }
+
         if (!chatId) {
-            console.warn(`[Telegram] ${siteLogin} uchun linked_group_chat_id topilmadi`);
+            console.warn(
+                `[Telegram] chat_id topilmadi (site=${siteLogin}). ` +
+                `users.linked_group_chat_id yoki TELEGRAM_CHAT_ID env kerak.`
+            );
             return;
         }
 
@@ -1364,13 +1385,7 @@ app.post(
             typeof supplier === 'string'
                 ? supplier.trim()
                 : '';
-
-        if (!cleanSupplier) {
-            return res.status(400).json({
-                message:
-                    "Kimdan olinganini kiritish shart!"
-            });
-        }
+        // Kimdan / telefon — ixtiyoriy (bo'sh bo'lishi mumkin)
 
         let cleanSupplierPhone =
             typeof supplier_phone === 'string'
@@ -1641,8 +1656,8 @@ app.post(
                 if (cleanPaymentType === 'credit') {
                     paymentInfo =
                         `\n💳 <b>To'lov turi:</b> Nasiya\n` +
-                        `👤 <b>Kimdan:</b> ${telegramEscape(cleanSupplier)}\n` +
-                        `📞 <b>Telefon:</b> ${telegramEscape(cleanSupplierPhone)}\n` +
+                        `👤 <b>Kimdan:</b> ${telegramEscape(cleanSupplier || "Ko'rsatilmagan")}\n` +
+                        (cleanSupplierPhone ? `📞 <b>Telefon:</b> ${telegramEscape(cleanSupplierPhone)}\n` : '') +
                         `💵 <b>To'langan:</b> ${formatSum(parsedPaidAmount)} so'm\n` +
                         `📉 <b>Qarz:</b> ${formatSum(Math.max(0, (parsedCostPrice * totalQty) - parsedPaidAmount))} so'm`;
                 } else {
