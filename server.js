@@ -2169,6 +2169,9 @@ app.get(
                     COUNT(DISTINCT local_id) AS products_count,
                     COALESCE(SUM(cost_price * quantity), 0) AS total_cost,
                     COALESCE(SUM(quantity), 0) AS total_quantity,
+                    array_agg(DISTINCT category) FILTER (
+                        WHERE category IS NOT NULL AND TRIM(category) <> ''
+                    ) AS categories,
                     json_agg(
                         json_build_object(
                             'local_id', local_id,
@@ -2197,8 +2200,10 @@ app.get(
                 supplier: row.supplier,
                 supplier_phone: row.supplier_phone || null,
                 products_count: Number(row.products_count) || 0,
+                product_count: Number(row.products_count) || 0, // frontend uchun alias
                 total_cost: Number(row.total_cost) || 0,
                 total_quantity: Number(row.total_quantity) || 0,
+                categories: Array.isArray(row.categories) ? row.categories.filter(Boolean) : [],
                 products: Array.isArray(row.products) ? row.products : []
             }));
 
