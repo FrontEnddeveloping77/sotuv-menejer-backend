@@ -1512,8 +1512,51 @@ app.post(
             const insertedRows = [];
 
             if (exactQuantities) {
-                // Foydalanuvchi belgilagan aniq taqsimot
+                // Har bir dona uchun alohida qator + alohida QR
                 for (const item of exactQuantities) {
+                    const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
+                    for (let u = 0; u < qty; u++) {
+                        const result = await client.query(
+                            `
+                            INSERT INTO public.products
+                            (
+                                user_id, local_id, category, name, cost_price, color, size, quantity,
+                                qr_token, qr_created_at, payment_type, supplier, paid_amount,
+                                supplier_phone, selling_price, image_url
+                            )
+                            VALUES
+                            (
+                                $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(),
+                                $10, $11, $12, $13, $14, $15
+                            )
+                            RETURNING *
+                            `,
+                            [
+                                userId,
+                                nextLocalId,
+                                String(category).trim(),
+                                String(name).trim(),
+                                parsedCostPrice,
+                                color || null,
+                                item.size || null,
+                                1,  // har bir qator = 1 dona
+                                randomUUID(),
+                                cleanPaymentType,
+                                cleanSupplier,
+                                parsedPaidAmount,
+                                cleanSupplierPhone,
+                                parsedSellingPrice,
+                                cleanImageUrl
+                            ]
+                        );
+                        insertedRows.push(result.rows[0]);
+                    }
+                }
+            } else if (
+                sizeList.length === 0
+            ) {
+                // Har bir dona uchun alohida QR
+                for (let u = 0; u < totalQty; u++) {
                     const result = await client.query(
                         `
                         INSERT INTO public.products
@@ -1536,8 +1579,8 @@ app.post(
                             String(name).trim(),
                             parsedCostPrice,
                             color || null,
-                            item.size || null,
-                            item.quantity,
+                            null,
+                            1,
                             randomUUID(),
                             cleanPaymentType,
                             cleanSupplier,
@@ -1549,127 +1592,50 @@ app.post(
                     );
                     insertedRows.push(result.rows[0]);
                 }
-            } else if (
-                sizeList.length === 0
-            ) {
-                const result = await client.query(
-                    `
-                    INSERT INTO public.products
-                    (
-                        user_id,
-                        local_id,
-                        category,
-                        name,
-                        cost_price,
-                        color,
-                        size,
-                        quantity,
-                        qr_token,
-                        qr_created_at,
-                        payment_type,
-                        supplier,
-                        paid_amount,
-                        supplier_phone,
-                        selling_price,
-                        image_url
-                    )
-                    VALUES
-                    (
-                        $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(),
-                        $10, $11, $12, $13, $14, $15
-                    )
-                    RETURNING *
-                    `,
-                    [
-                        userId,
-                        nextLocalId,
-                        String(category).trim(),
-                        String(name).trim(),
-                        parsedCostPrice,
-                        color || null,
-                        null,
-                        totalQty,
-                        randomUUID(),
-                        cleanPaymentType,
-                        cleanSupplier,
-                        parsedPaidAmount,
-                        cleanSupplierPhone,
-                        parsedSellingPrice,
-                        cleanImageUrl
-                    ]
-                );
-                insertedRows.push(
-                    result.rows[0]
-                );
             } else {
+                // Teng taqsimot: har bir dona uchun alohida QR
                 const count = sizeList.length;
-                const base = Math.floor(
-                    totalQty / count
-                );
+                const base = Math.floor(totalQty / count);
                 const remainder = totalQty % count;
 
-                for (
-                    let i = 0;
-                    i < count;
-                    i++
-                ) {
-                    const sizeQty =
-                        base +
-                        (
-                            i < remainder
-                                ? 1
-                                : 0
+                for (let i = 0; i < count; i++) {
+                    const sizeQty = base + (i < remainder ? 1 : 0);
+                    for (let u = 0; u < sizeQty; u++) {
+                        const result = await client.query(
+                            `
+                            INSERT INTO public.products
+                            (
+                                user_id, local_id, category, name, cost_price, color, size, quantity,
+                                qr_token, qr_created_at, payment_type, supplier, paid_amount,
+                                supplier_phone, selling_price, image_url
+                            )
+                            VALUES
+                            (
+                                $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(),
+                                $10, $11, $12, $13, $14, $15
+                            )
+                            RETURNING *
+                            `,
+                            [
+                                userId,
+                                nextLocalId,
+                                String(category).trim(),
+                                String(name).trim(),
+                                parsedCostPrice,
+                                color || null,
+                                sizeList[i],
+                                1,
+                                randomUUID(),
+                                cleanPaymentType,
+                                cleanSupplier,
+                                parsedPaidAmount,
+                                cleanSupplierPhone,
+                                parsedSellingPrice,
+                                cleanImageUrl
+                            ]
                         );
-
-                    const result = await client.query(
-                        `
-                        INSERT INTO public.products
-                        (
-                            user_id,
-                            local_id,
-                            category,
-                            name,
-                            cost_price,
-                            color,
-                            size,
-                            quantity,
-                            qr_token,
-                            qr_created_at,
-                            payment_type,
-                            supplier,
-                            paid_amount,
-                            supplier_phone,
-                            selling_price,
-                            image_url
-                        )
-                        VALUES
-                        (
-                            $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(),
-                            $10, $11, $12, $13, $14, $15
-                        )
-                        RETURNING *
-                        `,
-                        [
-                            userId,
-                            nextLocalId,
-                            String(category).trim(),
-                            String(name).trim(),
-                            parsedCostPrice,
-                            color || null,
-                            sizeList[i],
-                            sizeQty,
-                            randomUUID(),
-                            cleanPaymentType,
-                            cleanSupplier,
-                            parsedPaidAmount,
-                            cleanSupplierPhone,
-                            parsedSellingPrice,
-                            cleanImageUrl
-                        ]
-                    );
-                    insertedRows.push(
-                        result.rows[0]
-                    );
+                        insertedRows.push(result.rows[0]);
+                    }
                 }
             }
 
@@ -2654,7 +2620,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
             products: insertedRows
         });
     } catch (err) {
-        try { await client.query('ROLLBACK'); } catch (e) {}
+        try { await client.query('ROLLBACK'); } catch (e) { }
         console.error("Tovarni tahrirlashda xatolik:", err);
         res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
     } finally {
