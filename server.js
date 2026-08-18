@@ -4877,6 +4877,151 @@ app.get('/api/bot/top_category', async (req, res) => {
     }
 });
 
+
+/**
+ * GET /api/bot/report?login=XXX&period=daily|weekly|monthly|yearly
+ * Javob: { revenue, profit, expense, net_profit, sold, total_products, total_stock }
+ */
+app.get('/api/bot/report', async (req, res) => {
+    const siteLogin = typeof req.query.login === 'string' ? req.query.login.trim() : '';
+    const period = typeof req.query.period === 'string' ? req.query.period.trim().toLowerCase() : 'daily';
+
+    if (!siteLogin) {
+        return res.status(400).json({ message: "login kiritilmagan!" });
+    }
+
+    const allowed = ['daily', 'weekly', 'monthly', 'yearly'];
+    if (!allowed.includes(period)) {
+        return res.status(400).json({ message: "period noto'g'ri!" });
+    }
+
+    try {
+        const userResult = await pool.query(
+            `SELECT id FROM public.users WHERE site_login = $1 LIMIT 1`,
+            [siteLogin]
+        );
+        if (!userResult.rows.length) {
+            return res.status(404).json({ message: "Foydalanuvchi topilmadi!" });
+        }
+        const userId = userResult.rows[0].id;
+
+        const filters = {
+            daily: {
+                sales: `sold_at::date = CURRENT_DATE`,
+                expense: `created_at::date = CURRENT_DATE`
+            },
+            weekly: {
+                sales: `sold_at >= date_trunc('week', CURRENT_DATE)`,
+                expense: `created_at >= date_trunc('week', CURRENT_DATE)`
+            },
+            monthly: {
+                sales: `date_trunc('month', sold_at) = date_trunc('month', CURRENT_DATE)`,
+                expense: `date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)`
+            },
+            yearly: {
+                sales: `date_trunc('year', sold_at) = date_trunc('year', CURRENT_DATE)`,
+                expense: `date_trunc('year', created_at) = date_trunc('year', CURRENT_DATE)`
+            }
+        };
+        const f = filters[period];
+
+        const sales = await pool.query(
+            `
+            SELECT
+                COALESCE(SUM(quantity * selling_price), 0) AS revenue,
+                COALESCE(SUM(profit), 0) AS profit,
+                COALESCE(SUM(quantity), 0) AS sold
+            FROM public.sales
+            WHERE user_id = $1 AND returned = false AND ${f.sales}
+            `,
+            [userId]
+        );
+
+        const expenses = await pool.query(
+            `
+            SELECT COALESCE(SUM(amount), 0) AS expense
+            FROM public.expenses
+            WHERE user_id = $1 AND ${f.expense}
+            `,
+            [userId]
+        );
+
+        const stock = await pool.query(
+            `
+            SELECT
+                COUNT(DISTINCT local_id) AS total_products,
+                COALESCE(SUM(quantity), 0) AS total_stock
+            FROM public.products
+            WHERE user_id = $1
+            `,
+            [userId]
+        );
+
+        const revenue = Number(sales.rows[0].revenue || 0);
+        const profit = Number(sales.rows[0].profit || 0);
+        const sold = Number(sales.rows[0].sold || 0);
+        const expense = Number(expenses.rows[0].expense || 0);
+        const net_profit = profit - expense;
+        const total_products = Number(stock.rows[0].total_products || 0);
+        const total_stock = Number(stock.rows[0].total_stock || 0);
+
+        return res.json({
+            revenue,
+            profit,
+            expense,
+            net_profit,
+            sold,
+            total_products,
+            total_stock
+        });
+    } catch (err) {
+        console.error('Bot report xatosi:', err);
+        return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
+    }
+});
+
+/**
+ * GET /api/bot/warehouse?login=XXX
+ * Javob: { total_products, total_stock }
+ */
+app.get('/api/bot/warehouse', async (req, res) => {
+    const siteLogin = typeof req.query.login === 'string' ? req.query.login.trim() : '';
+
+    if (!siteLogin) {
+        return res.status(400).json({ message: "login kiritilmagan!" });
+    }
+
+    try {
+        const userResult = await pool.query(
+            `SELECT id FROM public.users WHERE site_login = $1 LIMIT 1`,
+            [siteLogin]
+        );
+        if (!userResult.rows.length) {
+            return res.status(404).json({ message: "Foydalanuvchi topilmadi!" });
+        }
+        const userId = userResult.rows[0].id;
+
+        const stock = await pool.query(
+            `
+            SELECT
+                COUNT(DISTINCT local_id) AS total_products,
+                COALESCE(SUM(quantity), 0) AS total_stock
+            FROM public.products
+            WHERE user_id = $1
+            `,
+            [userId]
+        );
+
+        return res.json({
+            total_products: Number(stock.rows[0].total_products || 0),
+            total_stock: Number(stock.rows[0].total_stock || 0)
+        });
+    } catch (err) {
+        console.error('Bot warehouse xatosi:', err);
+        return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
+    }
+});
+
 // ====================================================
 // 404
 // ====================================================
