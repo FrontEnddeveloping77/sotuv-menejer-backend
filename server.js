@@ -1395,12 +1395,7 @@ app.post(
                 ? supplier_phone.trim()
                 : '';
 
-        if (!cleanSupplierPhone) {
-            return res.status(400).json({
-                message:
-                    "Telefon raqamini kiritish shart!"
-            });
-        }
+        // Telefon ixtiyoriy — bo'sh bo'lishi mumkin
 
         let parsedPaidAmount = 0;
 
