@@ -4820,7 +4820,13 @@ app.get('/api/bot/products', async (req, res) => {
 
 /**
  * GET /api/bot/top_category?login=XXX
- * Javob: { "category": string, "sold_count": number, "total_amount": number }
+ * Javob: {
+ *   category, sold_count, total_amount,
+ *   top_size, top_size_sold, top_size_amount,
+ *   top_color, top_color_sold, top_color_amount,
+ *   stock_size, stock_size_qty,
+ *   stock_category, stock_category_qty
+ * }
  */
 app.get('/api/bot/top_category', async (req, res) => {
     const siteLogin = typeof req.query.login === 'string' ? req.query.login.trim() : '';
@@ -4841,7 +4847,8 @@ app.get('/api/bot/top_category', async (req, res) => {
 
         const userId = userResult.rows[0].id;
 
-        const result = await pool.query(
+        // Eng ko'p sotilgan kategoriya
+        const catResult = await pool.query(
             `
             SELECT
                 COALESCE(NULLIF(TRIM(category), ''), 'Boshqa') AS category,
@@ -4857,19 +4864,96 @@ app.get('/api/bot/top_category', async (req, res) => {
             [userId]
         );
 
-        if (!result.rows.length) {
-            return res.json({
-                category: '—',
-                sold_count: 0,
-                total_amount: 0
-            });
-        }
+        // Eng ko'p sotilgan razmer
+        const sizeSoldResult = await pool.query(
+            `
+            SELECT
+                COALESCE(NULLIF(TRIM(size), ''), 'Standart') AS size,
+                COALESCE(SUM(quantity), 0) AS sold_count,
+                COALESCE(SUM(quantity * selling_price), 0) AS total_amount
+            FROM public.sales
+            WHERE user_id = $1
+              AND returned = false
+            GROUP BY COALESCE(NULLIF(TRIM(size), ''), 'Standart')
+            ORDER BY sold_count DESC, total_amount DESC
+            LIMIT 1
+            `,
+            [userId]
+        );
 
-        const row = result.rows[0];
+        // Eng ko'p sotilgan rang
+        const colorSoldResult = await pool.query(
+            `
+            SELECT
+                COALESCE(NULLIF(TRIM(color), ''), 'Ko''rsatilmagan') AS color,
+                COALESCE(SUM(quantity), 0) AS sold_count,
+                COALESCE(SUM(quantity * selling_price), 0) AS total_amount
+            FROM public.sales
+            WHERE user_id = $1
+              AND returned = false
+            GROUP BY COALESCE(NULLIF(TRIM(color), ''), 'Ko''rsatilmagan')
+            ORDER BY sold_count DESC, total_amount DESC
+            LIMIT 1
+            `,
+            [userId]
+        );
+
+        // Eng ko'p turib qolgan razmer (ombordagi eng ko'p qoldiq)
+        const stockSizeResult = await pool.query(
+            `
+            SELECT
+                COALESCE(NULLIF(TRIM(size), ''), 'Standart') AS size,
+                COALESCE(SUM(quantity), 0) AS qty
+            FROM public.products
+            WHERE user_id = $1
+              AND COALESCE(quantity, 0) > 0
+            GROUP BY COALESCE(NULLIF(TRIM(size), ''), 'Standart')
+            ORDER BY qty DESC
+            LIMIT 1
+            `,
+            [userId]
+        );
+
+        // Eng ko'p turib qolgan kategoriya (ombordagi eng ko'p qoldiq)
+        const stockCatResult = await pool.query(
+            `
+            SELECT
+                COALESCE(NULLIF(TRIM(category), ''), 'Boshqa') AS category,
+                COALESCE(SUM(quantity), 0) AS qty
+            FROM public.products
+            WHERE user_id = $1
+              AND COALESCE(quantity, 0) > 0
+            GROUP BY COALESCE(NULLIF(TRIM(category), ''), 'Boshqa')
+            ORDER BY qty DESC
+            LIMIT 1
+            `,
+            [userId]
+        );
+
+        const cat = catResult.rows[0] || null;
+        const sizeSold = sizeSoldResult.rows[0] || null;
+        const colorSold = colorSoldResult.rows[0] || null;
+        const stockSize = stockSizeResult.rows[0] || null;
+        const stockCat = stockCatResult.rows[0] || null;
+
         return res.json({
-            category: row.category,
-            sold_count: Number(row.sold_count) || 0,
-            total_amount: Number(row.total_amount) || 0
+            category: cat ? cat.category : '—',
+            sold_count: cat ? Number(cat.sold_count) || 0 : 0,
+            total_amount: cat ? Number(cat.total_amount) || 0 : 0,
+
+            top_size: sizeSold ? sizeSold.size : '—',
+            top_size_sold: sizeSold ? Number(sizeSold.sold_count) || 0 : 0,
+            top_size_amount: sizeSold ? Number(sizeSold.total_amount) || 0 : 0,
+
+            top_color: colorSold ? colorSold.color : '—',
+            top_color_sold: colorSold ? Number(colorSold.sold_count) || 0 : 0,
+            top_color_amount: colorSold ? Number(colorSold.total_amount) || 0 : 0,
+
+            stock_size: stockSize ? stockSize.size : '—',
+            stock_size_qty: stockSize ? Number(stockSize.qty) || 0 : 0,
+
+            stock_category: stockCat ? stockCat.category : '—',
+            stock_category_qty: stockCat ? Number(stockCat.qty) || 0 : 0
         });
     } catch (err) {
         console.error('Bot top_category xatosi:', err);
