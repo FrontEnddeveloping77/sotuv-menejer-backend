@@ -4864,50 +4864,56 @@ app.get('/api/bot/top_category', async (req, res) => {
             [userId]
         );
 
-        // Eng ko'p sotilgan razmer
+        // Eng ko'p sotilgan razmer (faqat razmer kiritilganlar)
         const sizeSoldResult = await pool.query(
             `
             SELECT
-                COALESCE(NULLIF(TRIM(size), ''), 'Standart') AS size,
+                TRIM(size) AS size,
                 COALESCE(SUM(quantity), 0) AS sold_count,
                 COALESCE(SUM(quantity * selling_price), 0) AS total_amount
             FROM public.sales
             WHERE user_id = $1
               AND returned = false
-            GROUP BY COALESCE(NULLIF(TRIM(size), ''), 'Standart')
+              AND size IS NOT NULL
+              AND TRIM(size) <> ''
+            GROUP BY TRIM(size)
             ORDER BY sold_count DESC, total_amount DESC
             LIMIT 1
             `,
             [userId]
         );
 
-        // Eng ko'p sotilgan rang
+        // Eng ko'p sotilgan rang (faqat rang kiritilganlar)
         const colorSoldResult = await pool.query(
             `
             SELECT
-                COALESCE(NULLIF(TRIM(color), ''), 'Ko''rsatilmagan') AS color,
+                TRIM(color) AS color,
                 COALESCE(SUM(quantity), 0) AS sold_count,
                 COALESCE(SUM(quantity * selling_price), 0) AS total_amount
             FROM public.sales
             WHERE user_id = $1
               AND returned = false
-            GROUP BY COALESCE(NULLIF(TRIM(color), ''), 'Ko''rsatilmagan')
+              AND color IS NOT NULL
+              AND TRIM(color) <> ''
+            GROUP BY TRIM(color)
             ORDER BY sold_count DESC, total_amount DESC
             LIMIT 1
             `,
             [userId]
         );
 
-        // Eng ko'p turib qolgan razmer (ombordagi eng ko'p qoldiq)
+        // Eng ko'p turib qolgan razmer (faqat razmer kiritilganlar, ombordagi eng ko'p qoldiq)
         const stockSizeResult = await pool.query(
             `
             SELECT
-                COALESCE(NULLIF(TRIM(size), ''), 'Standart') AS size,
+                TRIM(size) AS size,
                 COALESCE(SUM(quantity), 0) AS qty
             FROM public.products
             WHERE user_id = $1
               AND COALESCE(quantity, 0) > 0
-            GROUP BY COALESCE(NULLIF(TRIM(size), ''), 'Standart')
+              AND size IS NOT NULL
+              AND TRIM(size) <> ''
+            GROUP BY TRIM(size)
             ORDER BY qty DESC
             LIMIT 1
             `,
