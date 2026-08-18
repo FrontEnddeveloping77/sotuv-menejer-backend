@@ -471,7 +471,27 @@ const queueTelegramNotification = async (
     }
 
     try {
-        let chatId = null;
+        const chatIds = new Set();
+
+        // 1) linked_groups jadvalidan (ko'p guruh)
+        try {
+            const lg = await clientOrPool.query(
+                `
+                SELECT lg.chat_id
+                FROM public.linked_groups lg
+                INNER JOIN public.users u ON u.id = lg.user_id
+                WHERE u.site_login = $1
+                `,
+                [siteLogin]
+            );
+            for (const row of lg.rows) {
+                if (row.chat_id) chatIds.add(String(row.chat_id));
+            }
+        } catch (lgErr) {
+            console.warn('[Telegram] linked_groups o\'qib bo\'lmadi:', lgErr.message);
+        }
+
+        // 2) Eski ustun: users.linked_group_chat_id
         try {
             const u = await clientOrPool.query(
                 `
@@ -482,29 +502,38 @@ const queueTelegramNotification = async (
                 `,
                 [siteLogin]
             );
-            chatId = u.rows[0]?.linked_group_chat_id || null;
+            const legacy = u.rows[0]?.linked_group_chat_id;
+            if (legacy) chatIds.add(String(legacy));
         } catch (colErr) {
-            // Ustun bo'lmasa — env dan olamiz
             console.warn('[Telegram] linked_group_chat_id o\'qib bo\'lmadi:', colErr.message);
         }
 
-        if (!chatId && TELEGRAM_CHAT_ID) {
-            chatId = TELEGRAM_CHAT_ID;
+        // 3) Env fallback
+        if (chatIds.size === 0 && TELEGRAM_CHAT_ID) {
+            chatIds.add(String(TELEGRAM_CHAT_ID));
         }
 
-        if (!chatId) {
+        if (chatIds.size === 0) {
             console.warn(
                 `[Telegram] chat_id topilmadi (site=${siteLogin}). ` +
-                `users.linked_group_chat_id yoki TELEGRAM_CHAT_ID env kerak.`
+                `Guruhni bot orqali bog'lang yoki TELEGRAM_CHAT_ID env qo'ying.`
             );
             return;
         }
 
-        await sendTelegramNow(chatId, message, photoUrl);
-        console.log(`[Telegram] YUBORILDI chat=${chatId} photo=${hasPhoto}`);
+        let anyOk = false;
+        for (const chatId of chatIds) {
+            try {
+                await sendTelegramNow(chatId, message, photoUrl);
+                console.log(`[Telegram] YUBORILDI chat=${chatId} photo=${hasPhoto}`);
+                anyOk = true;
+            } catch (sendErr) {
+                console.error(`[Telegram] chat=${chatId} yuborish xatosi:`, sendErr.message);
+            }
+        }
 
         // Muvaffaqiyatli yuborilsa — is_sent = true
-        if (inserted) {
+        if (anyOk && inserted) {
             try {
                 await clientOrPool.query(
                     `
@@ -550,6 +579,41 @@ const ensureTables = async () => {
     } catch (err) {
         console.error(
             "⚠️ USERS jadvalini yangilashda xatolik (davom etilmoqda):",
+            err.message
+        );
+    }
+
+    // ------------------------------------------------
+    // LINKED_GROUPS (bir login → ko'p guruh)
+    // ------------------------------------------------
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS public.linked_groups (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                chat_id BIGINT NOT NULL UNIQUE,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_linked_groups_user_id
+            ON public.linked_groups(user_id);
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_linked_groups_chat_id
+            ON public.linked_groups(chat_id);
+        `);
+        // Eski linked_group_chat_id → linked_groups ga ko'chirish
+        await pool.query(`
+            INSERT INTO public.linked_groups (user_id, chat_id)
+            SELECT id, linked_group_chat_id
+            FROM public.users
+            WHERE linked_group_chat_id IS NOT NULL
+            ON CONFLICT (chat_id) DO NOTHING
+        `);
+    } catch (err) {
+        console.error(
+            "⚠️ LINKED_GROUPS jadvalini yaratishda xatolik:",
             err.message
         );
     }
@@ -2380,31 +2444,15 @@ app.get(
         try {
             const userId = req.user.userId;
 
+            // Faqat: ism, telefon, kategoriya(lar) — boshqa ma'lumot kerak emas
             const result = await pool.query(
                 `
                 SELECT
                     COALESCE(NULLIF(TRIM(supplier), ''), 'Noma''lum') AS supplier,
                     MAX(NULLIF(TRIM(supplier_phone), '')) AS supplier_phone,
-                    COUNT(DISTINCT local_id) AS products_count,
-                    COALESCE(SUM(cost_price * quantity), 0) AS total_cost,
-                    COALESCE(SUM(quantity), 0) AS total_quantity,
                     array_agg(DISTINCT category) FILTER (
                         WHERE category IS NOT NULL AND TRIM(category) <> ''
-                    ) AS categories,
-                    json_agg(
-                        json_build_object(
-                            'local_id', local_id,
-                            'name', name,
-                            'category', category,
-                            'color', color,
-                            'size', size,
-                            'quantity', quantity,
-                            'cost_price', cost_price,
-                            'payment_type', payment_type,
-                            'created_at', created_at
-                        )
-                        ORDER BY local_id DESC, size ASC NULLS LAST
-                    ) AS products
+                    ) AS categories
                 FROM public.products
                 WHERE user_id = $1
                   AND supplier IS NOT NULL
@@ -2418,12 +2466,7 @@ app.get(
             const suppliers = result.rows.map((row) => ({
                 supplier: row.supplier,
                 supplier_phone: row.supplier_phone || null,
-                products_count: Number(row.products_count) || 0,
-                product_count: Number(row.products_count) || 0, // frontend uchun alias
-                total_cost: Number(row.total_cost) || 0,
-                total_quantity: Number(row.total_quantity) || 0,
-                categories: Array.isArray(row.categories) ? row.categories.filter(Boolean) : [],
-                products: Array.isArray(row.products) ? row.products : []
+                categories: Array.isArray(row.categories) ? row.categories.filter(Boolean) : []
             }));
 
             res.json({
