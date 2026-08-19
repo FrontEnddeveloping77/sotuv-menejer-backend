@@ -2751,21 +2751,92 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
             [saleId]
         );
 
-        // Omborga sonini qaytarib qo'shish
-        const prodRes = await client.query(
-            `
-            UPDATE public.products
-            SET quantity = quantity + $1
-            WHERE user_id = $2 AND local_id = $3
-            RETURNING image_url
-            `,
-            [sale.quantity, userId, sale.local_id]
-        );
+        // Omborga FAQAT SHU RAZMER / SHU QATOR ga qaytarish
+        // (Eski xato: local_id bo'yicha BARCHA razmerlarga quantity qo'shardi)
+        const qtyToReturn = Number(sale.quantity) || 0;
+        let restoredImageUrl = sale.image_url || null;
+        let restored = false;
+
+        // 1) product_id hali mavjud bo'lsa — faqat shu qator
+        if (sale.product_id) {
+            const byId = await client.query(
+                `
+                UPDATE public.products
+                SET quantity = quantity + $1
+                WHERE id = $2 AND user_id = $3
+                RETURNING id, image_url
+                `,
+                [qtyToReturn, sale.product_id, userId]
+            );
+            if (byId.rows.length) {
+                restored = true;
+                restoredImageUrl = restoredImageUrl || byId.rows[0].image_url || null;
+            }
+        }
+
+        // 2) O'chirilgan bo'lishi mumkin — local_id + size (bitta qator)
+        if (!restored && sale.local_id != null) {
+            const findRes = await client.query(
+                `
+                SELECT id, image_url
+                FROM public.products
+                WHERE user_id = $1
+                  AND local_id = $2
+                  AND COALESCE(TRIM(size), '') = COALESCE(TRIM($3::text), '')
+                ORDER BY id ASC
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [userId, sale.local_id, sale.size || '']
+            );
+            if (findRes.rows.length) {
+                const row = findRes.rows[0];
+                await client.query(
+                    `UPDATE public.products SET quantity = quantity + $1 WHERE id = $2 AND user_id = $3`,
+                    [qtyToReturn, row.id, userId]
+                );
+                restored = true;
+                restoredImageUrl = restoredImageUrl || row.image_url || null;
+            }
+        }
+
+        // 3) Butunlay yo'q (0 bo'lib o'chirilgan) — shu razmer bilan qayta yaratamiz
+        if (!restored) {
+            const insertRes = await client.query(
+                `
+                INSERT INTO public.products
+                (
+                    user_id, local_id, category, name, cost_price, color, size,
+                    quantity, qr_token, qr_created_at, selling_price, image_url
+                )
+                VALUES
+                (
+                    $1, $2, $3, $4, $5, $6, $7,
+                    $8, $9, NOW(), $10, $11
+                )
+                RETURNING id, image_url
+                `,
+                [
+                    userId,
+                    sale.local_id || 1,
+                    sale.category || null,
+                    sale.title || 'Tovar',
+                    sale.cost_price || 0,
+                    sale.color || null,
+                    sale.size || null,
+                    qtyToReturn,
+                    randomUUID(),
+                    sale.selling_price != null ? sale.selling_price : null,
+                    sale.image_url || null
+                ]
+            );
+            restoredImageUrl = restoredImageUrl || insertRes.rows[0]?.image_url || null;
+            restored = true;
+        }
 
         await client.query('COMMIT');
 
-        // Rasm birinchi navbatda sotuvdan, bo'lmasa tovardan olinadi
-        const returnImageUrl = sale.image_url || prodRes.rows[0]?.image_url || null;
+        const returnImageUrl = restoredImageUrl || null;
 
         // 🟢 TELEGRAM NOTIFICATION (RASMI BILAN)
         try {
@@ -2777,8 +2848,9 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
                     `🔄 <b>TOVAR QAYTARILDI (VOZVRAT)</b>\n` +
                     `━━━━━━━━━━━━━━━━━━━━\n` +
                     `📦 <b>Tovar:</b> ${telegramEscape(sale.title)}\n` +
-                    `🔢 <b>Soni:</b> ${sale.quantity} dona\n` +
-                    `💰 <b>Qaytarilgan summa:</b> ${formatSum(sale.quantity * sale.selling_price)} so'm\n` +
+                    `📏 <b>Razmer:</b> ${telegramEscape(sale.size || 'Standart')}\n` +
+                    `🔢 <b>Soni:</b> ${qtyToReturn} dona\n` +
+                    `💰 <b>Qaytarilgan summa:</b> ${formatSum(qtyToReturn * Number(sale.selling_price || 0))} so'm\n` +
                     `━━━━━━━━━━━━━━━━━━━━`;
 
                 await queueTelegramNotification(pool, siteLogin, msg, returnImageUrl);
