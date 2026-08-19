@@ -123,6 +123,18 @@ const formatSum = (value) => {
     return Number(value).toLocaleString('uz-UZ');
 };
 
+const formatExpenseTypeUz = (type) => {
+    const map = {
+        daily: 'Kunlik',
+        weekly: 'Haftalik',
+        monthly: 'Oylik',
+        yearly: 'Yillik',
+        other: 'Boshqa',
+    };
+    const key = String(type || '').toLowerCase().trim();
+    return map[key] || type || '—';
+};
+
 const telegramEscape = (value) =>
     String(value ?? '')
         .replace(/&/g, '&amp;')
@@ -3721,7 +3733,8 @@ app.put(
             });
         }
 
-        const type = ['daily', 'monthly', 'yearly'].includes(expense_type)
+        // Frontend: daily | monthly | other (va ixtiyoriy weekly/yearly)
+        const type = ['daily', 'weekly', 'monthly', 'yearly', 'other'].includes(expense_type)
             ? expense_type
             : 'daily';
 
@@ -3772,7 +3785,7 @@ app.put(
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `📝 <b>Tavsifi:</b> ${telegramEscape(cleanTitle)}\n` +
                 `💰 <b>Summasi:</b> ${formatSum(parsedAmount)} so'm\n` +
-                `📂 <b>Turi:</b> ${telegramEscape(type)}\n` +
+                `📂 <b>Turi:</b> ${telegramEscape(formatExpenseTypeUz(type))}\n` +
                 `━━━━━━━━━━━━━━━━━━━━`;
 
             message += await getTodayReport(client, userId);
@@ -3858,6 +3871,7 @@ app.delete(
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `📝 <b>Tavsifi:</b> ${telegramEscape(expense.title)}\n` +
                 `💰 <b>Summasi:</b> ${formatSum(expense.amount)} so'm\n` +
+                `📂 <b>Turi:</b> ${telegramEscape(formatExpenseTypeUz(expense.expense_type))}\n` +
                 `━━━━━━━━━━━━━━━━━━━━`;
 
             message += await getTodayReport(client, userId);
