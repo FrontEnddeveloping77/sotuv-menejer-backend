@@ -2826,6 +2826,8 @@ app.post(
             let firstProductName = null;
             let firstLocalId = null;
             let firstImageUrl = null;
+            let firstSupplier = null;
+            let firstSupplierPhone = null;
             const soldLines = [];
             let anyFullySoldOut = false;
             const affectedLocalIds = new Set();
@@ -2936,6 +2938,8 @@ VALUES
                     firstProductName = product.name;
                     firstLocalId = product.local_id;
                     firstImageUrl = product.image_url || null;
+                    firstSupplier = product.supplier || null;
+                    firstSupplierPhone = product.supplier_phone || null;
                 }
 
                 soldLines.push(
@@ -3001,8 +3005,15 @@ VALUES
                 `${totalProfit >= 0 ? '📈' : '📉'} <b>${totalProfit >= 0 ? 'Jami foyda' : 'Jami ziyon'}:</b> ${formatSum(Math.abs(totalProfit))} so'm\n` +
                 remainingStockInfo +
                 `\n━━━━━━━━━━━━━━━━━━━━\n` +
-                (anyFullySoldOut ? `🗑 Ba'zi razmerlar ombordan butunlay chiqarildi\n` : '') +
-                `🎉 Tabriklaymiz, savdo amalga oshdi!`;
+                (firstSupplier
+                    ? `👤 <b>Kimdan olingan:</b> ${telegramEscape(String(firstSupplier).trim())}\n`
+                    : '') +
+                (firstSupplierPhone
+                    ? `📞 <b>Telefon:</b> ${telegramEscape(String(firstSupplierPhone).trim())}\n`
+                    : '') +
+                ((firstSupplier && String(firstSupplier).trim()) || (firstSupplierPhone && String(firstSupplierPhone).trim())
+                    ? `━━━━━━━━━━━━━━━━━━━━`
+                    : '');
 
             sellMessage += await getTodayReport(client, userId);
 
@@ -3080,6 +3091,8 @@ app.post(
             let firstProductName = null;
             let firstLocalId = null;
             let firstImageUrl = null;
+            let firstSupplier = null;
+            let firstSupplierPhone = null;
             const soldLines = [];
             let anyFullySoldOut = false;
             const affectedLocalIds = new Set();
@@ -3196,6 +3209,8 @@ VALUES
                     firstProductName = product.name;
                     firstLocalId = product.local_id;
                     firstImageUrl = product.image_url || null;
+                    firstSupplier = product.supplier || null;
+                    firstSupplierPhone = product.supplier_phone || null;
                 }
 
                 soldLines.push(
@@ -3255,8 +3270,15 @@ VALUES
                 `${totalProfit >= 0 ? '📈' : '📉'} <b>${totalProfit >= 0 ? 'Foyda' : 'Ziyon'}:</b> ${formatSum(Math.abs(totalProfit))} so'm\n` +
                 remainingStockInfo +
                 `\n━━━━━━━━━━━━━━━━━━━━\n` +
-                (anyFullySoldOut ? `🗑 Ba'zi razmerlar ombordan chiqarildi\n` : '') +
-                `✅ Nasiya savdosi amalga oshdi!`;
+                (firstSupplier
+                    ? `👤 <b>Kimdan olingan:</b> ${telegramEscape(String(firstSupplier).trim())}\n`
+                    : '') +
+                (firstSupplierPhone
+                    ? `📞 <b>Telefon:</b> ${telegramEscape(String(firstSupplierPhone).trim())}\n`
+                    : '') +
+                ((firstSupplier && String(firstSupplier).trim()) || (firstSupplierPhone && String(firstSupplierPhone).trim())
+                    ? `━━━━━━━━━━━━━━━━━━━━`
+                    : '');
 
             sellMessage += await getTodayReport(client, userId);
 
@@ -3918,7 +3940,7 @@ app.get(
                 SELECT
                     id, user_id, local_id, name, category, color, size,
                     cost_price, quantity, qr_token, qr_created_at, created_at,
-                    image_url, selling_price
+                    image_url, selling_price, supplier, supplier_phone
                 FROM public.products
                 WHERE qr_token = $1
                 LIMIT 1
@@ -4085,7 +4107,13 @@ VALUES
                 `💵 <b>Sotuv:</b> ${formatSum(sellingPrice)} so'm\n` +
                 `💳 <b>Tannarx:</b> ${formatSum(cost)} so'm\n` +
                 `${profit >= 0 ? '📈' : '📉'} <b>${profit >= 0 ? 'Foyda' : 'Ziyon'}:</b> ${formatSum(Math.abs(profit))} so'm\n` +
-                `📦 <b>Qoldiq:</b> ${newQty} dona`;
+                `📦 <b>Qoldiq:</b> ${newQty} dona\n` +
+                (product.supplier
+                    ? `👤 <b>Kimdan olingan:</b> ${telegramEscape(String(product.supplier).trim())}\n`
+                    : '') +
+                (product.supplier_phone
+                    ? `📞 <b>Telefon:</b> ${telegramEscape(String(product.supplier_phone).trim())}`
+                    : '');
 
             if (newQty === 0) {
                 message += `\n🗑 <b>Bu razmer ombordan tugadi.</b>`;
