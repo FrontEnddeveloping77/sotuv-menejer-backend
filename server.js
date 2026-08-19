@@ -1392,10 +1392,11 @@ app.post(
     '/api/products',
     authenticateToken,
     async (req, res) => {
+        const body = req.body || {};
+
+        // Turli nomdagi maydonlarni ham qabul qilamiz (frontend farqlari uchun)
         const {
             category,
-            name,
-            cost_price,
             color,
             quantity,
             sizes,
@@ -1405,15 +1406,42 @@ app.post(
             supplier_phone,
             selling_price,
             image_url
-        } = req.body || {};
+        } = body;
 
+        const nameRaw =
+            body.name ??
+            body.title ??
+            body.product_name ??
+            body.productName ??
+            '';
+        const costRaw =
+            body.cost_price ??
+            body.costPrice ??
+            body.price ??
+            body.kelgan_narx ??
+            body.kelganNarx;
+
+        const name =
+            typeof nameRaw === 'string'
+                ? nameRaw.trim()
+                : nameRaw != null && nameRaw !== ''
+                    ? String(nameRaw).trim()
+                    : '';
+
+        if (!name) {
+            return res.status(400).json({
+                message: "Tovar nomi kiritilishi shart!"
+            });
+        }
+
+        // 0 ham yaroqli narx; faqat umuman yuborilmasa / bo'sh satr — xato
         if (
-            !name ||
-            cost_price === undefined
+            costRaw === undefined ||
+            costRaw === null ||
+            (typeof costRaw === 'string' && costRaw.trim() === '')
         ) {
             return res.status(400).json({
-                message:
-                    "Tovar nomi va kelgan narxi kiritilishi shart!"
+                message: "Kelgan narx kiritilishi shart!"
             });
         }
 
@@ -1424,7 +1452,12 @@ app.post(
             });
         }
 
-        const parsedCostPrice = Number(cost_price);
+        // "60 000", "60,000", "60000 so'm" kabi formatlarni ham tozalaymiz
+        const costCleaned = String(costRaw)
+            .replace(/\s/g, '')
+            .replace(/,/g, '')
+            .replace(/[^\d.-]/g, '');
+        const parsedCostPrice = Number(costCleaned);
 
         if (
             !Number.isFinite(parsedCostPrice) ||
@@ -2789,6 +2822,8 @@ app.post(
                 const productId = Number(item.product_id);
                 const qty = Number(item.sell_quantity);
                 const price = Number(item.selling_price);
+                // Sotuvda rang kiritish mumkin (bo'sh bo'lsa tovardagi rang olinadi)
+                const itemColor = typeof item.color === 'string' ? item.color.trim() : '';
 
                 if (!Number.isInteger(productId) || productId <= 0) {
                     await client.query('ROLLBACK');
@@ -2826,6 +2861,7 @@ app.post(
                 const cost = Number(product.cost_price) || 0;
                 const profit = (price - cost) * qty;
                 const newQty = currentQty - qty;
+                const saleColor = itemColor || product.color || null;
 
                 // Sales insert
                 await client.query(
@@ -2860,7 +2896,7 @@ VALUES
                         profit,
                         product.local_id,
                         product.category,
-                        product.color,
+                        saleColor,
                         product.size,
                         product.image_url || null
                     ]
@@ -2891,13 +2927,16 @@ VALUES
                 }
 
                 soldLines.push(
-                    `   • 📏 ${telegramEscape(product.size || 'Standart')}: ${qty} dona × ${formatSum(price)} so'm`
+                    `   • 📏 ${telegramEscape(product.size || 'Standart')}` +
+                    (saleColor ? ` · 🎨 ${telegramEscape(saleColor)}` : '') +
+                    `: ${qty} dona × ${formatSum(price)} so'm`
                 );
 
                 normalizedItems.push({
                     product_id: product.id,
                     qty,
-                    price
+                    price,
+                    color: saleColor
                 });
             }
 
@@ -3037,6 +3076,7 @@ app.post(
                 const productId = Number(item.product_id);
                 const qty = Number(item.sell_quantity);
                 const price = Number(item.selling_price);
+                const itemColor = typeof item.color === 'string' ? item.color.trim() : '';
 
                 if (!Number.isInteger(productId) || productId <= 0) {
                     await client.query('ROLLBACK');
@@ -3074,6 +3114,7 @@ app.post(
                 const cost = Number(product.cost_price) || 0;
                 const profit = (price - cost) * qty;
                 const newQty = currentQty - qty;
+                const saleColor = itemColor || product.color || null;
 
                 // Sales insert — nasiya belgisi bilan
                 await client.query(
@@ -3112,7 +3153,7 @@ VALUES
                         profit,
                         product.local_id,
                         product.category,
-                        product.color,
+                        saleColor,
                         product.size,
                         product.image_url || null,
                         cleanCustomerName,
@@ -3146,7 +3187,9 @@ VALUES
                 }
 
                 soldLines.push(
-                    `   • 📏 ${telegramEscape(product.size || 'Standart')}: ${qty} dona × ${formatSum(price)} so'm`
+                    `   • 📏 ${telegramEscape(product.size || 'Standart')}` +
+                    (saleColor ? ` · 🎨 ${telegramEscape(saleColor)}` : '') +
+                    `: ${qty} dona × ${formatSum(price)} so'm`
                 );
             }
 
@@ -3915,6 +3958,7 @@ app.post(
         }
 
         const sellingPrice = Number(req.body?.selling_price);
+        const bodyColor = typeof req.body?.color === 'string' ? req.body.color.trim() : '';
 
         if (!Number.isFinite(sellingPrice) || sellingPrice < 0) {
             return res.status(400).json({
@@ -3960,6 +4004,7 @@ app.post(
             const totalAmount = sellingPrice * qty;
             const profit = (sellingPrice - cost) * qty;
             const newQty = quantity - qty;
+            const saleColor = bodyColor || product.color || null;
 
             await client.query(
                 `
@@ -3993,7 +4038,7 @@ VALUES
                     profit,
                     product.local_id,
                     product.category,
-                    product.color,
+                    saleColor,
                     product.size,
                     product.image_url || null
                 ]
@@ -4022,6 +4067,7 @@ VALUES
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `📦 <b>Tovar:</b> ${telegramEscape(product.name)}\n` +
                 `📏 <b>Razmer:</b> ${telegramEscape(product.size || 'Standart')}\n` +
+                (saleColor ? `🎨 <b>Rang:</b> ${telegramEscape(saleColor)}\n` : '') +
                 `🔢 <b>Soni:</b> 1 dona\n` +
                 `💵 <b>Sotuv:</b> ${formatSum(sellingPrice)} so'm\n` +
                 `💳 <b>Tannarx:</b> ${formatSum(cost)} so'm\n` +
@@ -4045,14 +4091,15 @@ VALUES
                     local_id: product.local_id,
                     name: product.name,
                     size: product.size,
-                    color: product.color,
+                    color: saleColor,
                     cost_price: cost
                 },
                 selling_price: sellingPrice,
                 quantity: qty,
                 total_amount: totalAmount,
                 profit,
-                remaining_quantity: newQty
+                remaining_quantity: newQty,
+                color: saleColor
             });
         } catch (err) {
             try {
@@ -4175,6 +4222,7 @@ app.post(
         }
 
         const sellingPrice = Number(req.body?.selling_price);
+        const bodyColor = typeof req.body?.color === 'string' ? req.body.color.trim() : '';
         const cleanCustomerName = typeof req.body?.customer_name === 'string'
             ? req.body.customer_name.trim()
             : '';
@@ -4238,6 +4286,7 @@ app.post(
             const profit = (sellingPrice - cost) * qty;
             const newQty = quantity - qty;
             const remainingDebt = Math.max(0, totalAmount - parsedPaidNow);
+            const saleColor = bodyColor || product.color || null;
 
             // Sales — nasiya belgisi bilan
             await client.query(
@@ -4261,7 +4310,7 @@ app.post(
                     profit,
                     product.local_id,
                     product.category,
-                    product.color,
+                    saleColor,
                     product.size,
                     product.image_url || null,
                     cleanCustomerName,
@@ -4293,6 +4342,7 @@ app.post(
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `📦 <b>Tovar:</b> ${telegramEscape(product.name)}\n` +
                 `📏 <b>Razmer:</b> ${telegramEscape(product.size || 'Standart')}\n` +
+                (saleColor ? `🎨 <b>Rang:</b> ${telegramEscape(saleColor)}\n` : '') +
                 `👤 <b>Mijoz:</b> ${telegramEscape(cleanCustomerName)}\n` +
                 `📞 <b>Telefon:</b> ${telegramEscape(cleanCustomerPhone)}\n` +
                 `🔢 <b>Soni:</b> 1 dona\n` +
