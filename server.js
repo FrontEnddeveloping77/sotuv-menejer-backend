@@ -3603,7 +3603,7 @@ app.post(
             });
         }
 
-        const type = ['daily', 'monthly', 'yearly'].includes(expense_type)
+        const type = ['daily', 'weekly', 'monthly', 'yearly', 'other'].includes(expense_type)
             ? expense_type
             : 'daily';
 
@@ -3639,7 +3639,7 @@ app.post(
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `📝 <b>Tavsifi:</b> ${telegramEscape(expense.title)}\n` +
                 `💰 <b>Summasi:</b> ${formatSum(expense.amount)} so'm\n` +
-                `📂 <b>Turi:</b> ${telegramEscape(type)}\n` +
+                `📂 <b>Turi:</b> ${telegramEscape(formatExpenseTypeUz(type))}\n` +
                 `📅 <b>Sanasi:</b> ${telegramEscape(expenseDate)}\n` +
                 `━━━━━━━━━━━━━━━━━━━━`;
 
@@ -3733,7 +3733,6 @@ app.put(
             });
         }
 
-        // Frontend: daily | monthly | other (va ixtiyoriy weekly/yearly)
         const type = ['daily', 'weekly', 'monthly', 'yearly', 'other'].includes(expense_type)
             ? expense_type
             : 'daily';
@@ -3871,7 +3870,6 @@ app.delete(
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `📝 <b>Tavsifi:</b> ${telegramEscape(expense.title)}\n` +
                 `💰 <b>Summasi:</b> ${formatSum(expense.amount)} so'm\n` +
-                `📂 <b>Turi:</b> ${telegramEscape(formatExpenseTypeUz(expense.expense_type))}\n` +
                 `━━━━━━━━━━━━━━━━━━━━`;
 
             message += await getTodayReport(client, userId);
@@ -3919,7 +3917,8 @@ app.get(
                 `
                 SELECT
                     id, user_id, local_id, name, category, color, size,
-                    cost_price, quantity, qr_token, qr_created_at, created_at
+                    cost_price, quantity, qr_token, qr_created_at, created_at,
+                    image_url, selling_price
                 FROM public.products
                 WHERE qr_token = $1
                 LIMIT 1
