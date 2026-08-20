@@ -174,15 +174,21 @@ const ensureEnteredStatsInitialized = async (clientOrPool, userId) => {
         [userId]
     );
 
-    // Turlar: ombor + sotuv
+    // Turlar: faqat ombordagi + qaytarilMAGAN sotuvlar (returned=true ikki marta sanilmasin)
     let types = Number(stock.rows[0].types || 0);
     try {
         const typesRes = await clientOrPool.query(
             `
             SELECT COUNT(*)::int AS types FROM (
-                SELECT local_id FROM public.products WHERE user_id = $1 AND local_id IS NOT NULL
+                SELECT local_id
+                FROM public.products
+                WHERE user_id = $1 AND local_id IS NOT NULL
                 UNION
-                SELECT local_id FROM public.sales WHERE user_id = $1 AND local_id IS NOT NULL
+                SELECT local_id
+                FROM public.sales
+                WHERE user_id = $1
+                  AND local_id IS NOT NULL
+                  AND COALESCE(returned, false) = false
             ) t
             `,
             [userId]
@@ -697,6 +703,15 @@ const ensureTables = async () => {
         await pool.query(`
             ALTER TABLE public.users
             ADD COLUMN IF NOT EXISTS entered_stats_initialized BOOLEAN NOT NULL DEFAULT false;
+        `);
+
+        // Bir marta: eski noto'g'ri (ikki marta sanilgan / returned qo'shilgan) entered_* ni
+        // keyingi so'rovda to'g'ri formula bilan qayta hisoblash uchun flagni reset qilamiz.
+        // ensureTables jarayonida faqat bir marta (process umrida) ishlaydi.
+        await pool.query(`
+            UPDATE public.users
+            SET entered_stats_initialized = false
+            WHERE COALESCE(entered_stats_initialized, false) = true
         `);
 
         await pool.query(`
@@ -1729,6 +1744,11 @@ app.post(
         try {
             await client.query('BEGIN');
 
+            // Init faqat bir marta va INSERT dan OLDIN (aks holda stock+sold + adjust = ikki marta)
+            try {
+                await ensureEnteredStatsInitialized(client, userId);
+            } catch (e) { /* ignore */ }
+
             const last = await client.query(
                 `
                 SELECT local_id
@@ -1955,10 +1975,7 @@ app.post(
                 );
             }
 
-            // Do'konga kirgan tovarlar hisobi (+ faqat qo'shishda)
-            try {
-                await ensureEnteredStatsInitialized(client, userId);
-            } catch (e) { /* ignore */ }
+            // Do'konga kirgan tovarlar hisobi (+ faqat qo'shishda; init yuqorida INSERT dan oldin qilingan)
             await adjustEnteredStats(client, userId, {
                 qtyDelta: totalQty,
                 sumDelta: totalQty * parsedCostPrice,
@@ -3785,6 +3802,11 @@ app.post(
         try {
             await client.query('BEGIN');
 
+            // Init faqat bir marta va o'chirishdan OLDIN
+            try {
+                await ensureEnteredStatsInitialized(client, userId);
+            } catch (e) { /* ignore */ }
+
             const removedLines = [];
             let totalRemoved = 0;
             let anyFullyRemoved = false;
@@ -3975,17 +3997,25 @@ app.post(
             await queueTelegramNotification(client, siteLogin, deleteMessage, firstImageUrl);
 
             // Do'konga kirgan hisobdan ayirish (faqat o'chirishda)
+            // types -1 faqat: omborda ham, qaytarilmagan sotuvda ham shu local_id qolmaganda
             let typesDelta = 0;
             for (const lid of localIdsTouched) {
                 const left = await client.query(
                     `SELECT 1 FROM public.products WHERE user_id = $1 AND local_id = $2 LIMIT 1`,
                     [userId, lid]
                 );
-                if (!left.rows.length) typesDelta -= 1;
+                if (left.rows.length) continue;
+                const soldLeft = await client.query(
+                    `
+                    SELECT 1 FROM public.sales
+                    WHERE user_id = $1 AND local_id = $2
+                      AND COALESCE(returned, false) = false
+                    LIMIT 1
+                    `,
+                    [userId, lid]
+                );
+                if (!soldLeft.rows.length) typesDelta -= 1;
             }
-            try {
-                await ensureEnteredStatsInitialized(client, userId);
-            } catch (e) { /* ignore */ }
             await adjustEnteredStats(client, userId, {
                 qtyDelta: -enteredQtyDelta,
                 sumDelta: -enteredSumDelta,
@@ -4613,6 +4643,11 @@ app.post(
 
             const product = result.rows[0];
 
+            // Init faqat bir marta va o'chirishdan OLDIN
+            try {
+                await ensureEnteredStatsInitialized(client, product.user_id);
+            } catch (e) { /* ignore */ }
+
             const userResult = await client.query(
                 `SELECT site_login FROM public.users WHERE id = $1`,
                 [product.user_id]
@@ -4629,15 +4664,24 @@ app.post(
             );
 
             // Do'konga kirgan hisobdan ayirish (faqat o'chirishda)
+            // types -1 faqat: omborda ham, qaytarilmagan sotuvda ham shu local_id qolmaganda
             let typesDelta = 0;
             const left = await client.query(
                 `SELECT 1 FROM public.products WHERE user_id = $1 AND local_id = $2 LIMIT 1`,
                 [product.user_id, localId]
             );
-            if (!left.rows.length) typesDelta = -1;
-            try {
-                await ensureEnteredStatsInitialized(client, product.user_id);
-            } catch (e) { /* ignore */ }
+            if (!left.rows.length) {
+                const soldLeft = await client.query(
+                    `
+                    SELECT 1 FROM public.sales
+                    WHERE user_id = $1 AND local_id = $2
+                      AND COALESCE(returned, false) = false
+                    LIMIT 1
+                    `,
+                    [product.user_id, localId]
+                );
+                if (!soldLeft.rows.length) typesDelta = -1;
+            }
             await adjustEnteredStats(client, product.user_id, {
                 qtyDelta: -removeQty,
                 sumDelta: -removeSum,
@@ -5178,12 +5222,30 @@ app.post('/api/products/restore', authenticateToken, async (req, res) => {
             });
         }
 
+        // Init faqat bir marta va restore INSERT dan OLDIN
+        try {
+            await ensureEnteredStatsInitialized(client, userId);
+        } catch (e) { /* ignore */ }
+
         // Restore qilishdan oldin shu local_id bor-yo'qligini tekshiramiz (types uchun)
+        // types +1 faqat: omborda yo'q VA qaytarilmagan sotuvda ham yo'q bo'lsa
         const existsBefore = await client.query(
             `SELECT 1 FROM public.products WHERE user_id = $1 AND local_id = $2 LIMIT 1`,
             [userId, row.local_id]
         );
-        const wasMissing = existsBefore.rows.length === 0;
+        let typesDeltaRestore = 0;
+        if (existsBefore.rows.length === 0) {
+            const soldExists = await client.query(
+                `
+                SELECT 1 FROM public.sales
+                WHERE user_id = $1 AND local_id = $2
+                  AND COALESCE(returned, false) = false
+                LIMIT 1
+                `,
+                [userId, row.local_id]
+            );
+            if (!soldExists.rows.length) typesDeltaRestore = 1;
+        }
 
         const insertRes = await client.query(
             `
@@ -5221,14 +5283,11 @@ app.post('/api/products/restore', authenticateToken, async (req, res) => {
             [deletedId]
         );
 
-        // ★★★ Entered statsni qayta qo'shamiz
-        try {
-            await ensureEnteredStatsInitialized(client, userId);
-        } catch (e) { /* ignore */ }
+        // ★★★ Entered statsni qayta qo'shamiz (init yuqorida INSERT dan oldin qilingan)
         await adjustEnteredStats(client, userId, {
             qtyDelta: Number(row.quantity) || 0,
             sumDelta: (Number(row.quantity) || 0) * (Number(row.cost_price) || 0),
-            typesDelta: wasMissing ? 1 : 0
+            typesDelta: typesDeltaRestore
         });
 
         const userRes = await client.query(
