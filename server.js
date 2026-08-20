@@ -6,6 +6,10 @@
 // - POST /api/qr/:token/sell-credit  (QR orqali nasiyaga sotish)
 // - GET  /api/products/deleted       (o'chirilgan tovarlar)
 // - POST /api/products/restore       (omborga qaytarish)
+//
+// MUHIM TUZATISH (2026-08):
+// Do'konga kirgan tovarlar (entered_*) FAQAT qo'shish / o'chirish / restore / edit-qty da o'zgaradi.
+// Sotuv (hatto oxirgi dona) HECH QACHON kamaytirmaydi.
 
 require('dotenv').config();
 
@@ -112,7 +116,7 @@ const daysSince = (dateValue) => {
     return (Date.now() - then) / (1000 * 60 * 60 * 24);
 };
 
-/** Do'konga kirgan tovarlar hisobi — faqat qo'shish / o'chirishda o'zgaradi */
+/** Do'konga kirgan tovarlar hisobi — faqat qo'shish / o'chirish / restore / edit da o'zgaradi */
 const adjustEnteredStats = async (clientOrPool, userId, { qtyDelta = 0, sumDelta = 0, typesDelta = 0 } = {}) => {
     if (!qtyDelta && !sumDelta && !typesDelta) return;
     await clientOrPool.query(
@@ -130,7 +134,7 @@ const adjustEnteredStats = async (clientOrPool, userId, { qtyDelta = 0, sumDelta
 
 /**
  * Bir marta: avval qo'shilgan tovarlarni ham hisobga olish.
- * Manba: hozirgi ombor + sotilganlar (vozvrat qilinmagan) + o'chirilgan arxiv.
+ * Manba: hozirgi ombor + sotilganlar (vozvrat qilinmagan).
  * Sotuv keyin hisobni kamaytirmaydi — shu backfill boshlang'ich nuqta.
  */
 const ensureEnteredStatsInitialized = async (clientOrPool, userId) => {
@@ -170,7 +174,7 @@ const ensureEnteredStatsInitialized = async (clientOrPool, userId) => {
         [userId]
     );
 
-    // Turlar: faqat ombor + sotuv (o'chirilgan qo'shilmaydi)
+    // Turlar: ombor + sotuv
     let types = Number(stock.rows[0].types || 0);
     try {
         const typesRes = await clientOrPool.query(
@@ -186,7 +190,6 @@ const ensureEnteredStatsInitialized = async (clientOrPool, userId) => {
         types = Number(typesRes.rows[0]?.types || types);
     } catch (e2) { /* keep stock types */ }
 
-    // O'chirilganlar qo'shilmaydi — aks holda son sun'iy oshadi
     const qty =
         Number(stock.rows[0].qty || 0) +
         Number(sold.rows[0].qty || 0);
@@ -1335,7 +1338,7 @@ app.get(
 );
 
 // ====================================================
-// DASHBOARD STATS
+// DASHBOARD STATS  ★★★ ASOSIY TUZATISH SHU YERDA ★★★
 // ====================================================
 
 app.get(
@@ -1345,107 +1348,26 @@ app.get(
         try {
             const userId = req.user.userId;
 
+            // Entered statsni bir marta init qilish
+            try {
+                await ensureEnteredStatsInitialized(pool, userId);
+            } catch (e) { /* ignore */ }
+
             let storeName = '';
 
             const userResult = await pool.query(
                 `
                 SELECT
                     full_name,
-                    site_login
+                    site_login,
+                    COALESCE(entered_qty, 0) AS entered_qty,
+                    COALESCE(entered_types, 0) AS entered_types,
+                    COALESCE(entered_sum, 0) AS entered_sum
                 FROM public.users
                 WHERE id = $1
                 LIMIT 1
                 `,
                 [userId]
-            );
-
-            // Do'konga kirgan (aniq formula):
-            //   ombordagi qoldiq
-            // + sotilgan (vozvrat qilinmagan)
-            // − o'chirilgan arxivda qolib ketgan, LEKIN omborda qayta bor bo'lganlar
-            //   (restore bug / qayta qo'shish — ikki marta hisoblashni oldini oladi)
-            // Sotuv kirgan sonni o'zgartirmaydi.
-            const enteredStock = await pool.query(
-                `
-                SELECT
-                    COALESCE(SUM(quantity), 0) AS qty,
-                    COALESCE(SUM(quantity * cost_price), 0) AS sum_val
-                FROM public.products
-                WHERE user_id = $1
-                `,
-                [userId]
-            );
-            const enteredSold = await pool.query(
-                `
-                SELECT
-                    COALESCE(SUM(quantity), 0) AS qty,
-                    COALESCE(SUM(quantity * cost_price), 0) AS sum_val
-                FROM public.sales
-                WHERE user_id = $1
-                  AND returned IS NOT TRUE
-                `,
-                [userId]
-            );
-
-            // Vozvrat qilinganlar omborda, lekin agar returned belgilari noto'g'ri bo'lsa
-            // qo'shimcha himoya: returned = true bo'lgan sotuvlar umuman qo'shilmaydi (yuqorida).
-
-            // O'chirilgan arxiv: faqat omborda SHU local_id hali bor bo'lsa ayiramiz
-            // (qayta tiklangan / qayta kiritilgan — dublikat)
-            let doubleCountQty = 0;
-            let doubleCountSum = 0;
-            try {
-                const dup = await pool.query(
-                    `
-                    SELECT
-                        COALESCE(SUM(d.quantity), 0) AS qty,
-                        COALESCE(SUM(d.quantity * d.cost_price), 0) AS sum_val
-                    FROM public.deleted_products d
-                    WHERE d.user_id = $1
-                      AND EXISTS (
-                        SELECT 1
-                        FROM public.products p
-                        WHERE p.user_id = d.user_id
-                          AND p.local_id = d.local_id
-                      )
-                    `,
-                    [userId]
-                );
-                doubleCountQty = Number(dup.rows[0].qty || 0);
-                doubleCountSum = Number(dup.rows[0].sum_val || 0);
-            } catch (e) { /* deleted_products yo'q */ }
-
-            // Yana: vozvrat qilingan sotuvlar returned=true, lekin ba'zida false qolib stockga qaytgan
-            // bo'lishi mumkin. Bunday holatni aniq bilib bo'lmaydi; returned IS NOT TRUE ishlatamiz.
-
-            let enteredTypes = 0;
-            try {
-                const typesRes = await pool.query(
-                    `
-                    SELECT COUNT(*)::int AS types FROM (
-                        SELECT local_id FROM public.products WHERE user_id = $1 AND local_id IS NOT NULL
-                        UNION
-                        SELECT local_id FROM public.sales WHERE user_id = $1 AND local_id IS NOT NULL AND returned IS NOT TRUE
-                    ) t
-                    `,
-                    [userId]
-                );
-                enteredTypes = Number(typesRes.rows[0].types || 0);
-            } catch (e) {
-                enteredTypes = 0;
-            }
-
-            const liveEnteredQty = Math.max(
-                0,
-                Number(enteredStock.rows[0].qty || 0) +
-                Number(enteredSold.rows[0].qty || 0) -
-                doubleCountQty
-            );
-            const liveEnteredSum = Math.max(
-                0,
-                Number(enteredStock.rows[0].sum_val || 0) +
-                Number(enteredSold.rows[0].sum_val || 0) -
-                doubleCountSum
             );
 
             if (userResult.rows.length > 0) {
@@ -1454,6 +1376,12 @@ app.get(
                     userResult.rows[0].site_login ||
                     '';
             }
+
+            // ★★★ Endi faqat users jadvalidagi saqlangan qiymatlar ishlatiladi.
+            // Sotuv (hatto oxirgi dona) bu qiymatlarni HECH QACHON o'zgartirmaydi.
+            const enteredQty = Number(userResult.rows[0]?.entered_qty || 0);
+            const enteredTypes = Number(userResult.rows[0]?.entered_types || 0);
+            const enteredSum = Number(userResult.rows[0]?.entered_sum || 0);
 
             const productStats = await pool.query(
                 `
@@ -1561,20 +1489,15 @@ app.get(
                 `TRUE`
             );
 
-            const uRow = userResult.rows[0] || {};
             res.json({
                 storeName,
                 totalProducts: Number(productStats.rows[0].totalProducts || 0),
                 totalStock: Number(productStats.rows[0].totalStock || 0),
                 totalStockValue: Number(productStats.rows[0].totalStockValue || 0),
-                enteredQty: liveEnteredQty,
-                enteredTypes: enteredTypes,
-                enteredSum: liveEnteredSum,
-                enteredBreakdown: {
-                    stock: Number(enteredStock.rows[0].qty || 0),
-                    sold: Number(enteredSold.rows[0].qty || 0),
-                    doubleCountRemoved: doubleCountQty
-                },
+                // ★★★ Faqat saqlangan qiymatlar — sotuv ta'sir qilmaydi
+                enteredQty,
+                enteredTypes,
+                enteredSum,
                 totalDebt: Number(debtStats.rows[0].totalDebt || 0),
                 totalCustomerDebt: Number(customerDebtStats.rows[0].totalCustomerDebt || 0),
                 totalSold: total.sold,
@@ -2142,7 +2065,7 @@ app.get(
 );
 
 // ====================================================
-// DO'KONGA KIRGAN TOVARLAR (ombor + sotilgan + o'chirilgan)
+// DO'KONGA KIRGAN TOVARLAR (ombor + sotilgan)
 // ====================================================
 app.get('/api/products/entered', authenticateToken, async (req, res) => {
     try {
@@ -2483,8 +2406,7 @@ app.post(
             // Muddat tekshiruvi (oxirgi 30 kun)
             const anyRecent = groupsResult.rows.some(g => daysSince(g.created_at) <= DEBT_PAYMENT_UNDO_WINDOW_DAYS);
             if (!anyRecent) {
-                // Hali ham ruxsat beramiz, lekin ogohlantiramiz (yoki qattiq cheklash mumkin)
-                // Hozircha ruxsat beramiz
+                // Hali ham ruxsat beramiz
             }
 
             let totalAdjusted = 0;
@@ -2532,11 +2454,7 @@ app.post(
                     });
                 }
             } else {
-                // Edit mode: barcha local_id lar uchun paid_amount ni yangi qiymatga o'zgartirish
-                // (soddalashtirilgan: birinchi groupga qo'llaymiz yoki proporsional)
-                // Eng oddiy: barcha grouplar uchun bir xil yangi paid_amount qo'yamiz (yoki faqat bitta)
-                // Hozircha: umumiy paid ni o'zgartirish uchun birinchi local_id ga yozamiz
-
+                // Edit mode
                 const first = groupsResult.rows[0];
                 const oldPaid = Number(first.total_paid) || 0;
 
@@ -2551,7 +2469,7 @@ app.post(
                     [parsedAmount, userId, first.local_id]
                 );
 
-                // Boshqa local_id larni 0 qilish (sodda yondashuv)
+                // Boshqa local_id larni 0 qilish
                 for (let i = 1; i < groupsResult.rows.length; i++) {
                     await client.query(
                         `
@@ -2872,7 +2790,7 @@ app.get(
 );
 
 // ====================================================
-// TOVARNI TAHRIRLASH (PUT /api/products/:localId) — TO'LIQ TUZATILGAN
+// TOVARNI TAHRIRLASH (PUT /api/products/:localId) — TUZATILGAN (entered delta)
 // ====================================================
 app.put('/api/products/:localId', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
@@ -2942,6 +2860,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
         }
 
         const oldTotalQty = oldRes.rows.reduce((s, r) => s + Number(r.quantity || 0), 0);
+        const oldSum = oldRes.rows.reduce((s, r) => s + (Number(r.quantity || 0) * Number(r.cost_price || 0)), 0);
         const oldSizes = oldRes.rows.map(r => r.size || 'Standart').join(', ');
         const oldImage = oldFirst.image_url || null;
 
@@ -3012,6 +2931,21 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
                 insertedRows.push(result.rows[0]);
             }
         }
+
+        // ★★★ Entered stats delta (faqat miqdor/narx o'zgarsa)
+        const newTotalQty = totalQty;
+        const newSum = totalQty * parsedCostPrice;
+        const qtyDelta = newTotalQty - oldTotalQty;
+        const sumDelta = newSum - oldSum;
+
+        try {
+            await ensureEnteredStatsInitialized(client, userId);
+        } catch (e) { /* ignore */ }
+        await adjustEnteredStats(client, userId, {
+            qtyDelta,
+            sumDelta,
+            typesDelta: 0 // local_id o'zgarmagan
+        });
 
         // Telegram xabar (eski → yangi + rasm)
         const userResult = await client.query(
@@ -3097,7 +3031,6 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
         );
 
         // Omborga FAQAT SHU RAZMER / SHU QATOR ga qaytarish
-        // (Eski xato: local_id bo'yicha BARCHA razmerlarga quantity qo'shardi)
         const qtyToReturn = Number(sale.quantity) || 0;
         let restoredImageUrl = sale.image_url || null;
         let restored = false;
@@ -3215,7 +3148,7 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
 });
 
 // ====================================================
-// SOTUV (NAQD)
+// SOTUV (NAQD) — entered ga TA'SIR QILMAYDI
 // ====================================================
 
 app.post(
@@ -3483,7 +3416,7 @@ VALUES
 );
 
 // ====================================================
-// YANGI: NASIYAGA SOTISH
+// YANGI: NASIYAGA SOTISH — entered ga TA'SIR QILMAYDI
 // ====================================================
 
 app.post(
@@ -4460,7 +4393,7 @@ app.get(
 );
 
 // ====================================================
-// QR SOTUV
+// QR SOTUV — entered ga TA'SIR QILMAYDI
 // ====================================================
 
 app.post(
@@ -4730,7 +4663,7 @@ app.post(
 );
 
 // ====================================================
-// QR NASIYAGA SOTISH
+// QR NASIYAGA SOTISH — entered ga TA'SIR QILMAYDI
 // ====================================================
 
 app.post(
@@ -5194,7 +5127,7 @@ app.get('/api/products/deleted', authenticateToken, async (req, res) => {
 });
 
 // ====================================================
-// TOVARNI OMBORGA QAYTARISH
+// TOVARNI OMBORGA QAYTARISH — entered ga + qo'shiladi
 // ====================================================
 app.post('/api/products/restore', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
@@ -5226,6 +5159,13 @@ app.post('/api/products/restore', authenticateToken, async (req, res) => {
                 message: `Bu tovar ${DELETED_RESTORE_WINDOW_DAYS} kundan ko'p vaqt oldin o'chirilgan, qaytarib bo'lmaydi!`
             });
         }
+
+        // Restore qilishdan oldin shu local_id bor-yo'qligini tekshiramiz (types uchun)
+        const existsBefore = await client.query(
+            `SELECT 1 FROM public.products WHERE user_id = $1 AND local_id = $2 LIMIT 1`,
+            [userId, row.local_id]
+        );
+        const wasMissing = existsBefore.rows.length === 0;
 
         const insertRes = await client.query(
             `
@@ -5262,6 +5202,16 @@ app.post('/api/products/restore', authenticateToken, async (req, res) => {
             `DELETE FROM public.deleted_products WHERE id = $1`,
             [deletedId]
         );
+
+        // ★★★ Entered statsni qayta qo'shamiz
+        try {
+            await ensureEnteredStatsInitialized(client, userId);
+        } catch (e) { /* ignore */ }
+        await adjustEnteredStats(client, userId, {
+            qtyDelta: Number(row.quantity) || 0,
+            sumDelta: (Number(row.quantity) || 0) * (Number(row.cost_price) || 0),
+            typesDelta: wasMissing ? 1 : 0
+        });
 
         const userRes = await client.query(
             `SELECT site_login FROM public.users WHERE id = $1`,
@@ -5438,13 +5388,6 @@ app.get('/api/bot/products', async (req, res) => {
 
 /**
  * GET /api/bot/top_category?login=XXX
- * Javob: {
- *   category, sold_count, total_amount,
- *   top_size, top_size_sold, top_size_amount,
- *   top_color, top_color_sold, top_color_amount,
- *   stock_size, stock_size_qty,
- *   stock_category, stock_category_qty
- * }
  */
 app.get('/api/bot/top_category', async (req, res) => {
     const siteLogin = typeof req.query.login === 'string' ? req.query.login.trim() : '';
@@ -5482,7 +5425,7 @@ app.get('/api/bot/top_category', async (req, res) => {
             [userId]
         );
 
-        // Eng ko'p sotilgan razmer (faqat razmer kiritilganlar)
+        // Eng ko'p sotilgan razmer
         const sizeSoldResult = await pool.query(
             `
             SELECT
@@ -5501,7 +5444,7 @@ app.get('/api/bot/top_category', async (req, res) => {
             [userId]
         );
 
-        // Eng ko'p sotilgan rang (faqat rang kiritilganlar)
+        // Eng ko'p sotilgan rang
         const colorSoldResult = await pool.query(
             `
             SELECT
@@ -5520,7 +5463,7 @@ app.get('/api/bot/top_category', async (req, res) => {
             [userId]
         );
 
-        // Eng ko'p turib qolgan razmer (faqat razmer kiritilganlar, ombordagi eng ko'p qoldiq)
+        // Eng ko'p turib qolgan razmer
         const stockSizeResult = await pool.query(
             `
             SELECT
@@ -5538,7 +5481,7 @@ app.get('/api/bot/top_category', async (req, res) => {
             [userId]
         );
 
-        // Eng ko'p turib qolgan kategoriya (ombordagi eng ko'p qoldiq)
+        // Eng ko'p turib qolgan kategoriya
         const stockCatResult = await pool.query(
             `
             SELECT
@@ -5588,7 +5531,6 @@ app.get('/api/bot/top_category', async (req, res) => {
 
 /**
  * GET /api/bot/report?login=XXX&period=daily|weekly|monthly|yearly
- * Javob: { revenue, profit, expense, net_profit, sold, total_products, total_stock }
  */
 app.get('/api/bot/report', async (req, res) => {
     const siteLogin = typeof req.query.login === 'string' ? req.query.login.trim() : '';
@@ -5690,7 +5632,6 @@ app.get('/api/bot/report', async (req, res) => {
 
 /**
  * GET /api/bot/warehouse?login=XXX
- * Javob: { total_products, total_stock }
  */
 app.get('/api/bot/warehouse', async (req, res) => {
     const siteLogin = typeof req.query.login === 'string' ? req.query.login.trim() : '';
