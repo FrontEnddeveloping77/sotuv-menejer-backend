@@ -2094,6 +2094,158 @@ app.get(
 );
 
 // ====================================================
+// DO'KONGA KIRGAN TOVARLAR (ombor + sotilgan + o'chirilgan)
+// ====================================================
+app.get('/api/products/entered', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId;
+
+        try {
+            await ensureEnteredStatsInitialized(pool, userId);
+        } catch (e) { /* ignore */ }
+
+        const stock = await pool.query(
+            `
+            SELECT
+                local_id,
+                MAX(name) AS name,
+                MAX(category) AS category,
+                MAX(color) AS color,
+                COALESCE(SUM(quantity), 0) AS stock_qty,
+                COALESCE(SUM(quantity * cost_price), 0) AS stock_sum,
+                array_agg(DISTINCT size) FILTER (WHERE size IS NOT NULL AND TRIM(size) <> '') AS sizes
+            FROM public.products
+            WHERE user_id = $1
+            GROUP BY local_id
+            `,
+            [userId]
+        );
+
+        const sold = await pool.query(
+            `
+            SELECT
+                local_id,
+                MAX(title) AS name,
+                MAX(category) AS category,
+                MAX(color) AS color,
+                COALESCE(SUM(quantity), 0) AS sold_qty,
+                COALESCE(SUM(quantity * cost_price), 0) AS sold_sum,
+                array_agg(DISTINCT size) FILTER (WHERE size IS NOT NULL AND TRIM(size) <> '') AS sizes
+            FROM public.sales
+            WHERE user_id = $1
+              AND COALESCE(returned, false) = false
+            GROUP BY local_id
+            `,
+            [userId]
+        );
+
+        let deletedRows = [];
+        try {
+            const deleted = await pool.query(
+                `
+                SELECT
+                    local_id,
+                    MAX(name) AS name,
+                    MAX(category) AS category,
+                    MAX(color) AS color,
+                    COALESCE(SUM(quantity), 0) AS deleted_qty,
+                    COALESCE(SUM(quantity * cost_price), 0) AS deleted_sum,
+                    array_agg(DISTINCT size) FILTER (WHERE size IS NOT NULL AND TRIM(size) <> '') AS sizes
+                FROM public.deleted_products
+                WHERE user_id = $1
+                GROUP BY local_id
+                `,
+                [userId]
+            );
+            deletedRows = deleted.rows;
+        } catch (e) {
+            deletedRows = [];
+        }
+
+        const map = new Map();
+
+        const upsert = (row, kind) => {
+            const lid = row.local_id;
+            if (lid == null) return;
+            if (!map.has(lid)) {
+                map.set(lid, {
+                    local_id: lid,
+                    name: row.name || 'Tovar',
+                    category: row.category || '',
+                    color: row.color || '',
+                    sizes: new Set(),
+                    stock_qty: 0,
+                    sold_qty: 0,
+                    deleted_qty: 0,
+                    stock_sum: 0,
+                    sold_sum: 0,
+                    deleted_sum: 0
+                });
+            }
+            const g = map.get(lid);
+            if (row.name) g.name = row.name;
+            if (row.category) g.category = row.category;
+            if (row.color) g.color = row.color;
+            (row.sizes || []).forEach((s) => {
+                if (s) g.sizes.add(String(s));
+            });
+            if (kind === 'stock') {
+                g.stock_qty += Number(row.stock_qty || 0);
+                g.stock_sum += Number(row.stock_sum || 0);
+            } else if (kind === 'sold') {
+                g.sold_qty += Number(row.sold_qty || 0);
+                g.sold_sum += Number(row.sold_sum || 0);
+            } else if (kind === 'deleted') {
+                g.deleted_qty += Number(row.deleted_qty || 0);
+                g.deleted_sum += Number(row.deleted_sum || 0);
+            }
+        };
+
+        stock.rows.forEach((r) => upsert(r, 'stock'));
+        sold.rows.forEach((r) => upsert(r, 'sold'));
+        deletedRows.forEach((r) => upsert(r, 'deleted'));
+
+        const products = Array.from(map.values())
+            .map((g) => {
+                const entered_qty = g.stock_qty + g.sold_qty + g.deleted_qty;
+                const entered_sum = g.stock_sum + g.sold_sum + g.deleted_sum;
+                const remaining = g.stock_qty;
+                return {
+                    local_id: g.local_id,
+                    name: g.name,
+                    category: g.category || '—',
+                    color: g.color || '—',
+                    sizes: Array.from(g.sizes),
+                    entered_qty,
+                    entered_sum,
+                    remaining_qty: remaining,
+                    sold_qty: g.sold_qty,
+                    deleted_qty: g.deleted_qty,
+                    status: remaining > 0 ? 'omborda' : 'tugagan'
+                };
+            })
+            .filter((p) => p.entered_qty > 0)
+            .sort((a, b) => Number(b.local_id) - Number(a.local_id));
+
+        const totalEnteredQty = products.reduce((s, p) => s + p.entered_qty, 0);
+        const totalEnteredSum = products.reduce((s, p) => s + p.entered_sum, 0);
+        const totalTypes = products.length;
+
+        return res.json({
+            products,
+            summary: {
+                enteredTypes: totalTypes,
+                enteredQty: totalEnteredQty,
+                enteredSum: totalEnteredSum
+            }
+        });
+    } catch (err) {
+        console.error('GET /api/products/entered xatosi:', err);
+        return res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
+    }
+});
+
+// ====================================================
 // QARZLAR RO'YXATI (Tovar berganlar — to'g'ri hisob)
 // ====================================================
 app.get('/api/debts', authenticateToken, async (req, res) => {
