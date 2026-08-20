@@ -8,8 +8,8 @@
 // - POST /api/products/restore       (omborga qaytarish)
 //
 // MUHIM TUZATISH (2026-08):
-// Do'konga kirgan tovarlar (entered_*) FAQAT qo'shish / o'chirish / restore / edit-qty da o'zgaradi.
-// Sotuv (hatto oxirgi dona) HECH QACHON kamaytirmaydi.
+// Do'konga kirgan tovarlar (entered_*) FAQAT qo'shish / o'chirish / restore da o'zgaradi.
+// Sotuv, vozvrat, tahrirlash HECH QACHON entered_* ni o'zgartirmaydi.
 
 require('dotenv').config();
 
@@ -116,7 +116,7 @@ const daysSince = (dateValue) => {
     return (Date.now() - then) / (1000 * 60 * 60 * 24);
 };
 
-/** Do'konga kirgan tovarlar hisobi — faqat qo'shish / o'chirish / restore / edit da o'zgaradi */
+/** Do'konga kirgan tovarlar hisobi — faqat qo'shish / o'chirish / restore da o'zgaradi */
 const adjustEnteredStats = async (clientOrPool, userId, { qtyDelta = 0, sumDelta = 0, typesDelta = 0 } = {}) => {
     if (!qtyDelta && !sumDelta && !typesDelta) return;
     await clientOrPool.query(
@@ -2170,16 +2170,27 @@ app.get('/api/products/entered', authenticateToken, async (req, res) => {
             .filter((p) => p.entered_qty > 0)
             .sort((a, b) => Number(b.local_id) - Number(a.local_id));
 
-        const totalEnteredQty = products.reduce((s, p) => s + p.entered_qty, 0);
-        const totalEnteredSum = products.reduce((s, p) => s + p.entered_sum, 0);
-        const totalTypes = products.length;
+        // Summary FAQAT users jadvalidagi saqlangan entered_* dan (live stock+sold hisoblanmasin)
+        const userStats = await pool.query(
+            `
+            SELECT
+                COALESCE(entered_qty, 0) AS entered_qty,
+                COALESCE(entered_sum, 0) AS entered_sum,
+                COALESCE(entered_types, 0) AS entered_types
+            FROM public.users
+            WHERE id = $1
+            LIMIT 1
+            `,
+            [userId]
+        );
+        const u = userStats.rows[0] || {};
 
         return res.json({
             products,
             summary: {
-                enteredTypes: totalTypes,
-                enteredQty: totalEnteredQty,
-                enteredSum: totalEnteredSum
+                enteredTypes: Number(u.entered_types || 0),
+                enteredQty: Number(u.entered_qty || 0),
+                enteredSum: Number(u.entered_sum || 0)
             }
         });
     } catch (err) {
@@ -2932,20 +2943,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
             }
         }
 
-        // ★★★ Entered stats delta (faqat miqdor/narx o'zgarsa)
-        const newTotalQty = totalQty;
-        const newSum = totalQty * parsedCostPrice;
-        const qtyDelta = newTotalQty - oldTotalQty;
-        const sumDelta = newSum - oldSum;
-
-        try {
-            await ensureEnteredStatsInitialized(client, userId);
-        } catch (e) { /* ignore */ }
-        await adjustEnteredStats(client, userId, {
-            qtyDelta,
-            sumDelta,
-            typesDelta: 0 // local_id o'zgarmagan
-        });
+        // Entered stats: tahrirlash HECH QACHON o'zgartirmaydi (faqat qo'shish / o'chirish / restore)
 
         // Telegram xabar (eski → yangi + rasm)
         const userResult = await client.query(
@@ -4621,10 +4619,30 @@ app.post(
             );
             const siteLogin = userResult.rows[0]?.site_login || null;
 
+            const removeQty = Number(product.quantity) || 0;
+            const removeSum = removeQty * (Number(product.cost_price) || 0);
+            const localId = product.local_id;
+
             await client.query(
                 `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
                 [product.id, product.user_id]
             );
+
+            // Do'konga kirgan hisobdan ayirish (faqat o'chirishda)
+            let typesDelta = 0;
+            const left = await client.query(
+                `SELECT 1 FROM public.products WHERE user_id = $1 AND local_id = $2 LIMIT 1`,
+                [product.user_id, localId]
+            );
+            if (!left.rows.length) typesDelta = -1;
+            try {
+                await ensureEnteredStatsInitialized(client, product.user_id);
+            } catch (e) { /* ignore */ }
+            await adjustEnteredStats(client, product.user_id, {
+                qtyDelta: -removeQty,
+                sumDelta: -removeSum,
+                typesDelta
+            });
 
             const messageBase =
                 `🗑️ <b>QR ORQALI TOVAR O'CHIRILDI</b>\n` +
@@ -4634,7 +4652,7 @@ app.post(
                 `🎨 <b>Rang:</b> ${telegramEscape(product.color || "Ko'rsatilmagan")}\n` +
                 `🗂 <b>Kategoriya:</b> ${telegramEscape(product.category || "Ko'rsatilmagan")}\n` +
                 `💰 <b>Tannarx:</b> ${formatSum(product.cost_price)} so'm\n` +
-                `🔢 <b>Ombordagi miqdor:</b> ${Number(product.quantity) || 0} dona\n` +
+                `🔢 <b>Ombordagi miqdor:</b> ${removeQty} dona\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
                 `🗑️ Tovar ombordan chiqarildi.`;
 
