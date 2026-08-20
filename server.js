@@ -705,15 +705,6 @@ const ensureTables = async () => {
             ADD COLUMN IF NOT EXISTS entered_stats_initialized BOOLEAN NOT NULL DEFAULT false;
         `);
 
-        // Bir marta: eski noto'g'ri (ikki marta sanilgan / returned qo'shilgan) entered_* ni
-        // keyingi so'rovda to'g'ri formula bilan qayta hisoblash uchun flagni reset qilamiz.
-        // ensureTables jarayonida faqat bir marta (process umrida) ishlaydi.
-        await pool.query(`
-            UPDATE public.users
-            SET entered_stats_initialized = false
-            WHERE COALESCE(entered_stats_initialized, false) = true
-        `);
-
         await pool.query(`
             CREATE INDEX IF NOT EXISTS
             idx_users_linked_group_chat_id
@@ -1739,15 +1730,17 @@ app.post(
                 });
         }
 
+        // Init transaction TASHQARISIDA (xato bo'lsa ham BEGIN abort bo'lmasin)
+        try {
+            await ensureEnteredStatsInitialized(pool, userId);
+        } catch (e) {
+            console.error('ensureEnteredStatsInitialized (add) xatosi:', e.message);
+        }
+
         const client = await pool.connect();
 
         try {
             await client.query('BEGIN');
-
-            // Init faqat bir marta va INSERT dan OLDIN (aks holda stock+sold + adjust = ikki marta)
-            try {
-                await ensureEnteredStatsInitialized(client, userId);
-            } catch (e) { /* ignore */ }
 
             const last = await client.query(
                 `
@@ -1976,11 +1969,15 @@ app.post(
             }
 
             // Do'konga kirgan tovarlar hisobi (+ faqat qo'shishda; init yuqorida INSERT dan oldin qilingan)
-            await adjustEnteredStats(client, userId, {
-                qtyDelta: totalQty,
-                sumDelta: totalQty * parsedCostPrice,
-                typesDelta: 1
-            });
+            try {
+                await adjustEnteredStats(client, userId, {
+                    qtyDelta: totalQty,
+                    sumDelta: totalQty * parsedCostPrice,
+                    typesDelta: 1
+                });
+            } catch (e) {
+                console.error('adjustEnteredStats (add) xatosi:', e.message);
+            }
 
             await client.query('COMMIT');
 
@@ -3797,15 +3794,17 @@ app.post(
             });
         }
 
+        // Init transaction TASHQARISIDA
+        try {
+            await ensureEnteredStatsInitialized(pool, userId);
+        } catch (e) {
+            console.error('ensureEnteredStatsInitialized (delete) xatosi:', e.message);
+        }
+
         const client = await pool.connect();
 
         try {
             await client.query('BEGIN');
-
-            // Init faqat bir marta va o'chirishdan OLDIN
-            try {
-                await ensureEnteredStatsInitialized(client, userId);
-            } catch (e) { /* ignore */ }
 
             const removedLines = [];
             let totalRemoved = 0;
@@ -4016,11 +4015,15 @@ app.post(
                 );
                 if (!soldLeft.rows.length) typesDelta -= 1;
             }
-            await adjustEnteredStats(client, userId, {
-                qtyDelta: -enteredQtyDelta,
-                sumDelta: -enteredSumDelta,
-                typesDelta
-            });
+            try {
+                await adjustEnteredStats(client, userId, {
+                    qtyDelta: -enteredQtyDelta,
+                    sumDelta: -enteredSumDelta,
+                    typesDelta
+                });
+            } catch (e) {
+                console.error('adjustEnteredStats (delete) xatosi:', e.message);
+            }
 
             await client.query('COMMIT');
 
@@ -4643,10 +4646,12 @@ app.post(
 
             const product = result.rows[0];
 
-            // Init faqat bir marta va o'chirishdan OLDIN
+            // Init alohida connection orqali (client transaction abort bo'lmasin)
             try {
-                await ensureEnteredStatsInitialized(client, product.user_id);
-            } catch (e) { /* ignore */ }
+                await ensureEnteredStatsInitialized(pool, product.user_id);
+            } catch (e) {
+                console.error('ensureEnteredStatsInitialized (qr-delete) xatosi:', e.message);
+            }
 
             const userResult = await client.query(
                 `SELECT site_login FROM public.users WHERE id = $1`,
@@ -4682,11 +4687,15 @@ app.post(
                 );
                 if (!soldLeft.rows.length) typesDelta = -1;
             }
-            await adjustEnteredStats(client, product.user_id, {
-                qtyDelta: -removeQty,
-                sumDelta: -removeSum,
-                typesDelta
-            });
+            try {
+                await adjustEnteredStats(client, product.user_id, {
+                    qtyDelta: -removeQty,
+                    sumDelta: -removeSum,
+                    typesDelta
+                });
+            } catch (e) {
+                console.error('adjustEnteredStats (qr-delete) xatosi:', e.message);
+            }
 
             const messageBase =
                 `🗑️ <b>QR ORQALI TOVAR O'CHIRILDI</b>\n` +
@@ -5222,10 +5231,12 @@ app.post('/api/products/restore', authenticateToken, async (req, res) => {
             });
         }
 
-        // Init faqat bir marta va restore INSERT dan OLDIN
+        // Init alohida connection orqali (client transaction abort bo'lmasin)
         try {
-            await ensureEnteredStatsInitialized(client, userId);
-        } catch (e) { /* ignore */ }
+            await ensureEnteredStatsInitialized(pool, userId);
+        } catch (e) {
+            console.error('ensureEnteredStatsInitialized (restore) xatosi:', e.message);
+        }
 
         // Restore qilishdan oldin shu local_id bor-yo'qligini tekshiramiz (types uchun)
         // types +1 faqat: omborda yo'q VA qaytarilmagan sotuvda ham yo'q bo'lsa
@@ -5283,12 +5294,16 @@ app.post('/api/products/restore', authenticateToken, async (req, res) => {
             [deletedId]
         );
 
-        // ★★★ Entered statsni qayta qo'shamiz (init yuqorida INSERT dan oldin qilingan)
-        await adjustEnteredStats(client, userId, {
-            qtyDelta: Number(row.quantity) || 0,
-            sumDelta: (Number(row.quantity) || 0) * (Number(row.cost_price) || 0),
-            typesDelta: typesDeltaRestore
-        });
+        // ★★★ Entered statsni qayta qo'shamiz
+        try {
+            await adjustEnteredStats(client, userId, {
+                qtyDelta: Number(row.quantity) || 0,
+                sumDelta: (Number(row.quantity) || 0) * (Number(row.cost_price) || 0),
+                typesDelta: typesDeltaRestore
+            });
+        } catch (e) {
+            console.error('adjustEnteredStats (restore) xatosi:', e.message);
+        }
 
         const userRes = await client.query(
             `SELECT site_login FROM public.users WHERE id = $1`,
