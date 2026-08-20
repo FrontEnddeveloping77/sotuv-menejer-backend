@@ -1381,29 +1381,100 @@ app.get(
         try {
             const userId = req.user.userId;
 
-            // Avvalgi tovarlarni bir marta hisobga olish
-            try {
-                await ensureEnteredStatsInitialized(pool, userId);
-            } catch (bfErr) {
-                console.error('entered stats backfill xatosi:', bfErr.message);
-            }
-
             let storeName = '';
 
             const userResult = await pool.query(
                 `
                 SELECT
                     full_name,
-                    site_login,
-                    COALESCE(entered_qty, 0) AS entered_qty,
-                    COALESCE(entered_types, 0) AS entered_types,
-                    COALESCE(entered_sum, 0) AS entered_sum
+                    site_login
                 FROM public.users
                 WHERE id = $1
                 LIMIT 1
                 `,
                 [userId]
             );
+
+            // Do'konga kirgan = ombor + sotilgan (vozvrat emas) + o'chirilgan (oldingilar ham)
+            const enteredStock = await pool.query(
+                `
+                SELECT
+                    COALESCE(SUM(quantity), 0) AS qty,
+                    COALESCE(SUM(quantity * cost_price), 0) AS sum_val
+                FROM public.products
+                WHERE user_id = $1
+                `,
+                [userId]
+            );
+            const enteredSold = await pool.query(
+                `
+                SELECT
+                    COALESCE(SUM(quantity), 0) AS qty,
+                    COALESCE(SUM(quantity * cost_price), 0) AS sum_val
+                FROM public.sales
+                WHERE user_id = $1
+                  AND COALESCE(returned, false) = false
+                `,
+                [userId]
+            );
+            let enteredDeletedQty = 0;
+            let enteredDeletedSum = 0;
+            try {
+                const enteredDeleted = await pool.query(
+                    `
+                    SELECT
+                        COALESCE(SUM(quantity), 0) AS qty,
+                        COALESCE(SUM(quantity * cost_price), 0) AS sum_val
+                    FROM public.deleted_products
+                    WHERE user_id = $1
+                    `,
+                    [userId]
+                );
+                enteredDeletedQty = Number(enteredDeleted.rows[0].qty || 0);
+                enteredDeletedSum = Number(enteredDeleted.rows[0].sum_val || 0);
+            } catch (e) { /* jadval bo'lmasa */ }
+
+            let enteredTypes = 0;
+            try {
+                const typesRes = await pool.query(
+                    `
+                    SELECT COUNT(*)::int AS types FROM (
+                        SELECT local_id FROM public.products WHERE user_id = $1 AND local_id IS NOT NULL
+                        UNION
+                        SELECT local_id FROM public.sales WHERE user_id = $1 AND local_id IS NOT NULL
+                        UNION
+                        SELECT local_id FROM public.deleted_products WHERE user_id = $1 AND local_id IS NOT NULL
+                    ) t
+                    `,
+                    [userId]
+                );
+                enteredTypes = Number(typesRes.rows[0].types || 0);
+            } catch (e) {
+                try {
+                    const typesRes2 = await pool.query(
+                        `
+                        SELECT COUNT(*)::int AS types FROM (
+                            SELECT local_id FROM public.products WHERE user_id = $1 AND local_id IS NOT NULL
+                            UNION
+                            SELECT local_id FROM public.sales WHERE user_id = $1 AND local_id IS NOT NULL
+                        ) t
+                        `,
+                        [userId]
+                    );
+                    enteredTypes = Number(typesRes2.rows[0].types || 0);
+                } catch (e2) {
+                    enteredTypes = 0;
+                }
+            }
+
+            const liveEnteredQty =
+                Number(enteredStock.rows[0].qty || 0) +
+                Number(enteredSold.rows[0].qty || 0) +
+                enteredDeletedQty;
+            const liveEnteredSum =
+                Number(enteredStock.rows[0].sum_val || 0) +
+                Number(enteredSold.rows[0].sum_val || 0) +
+                enteredDeletedSum;
 
             if (userResult.rows.length > 0) {
                 storeName =
@@ -1524,9 +1595,9 @@ app.get(
                 totalProducts: Number(productStats.rows[0].totalProducts || 0),
                 totalStock: Number(productStats.rows[0].totalStock || 0),
                 totalStockValue: Number(productStats.rows[0].totalStockValue || 0),
-                enteredQty: Number(uRow.entered_qty || 0),
-                enteredTypes: Number(uRow.entered_types || 0),
-                enteredSum: Number(uRow.entered_sum || 0),
+                enteredQty: liveEnteredQty,
+                enteredTypes: enteredTypes,
+                enteredSum: liveEnteredSum,
                 totalDebt: Number(debtStats.rows[0].totalDebt || 0),
                 totalCustomerDebt: Number(customerDebtStats.rows[0].totalCustomerDebt || 0),
                 totalSold: total.sold,
