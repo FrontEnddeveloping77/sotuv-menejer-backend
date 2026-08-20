@@ -170,26 +170,7 @@ const ensureEnteredStatsInitialized = async (clientOrPool, userId) => {
         [userId]
     );
 
-    let deletedQty = 0;
-    let deletedSum = 0;
-    try {
-        const deleted = await clientOrPool.query(
-            `
-            SELECT
-                COALESCE(SUM(quantity), 0) AS qty,
-                COALESCE(SUM(quantity * cost_price), 0) AS sum_val
-            FROM public.deleted_products
-            WHERE user_id = $1
-            `,
-            [userId]
-        );
-        deletedQty = Number(deleted.rows[0].qty || 0);
-        deletedSum = Number(deleted.rows[0].sum_val || 0);
-    } catch (e) {
-        // jadval bo'lmasa — e'tiborsiz
-    }
-
-    // Turlar: ombor + sotuv + o'chirilgan
+    // Turlar: faqat ombor + sotuv (o'chirilgan qo'shilmaydi)
     let types = Number(stock.rows[0].types || 0);
     try {
         const typesRes = await clientOrPool.query(
@@ -198,37 +179,20 @@ const ensureEnteredStatsInitialized = async (clientOrPool, userId) => {
                 SELECT local_id FROM public.products WHERE user_id = $1 AND local_id IS NOT NULL
                 UNION
                 SELECT local_id FROM public.sales WHERE user_id = $1 AND local_id IS NOT NULL
-                UNION
-                SELECT local_id FROM public.deleted_products WHERE user_id = $1 AND local_id IS NOT NULL
             ) t
             `,
             [userId]
         );
         types = Number(typesRes.rows[0]?.types || types);
-    } catch (e) {
-        try {
-            const typesRes2 = await clientOrPool.query(
-                `
-                SELECT COUNT(*)::int AS types FROM (
-                    SELECT local_id FROM public.products WHERE user_id = $1 AND local_id IS NOT NULL
-                    UNION
-                    SELECT local_id FROM public.sales WHERE user_id = $1 AND local_id IS NOT NULL
-                ) t
-                `,
-                [userId]
-            );
-            types = Number(typesRes2.rows[0]?.types || types);
-        } catch (e2) { /* keep stock types */ }
-    }
+    } catch (e2) { /* keep stock types */ }
 
+    // O'chirilganlar qo'shilmaydi — aks holda son sun'iy oshadi
     const qty =
         Number(stock.rows[0].qty || 0) +
-        Number(sold.rows[0].qty || 0) +
-        deletedQty;
+        Number(sold.rows[0].qty || 0);
     const sumVal =
         Number(stock.rows[0].sum_val || 0) +
-        Number(sold.rows[0].sum_val || 0) +
-        deletedSum;
+        Number(sold.rows[0].sum_val || 0);
 
     await clientOrPool.query(
         `
@@ -1395,7 +1359,9 @@ app.get(
                 [userId]
             );
 
-            // Do'konga kirgan = ombor + sotilgan (vozvrat emas) + o'chirilgan (oldingilar ham)
+            // Do'konga kirgan = hozirgi ombor + sotilgan (vozvrat qilinmagan).
+            // O'chirilganlar QO'SHILMAYDI (aks holda qayta hisoblanib oshib ketadi).
+            // Sotuv kirganni kamaytirmaydi: ombordan chiqadi, sales ga o'tadi.
             const enteredStock = await pool.query(
                 `
                 SELECT
@@ -1417,22 +1383,6 @@ app.get(
                 `,
                 [userId]
             );
-            let enteredDeletedQty = 0;
-            let enteredDeletedSum = 0;
-            try {
-                const enteredDeleted = await pool.query(
-                    `
-                    SELECT
-                        COALESCE(SUM(quantity), 0) AS qty,
-                        COALESCE(SUM(quantity * cost_price), 0) AS sum_val
-                    FROM public.deleted_products
-                    WHERE user_id = $1
-                    `,
-                    [userId]
-                );
-                enteredDeletedQty = Number(enteredDeleted.rows[0].qty || 0);
-                enteredDeletedSum = Number(enteredDeleted.rows[0].sum_val || 0);
-            } catch (e) { /* jadval bo'lmasa */ }
 
             let enteredTypes = 0;
             try {
@@ -1442,39 +1392,21 @@ app.get(
                         SELECT local_id FROM public.products WHERE user_id = $1 AND local_id IS NOT NULL
                         UNION
                         SELECT local_id FROM public.sales WHERE user_id = $1 AND local_id IS NOT NULL
-                        UNION
-                        SELECT local_id FROM public.deleted_products WHERE user_id = $1 AND local_id IS NOT NULL
                     ) t
                     `,
                     [userId]
                 );
                 enteredTypes = Number(typesRes.rows[0].types || 0);
             } catch (e) {
-                try {
-                    const typesRes2 = await pool.query(
-                        `
-                        SELECT COUNT(*)::int AS types FROM (
-                            SELECT local_id FROM public.products WHERE user_id = $1 AND local_id IS NOT NULL
-                            UNION
-                            SELECT local_id FROM public.sales WHERE user_id = $1 AND local_id IS NOT NULL
-                        ) t
-                        `,
-                        [userId]
-                    );
-                    enteredTypes = Number(typesRes2.rows[0].types || 0);
-                } catch (e2) {
-                    enteredTypes = 0;
-                }
+                enteredTypes = 0;
             }
 
             const liveEnteredQty =
                 Number(enteredStock.rows[0].qty || 0) +
-                Number(enteredSold.rows[0].qty || 0) +
-                enteredDeletedQty;
+                Number(enteredSold.rows[0].qty || 0);
             const liveEnteredSum =
                 Number(enteredStock.rows[0].sum_val || 0) +
-                Number(enteredSold.rows[0].sum_val || 0) +
-                enteredDeletedSum;
+                Number(enteredSold.rows[0].sum_val || 0);
 
             if (userResult.rows.length > 0) {
                 storeName =
@@ -2210,29 +2142,6 @@ app.get('/api/products/entered', authenticateToken, async (req, res) => {
             [userId]
         );
 
-        let deletedRows = [];
-        try {
-            const deleted = await pool.query(
-                `
-                SELECT
-                    local_id,
-                    MAX(name) AS name,
-                    MAX(category) AS category,
-                    MAX(color) AS color,
-                    COALESCE(SUM(quantity), 0) AS deleted_qty,
-                    COALESCE(SUM(quantity * cost_price), 0) AS deleted_sum,
-                    array_agg(DISTINCT size) FILTER (WHERE size IS NOT NULL AND TRIM(size) <> '') AS sizes
-                FROM public.deleted_products
-                WHERE user_id = $1
-                GROUP BY local_id
-                `,
-                [userId]
-            );
-            deletedRows = deleted.rows;
-        } catch (e) {
-            deletedRows = [];
-        }
-
         const map = new Map();
 
         const upsert = (row, kind) => {
@@ -2247,10 +2156,8 @@ app.get('/api/products/entered', authenticateToken, async (req, res) => {
                     sizes: new Set(),
                     stock_qty: 0,
                     sold_qty: 0,
-                    deleted_qty: 0,
                     stock_sum: 0,
-                    sold_sum: 0,
-                    deleted_sum: 0
+                    sold_sum: 0
                 });
             }
             const g = map.get(lid);
@@ -2266,20 +2173,17 @@ app.get('/api/products/entered', authenticateToken, async (req, res) => {
             } else if (kind === 'sold') {
                 g.sold_qty += Number(row.sold_qty || 0);
                 g.sold_sum += Number(row.sold_sum || 0);
-            } else if (kind === 'deleted') {
-                g.deleted_qty += Number(row.deleted_qty || 0);
-                g.deleted_sum += Number(row.deleted_sum || 0);
             }
         };
 
         stock.rows.forEach((r) => upsert(r, 'stock'));
         sold.rows.forEach((r) => upsert(r, 'sold'));
-        deletedRows.forEach((r) => upsert(r, 'deleted'));
 
         const products = Array.from(map.values())
             .map((g) => {
-                const entered_qty = g.stock_qty + g.sold_qty + g.deleted_qty;
-                const entered_sum = g.stock_sum + g.sold_sum + g.deleted_sum;
+                // Kirgan = ombordagi qoldiq + sotilgan (o'chirilgan qo'shilmaydi)
+                const entered_qty = g.stock_qty + g.sold_qty;
+                const entered_sum = g.stock_sum + g.sold_sum;
                 const remaining = g.stock_qty;
                 return {
                     local_id: g.local_id,
@@ -2291,7 +2195,7 @@ app.get('/api/products/entered', authenticateToken, async (req, res) => {
                     entered_sum,
                     remaining_qty: remaining,
                     sold_qty: g.sold_qty,
-                    deleted_qty: g.deleted_qty,
+                    deleted_qty: 0,
                     status: remaining > 0 ? 'omborda' : 'tugagan'
                 };
             })
