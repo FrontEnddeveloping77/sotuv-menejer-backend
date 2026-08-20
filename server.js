@@ -1359,9 +1359,12 @@ app.get(
                 [userId]
             );
 
-            // Do'konga kirgan = hozirgi ombor + sotilgan (vozvrat qilinmagan).
-            // O'chirilganlar QO'SHILMAYDI (aks holda qayta hisoblanib oshib ketadi).
-            // Sotuv kirganni kamaytirmaydi: ombordan chiqadi, sales ga o'tadi.
+            // Do'konga kirgan (aniq formula):
+            //   ombordagi qoldiq
+            // + sotilgan (vozvrat qilinmagan)
+            // − o'chirilgan arxivda qolib ketgan, LEKIN omborda qayta bor bo'lganlar
+            //   (restore bug / qayta qo'shish — ikki marta hisoblashni oldini oladi)
+            // Sotuv kirgan sonni o'zgartirmaydi.
             const enteredStock = await pool.query(
                 `
                 SELECT
@@ -1379,10 +1382,41 @@ app.get(
                     COALESCE(SUM(quantity * cost_price), 0) AS sum_val
                 FROM public.sales
                 WHERE user_id = $1
-                  AND COALESCE(returned, false) = false
+                  AND returned IS NOT TRUE
                 `,
                 [userId]
             );
+
+            // Vozvrat qilinganlar omborda, lekin agar returned belgilari noto'g'ri bo'lsa
+            // qo'shimcha himoya: returned = true bo'lgan sotuvlar umuman qo'shilmaydi (yuqorida).
+
+            // O'chirilgan arxiv: faqat omborda SHU local_id hali bor bo'lsa ayiramiz
+            // (qayta tiklangan / qayta kiritilgan — dublikat)
+            let doubleCountQty = 0;
+            let doubleCountSum = 0;
+            try {
+                const dup = await pool.query(
+                    `
+                    SELECT
+                        COALESCE(SUM(d.quantity), 0) AS qty,
+                        COALESCE(SUM(d.quantity * d.cost_price), 0) AS sum_val
+                    FROM public.deleted_products d
+                    WHERE d.user_id = $1
+                      AND EXISTS (
+                        SELECT 1
+                        FROM public.products p
+                        WHERE p.user_id = d.user_id
+                          AND p.local_id = d.local_id
+                      )
+                    `,
+                    [userId]
+                );
+                doubleCountQty = Number(dup.rows[0].qty || 0);
+                doubleCountSum = Number(dup.rows[0].sum_val || 0);
+            } catch (e) { /* deleted_products yo'q */ }
+
+            // Yana: vozvrat qilingan sotuvlar returned=true, lekin ba'zida false qolib stockga qaytgan
+            // bo'lishi mumkin. Bunday holatni aniq bilib bo'lmaydi; returned IS NOT TRUE ishlatamiz.
 
             let enteredTypes = 0;
             try {
@@ -1391,7 +1425,7 @@ app.get(
                     SELECT COUNT(*)::int AS types FROM (
                         SELECT local_id FROM public.products WHERE user_id = $1 AND local_id IS NOT NULL
                         UNION
-                        SELECT local_id FROM public.sales WHERE user_id = $1 AND local_id IS NOT NULL
+                        SELECT local_id FROM public.sales WHERE user_id = $1 AND local_id IS NOT NULL AND returned IS NOT TRUE
                     ) t
                     `,
                     [userId]
@@ -1401,12 +1435,18 @@ app.get(
                 enteredTypes = 0;
             }
 
-            const liveEnteredQty =
+            const liveEnteredQty = Math.max(
+                0,
                 Number(enteredStock.rows[0].qty || 0) +
-                Number(enteredSold.rows[0].qty || 0);
-            const liveEnteredSum =
+                Number(enteredSold.rows[0].qty || 0) -
+                doubleCountQty
+            );
+            const liveEnteredSum = Math.max(
+                0,
                 Number(enteredStock.rows[0].sum_val || 0) +
-                Number(enteredSold.rows[0].sum_val || 0);
+                Number(enteredSold.rows[0].sum_val || 0) -
+                doubleCountSum
+            );
 
             if (userResult.rows.length > 0) {
                 storeName =
@@ -1530,6 +1570,11 @@ app.get(
                 enteredQty: liveEnteredQty,
                 enteredTypes: enteredTypes,
                 enteredSum: liveEnteredSum,
+                enteredBreakdown: {
+                    stock: Number(enteredStock.rows[0].qty || 0),
+                    sold: Number(enteredSold.rows[0].qty || 0),
+                    doubleCountRemoved: doubleCountQty
+                },
                 totalDebt: Number(debtStats.rows[0].totalDebt || 0),
                 totalCustomerDebt: Number(customerDebtStats.rows[0].totalCustomerDebt || 0),
                 totalSold: total.sold,
