@@ -112,6 +112,22 @@ const daysSince = (dateValue) => {
     return (Date.now() - then) / (1000 * 60 * 60 * 24);
 };
 
+/** Do'konga kirgan tovarlar hisobi — faqat qo'shish / o'chirishda o'zgaradi */
+const adjustEnteredStats = async (clientOrPool, userId, { qtyDelta = 0, sumDelta = 0, typesDelta = 0 } = {}) => {
+    if (!qtyDelta && !sumDelta && !typesDelta) return;
+    await clientOrPool.query(
+        `
+        UPDATE public.users
+        SET
+            entered_qty = GREATEST(COALESCE(entered_qty, 0) + $2, 0),
+            entered_sum = GREATEST(COALESCE(entered_sum, 0) + $3, 0),
+            entered_types = GREATEST(COALESCE(entered_types, 0)::int + $4, 0)
+        WHERE id = $1
+        `,
+        [userId, Number(qtyDelta) || 0, Number(sumDelta) || 0, Number(typesDelta) || 0]
+    );
+};
+
 // ====================================================
 // YORDAMCHI FUNKSIYALAR
 // ====================================================
@@ -581,6 +597,19 @@ const ensureTables = async () => {
         await pool.query(`
             ALTER TABLE public.users
             ADD COLUMN IF NOT EXISTS linked_group_chat_id BIGINT;
+        `);
+
+        await pool.query(`
+            ALTER TABLE public.users
+            ADD COLUMN IF NOT EXISTS entered_qty NUMERIC NOT NULL DEFAULT 0;
+        `);
+        await pool.query(`
+            ALTER TABLE public.users
+            ADD COLUMN IF NOT EXISTS entered_types INTEGER NOT NULL DEFAULT 0;
+        `);
+        await pool.query(`
+            ALTER TABLE public.users
+            ADD COLUMN IF NOT EXISTS entered_sum NUMERIC NOT NULL DEFAULT 0;
         `);
 
         await pool.query(`
@@ -1238,7 +1267,10 @@ app.get(
                 `
                 SELECT
                     full_name,
-                    site_login
+                    site_login,
+                    COALESCE(entered_qty, 0) AS entered_qty,
+                    COALESCE(entered_types, 0) AS entered_types,
+                    COALESCE(entered_sum, 0) AS entered_sum
                 FROM public.users
                 WHERE id = $1
                 LIMIT 1
@@ -1359,11 +1391,15 @@ app.get(
                 `TRUE`
             );
 
+            const uRow = userResult.rows[0] || {};
             res.json({
                 storeName,
                 totalProducts: Number(productStats.rows[0].totalProducts || 0),
                 totalStock: Number(productStats.rows[0].totalStock || 0),
                 totalStockValue: Number(productStats.rows[0].totalStockValue || 0),
+                enteredQty: Number(uRow.entered_qty || 0),
+                enteredTypes: Number(uRow.entered_types || 0),
+                enteredSum: Number(uRow.entered_sum || 0),
                 totalDebt: Number(debtStats.rows[0].totalDebt || 0),
                 totalCustomerDebt: Number(customerDebtStats.rows[0].totalCustomerDebt || 0),
                 totalSold: total.sold,
@@ -1820,6 +1856,13 @@ app.post(
                     cleanImageUrl
                 );
             }
+
+            // Do'konga kirgan tovarlar hisobi (+ faqat qo'shishda)
+            await adjustEnteredStats(client, userId, {
+                qtyDelta: totalQty,
+                sumDelta: totalQty * parsedCostPrice,
+                typesDelta: 1
+            });
 
             await client.query('COMMIT');
 
@@ -3476,6 +3519,9 @@ app.post(
             let firstImageUrl = null;
             const affectedLocalIds = new Set();
             const results = [];
+            let enteredQtyDelta = 0;
+            let enteredSumDelta = 0;
+            const localIdsTouched = new Set();
 
             for (const item of items) {
                 const productId = Number(item.product_id);
@@ -3579,6 +3625,9 @@ app.post(
                 }
 
                 totalRemoved += removeQty;
+                enteredQtyDelta += removeQty;
+                enteredSumDelta += removeQty * (Number(product.cost_price) || 0);
+                localIdsTouched.add(Number(product.local_id));
 
                 removedLines.push(
                     `   • 📏 ${telegramEscape(product.size || "Standart")}: ${removeQty} dona olib tashlandi` +
@@ -3648,6 +3697,21 @@ app.post(
             deleteMessage += await getTodayReport(client, userId);
 
             await queueTelegramNotification(client, siteLogin, deleteMessage, firstImageUrl);
+
+            // Do'konga kirgan hisobdan ayirish (faqat o'chirishda)
+            let typesDelta = 0;
+            for (const lid of localIdsTouched) {
+                const left = await client.query(
+                    `SELECT 1 FROM public.products WHERE user_id = $1 AND local_id = $2 LIMIT 1`,
+                    [userId, lid]
+                );
+                if (!left.rows.length) typesDelta -= 1;
+            }
+            await adjustEnteredStats(client, userId, {
+                qtyDelta: -enteredQtyDelta,
+                sumDelta: -enteredSumDelta,
+                typesDelta
+            });
 
             await client.query('COMMIT');
 
