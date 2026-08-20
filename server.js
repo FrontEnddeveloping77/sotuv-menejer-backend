@@ -128,6 +128,122 @@ const adjustEnteredStats = async (clientOrPool, userId, { qtyDelta = 0, sumDelta
     );
 };
 
+/**
+ * Bir marta: avval qo'shilgan tovarlarni ham hisobga olish.
+ * Manba: hozirgi ombor + sotilganlar (vozvrat qilinmagan) + o'chirilgan arxiv.
+ * Sotuv keyin hisobni kamaytirmaydi — shu backfill boshlang'ich nuqta.
+ */
+const ensureEnteredStatsInitialized = async (clientOrPool, userId) => {
+    const flagRes = await clientOrPool.query(
+        `
+        SELECT COALESCE(entered_stats_initialized, false) AS inited
+        FROM public.users
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [userId]
+    );
+    if (!flagRes.rows.length) return;
+    if (flagRes.rows[0].inited) return;
+
+    const stock = await clientOrPool.query(
+        `
+        SELECT
+            COALESCE(SUM(quantity), 0) AS qty,
+            COALESCE(SUM(quantity * cost_price), 0) AS sum_val,
+            COUNT(DISTINCT local_id) AS types
+        FROM public.products
+        WHERE user_id = $1
+        `,
+        [userId]
+    );
+
+    const sold = await clientOrPool.query(
+        `
+        SELECT
+            COALESCE(SUM(quantity), 0) AS qty,
+            COALESCE(SUM(quantity * cost_price), 0) AS sum_val
+        FROM public.sales
+        WHERE user_id = $1
+          AND COALESCE(returned, false) = false
+        `,
+        [userId]
+    );
+
+    let deletedQty = 0;
+    let deletedSum = 0;
+    try {
+        const deleted = await clientOrPool.query(
+            `
+            SELECT
+                COALESCE(SUM(quantity), 0) AS qty,
+                COALESCE(SUM(quantity * cost_price), 0) AS sum_val
+            FROM public.deleted_products
+            WHERE user_id = $1
+            `,
+            [userId]
+        );
+        deletedQty = Number(deleted.rows[0].qty || 0);
+        deletedSum = Number(deleted.rows[0].sum_val || 0);
+    } catch (e) {
+        // jadval bo'lmasa — e'tiborsiz
+    }
+
+    // Turlar: ombor + sotuv + o'chirilgan
+    let types = Number(stock.rows[0].types || 0);
+    try {
+        const typesRes = await clientOrPool.query(
+            `
+            SELECT COUNT(*)::int AS types FROM (
+                SELECT local_id FROM public.products WHERE user_id = $1 AND local_id IS NOT NULL
+                UNION
+                SELECT local_id FROM public.sales WHERE user_id = $1 AND local_id IS NOT NULL
+                UNION
+                SELECT local_id FROM public.deleted_products WHERE user_id = $1 AND local_id IS NOT NULL
+            ) t
+            `,
+            [userId]
+        );
+        types = Number(typesRes.rows[0]?.types || types);
+    } catch (e) {
+        try {
+            const typesRes2 = await clientOrPool.query(
+                `
+                SELECT COUNT(*)::int AS types FROM (
+                    SELECT local_id FROM public.products WHERE user_id = $1 AND local_id IS NOT NULL
+                    UNION
+                    SELECT local_id FROM public.sales WHERE user_id = $1 AND local_id IS NOT NULL
+                ) t
+                `,
+                [userId]
+            );
+            types = Number(typesRes2.rows[0]?.types || types);
+        } catch (e2) { /* keep stock types */ }
+    }
+
+    const qty =
+        Number(stock.rows[0].qty || 0) +
+        Number(sold.rows[0].qty || 0) +
+        deletedQty;
+    const sumVal =
+        Number(stock.rows[0].sum_val || 0) +
+        Number(sold.rows[0].sum_val || 0) +
+        deletedSum;
+
+    await clientOrPool.query(
+        `
+        UPDATE public.users
+        SET
+            entered_qty = $2,
+            entered_sum = $3,
+            entered_types = $4,
+            entered_stats_initialized = true
+        WHERE id = $1
+        `,
+        [userId, qty, sumVal, types]
+    );
+};
+
 // ====================================================
 // YORDAMCHI FUNKSIYALAR
 // ====================================================
@@ -610,6 +726,10 @@ const ensureTables = async () => {
         await pool.query(`
             ALTER TABLE public.users
             ADD COLUMN IF NOT EXISTS entered_sum NUMERIC NOT NULL DEFAULT 0;
+        `);
+        await pool.query(`
+            ALTER TABLE public.users
+            ADD COLUMN IF NOT EXISTS entered_stats_initialized BOOLEAN NOT NULL DEFAULT false;
         `);
 
         await pool.query(`
@@ -1261,6 +1381,13 @@ app.get(
         try {
             const userId = req.user.userId;
 
+            // Avvalgi tovarlarni bir marta hisobga olish
+            try {
+                await ensureEnteredStatsInitialized(pool, userId);
+            } catch (bfErr) {
+                console.error('entered stats backfill xatosi:', bfErr.message);
+            }
+
             let storeName = '';
 
             const userResult = await pool.query(
@@ -1858,6 +1985,9 @@ app.post(
             }
 
             // Do'konga kirgan tovarlar hisobi (+ faqat qo'shishda)
+            try {
+                await ensureEnteredStatsInitialized(client, userId);
+            } catch (e) { /* ignore */ }
             await adjustEnteredStats(client, userId, {
                 qtyDelta: totalQty,
                 sumDelta: totalQty * parsedCostPrice,
@@ -3707,6 +3837,9 @@ app.post(
                 );
                 if (!left.rows.length) typesDelta -= 1;
             }
+            try {
+                await ensureEnteredStatsInitialized(client, userId);
+            } catch (e) { /* ignore */ }
             await adjustEnteredStats(client, userId, {
                 qtyDelta: -enteredQtyDelta,
                 sumDelta: -enteredSumDelta,
