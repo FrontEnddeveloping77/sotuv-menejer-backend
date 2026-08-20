@@ -3097,14 +3097,36 @@ app.post(
                     return res.status(400).json({ message: "Narx noto'g'ri!" });
                 }
 
-                const prodRes = await client.query(
+                let prodRes = await client.query(
                     `SELECT * FROM public.products WHERE id = $1 AND user_id = $2 FOR UPDATE`,
                     [productId, userId]
                 );
 
+                // Eski/yangi ID nomuvofiqligi: local_id + size bo'yicha qidirish
+                if (!prodRes.rows.length) {
+                    const lid = Number(item.local_id);
+                    const sizeVal = item.size != null ? String(item.size) : '';
+                    if (Number.isInteger(lid) && lid > 0) {
+                        prodRes = await client.query(
+                            `
+                            SELECT * FROM public.products
+                            WHERE user_id = $1
+                              AND local_id = $2
+                              AND COALESCE(TRIM(size), '') = COALESCE(TRIM($3::text), '')
+                            ORDER BY id ASC
+                            LIMIT 1
+                            FOR UPDATE
+                            `,
+                            [userId, lid, sizeVal]
+                        );
+                    }
+                }
+
                 if (!prodRes.rows.length) {
                     await client.query('ROLLBACK');
-                    return res.status(404).json({ message: `Tovar topilmadi! (ID: ${productId})` });
+                    return res.status(404).json({
+                        message: `Tovar topilmadi! (ID: ${productId}). Sahifani yangilab qayta urinib ko'ring.`
+                    });
                 }
 
                 const product = prodRes.rows[0];
@@ -3361,14 +3383,35 @@ app.post(
                     return res.status(400).json({ message: "Narx noto'g'ri!" });
                 }
 
-                const prodRes = await client.query(
+                let prodRes = await client.query(
                     `SELECT * FROM public.products WHERE id = $1 AND user_id = $2 FOR UPDATE`,
                     [productId, userId]
                 );
 
                 if (!prodRes.rows.length) {
+                    const lid = Number(item.local_id);
+                    const sizeVal = item.size != null ? String(item.size) : '';
+                    if (Number.isInteger(lid) && lid > 0) {
+                        prodRes = await client.query(
+                            `
+                            SELECT * FROM public.products
+                            WHERE user_id = $1
+                              AND local_id = $2
+                              AND COALESCE(TRIM(size), '') = COALESCE(TRIM($3::text), '')
+                            ORDER BY id ASC
+                            LIMIT 1
+                            FOR UPDATE
+                            `,
+                            [userId, lid, sizeVal]
+                        );
+                    }
+                }
+
+                if (!prodRes.rows.length) {
                     await client.query('ROLLBACK');
-                    return res.status(404).json({ message: `Tovar topilmadi! (ID: ${productId})` });
+                    return res.status(404).json({
+                        message: `Tovar topilmadi! (ID: ${productId}). Sahifani yangilab qayta urinib ko'ring.`
+                    });
                 }
 
                 const product = prodRes.rows[0];
