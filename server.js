@@ -39,13 +39,17 @@ let tablesReadyPromise = null;
 
 const ensureTablesOnce = () => {
     if (!tablesReadyPromise) {
-        tablesReadyPromise = ensureTables().catch((err) => {
-            console.error(
-                '❌ ensureTables() umumiy xatosi:',
-                err
-            );
-            tablesReadyPromise = null;
-        });
+        tablesReadyPromise = ensureTables()
+            .then(async () => {
+                await repairMissingReturnedStock();
+            })
+            .catch((err) => {
+                console.error(
+                    '❌ ensureTables() umumiy xatosi:',
+                    err
+                );
+                tablesReadyPromise = null;
+            });
     }
     return tablesReadyPromise;
 };
@@ -217,6 +221,152 @@ const ensureEnteredStatsInitialized = async (clientOrPool, userId) => {
     );
 };
 
+
+
+/**
+ * Vozvrat qilingan lekin omborga tushmagan sotuvlarni tiklash.
+ * - stock_restored=true → o'tkazib yuborish
+ * - product_id omborda bor → belgilash, qo'shmaslik
+ * - local_id+size omborda bor → belgilash, qo'shmaslik
+ * - vozvratdan KEYIN qayta sotilgan → belgilash, qo'shmaslik
+ * - aks holda → INSERT + QR, stock_restored=true
+ * entered_* ga tegilMAYDI
+ */
+const repairMissingReturnedStock = async () => {
+    try {
+        const rows = await pool.query(
+            `
+            SELECT s.*
+            FROM public.sales s
+            WHERE COALESCE(s.returned, false) = true
+              AND COALESCE(s.stock_restored, false) = false
+              AND COALESCE(s.quantity, 0) > 0
+            ORDER BY s.id ASC
+            `
+        );
+
+        let fixed = 0;
+        let marked = 0;
+
+        for (const sale of rows.rows) {
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+
+                const userId = sale.user_id;
+                const qty = Number(sale.quantity) || 0;
+                const sizeKey = String(sale.size ?? '').trim();
+
+                if (sale.product_id) {
+                    const exists = await client.query(
+                        `SELECT id FROM public.products WHERE id = $1 AND user_id = $2 LIMIT 1`,
+                        [sale.product_id, userId]
+                    );
+                    if (exists.rows.length) {
+                        await client.query(
+                            `UPDATE public.sales SET stock_restored = true WHERE id = $1`,
+                            [sale.id]
+                        );
+                        await client.query('COMMIT');
+                        marked += 1;
+                        continue;
+                    }
+                }
+
+                if (sale.local_id != null) {
+                    const sib = await client.query(
+                        `
+                        SELECT id FROM public.products
+                        WHERE user_id = $1
+                          AND local_id = $2
+                          AND COALESCE(NULLIF(TRIM(COALESCE(size, '')), ''), '') = $3
+                        LIMIT 1
+                        `,
+                        [userId, sale.local_id, sizeKey]
+                    );
+                    if (sib.rows.length) {
+                        await client.query(
+                            `UPDATE public.sales SET stock_restored = true WHERE id = $1`,
+                            [sale.id]
+                        );
+                        await client.query('COMMIT');
+                        marked += 1;
+                        continue;
+                    }
+                }
+
+                const resold = await client.query(
+                    `
+                    SELECT id FROM public.sales
+                    WHERE user_id = $1
+                      AND COALESCE(returned, false) = false
+                      AND sold_at > $2
+                      AND local_id IS NOT DISTINCT FROM $3
+                      AND COALESCE(NULLIF(TRIM(COALESCE(size, '')), ''), '') = $4
+                    LIMIT 1
+                    `,
+                    [userId, sale.sold_at, sale.local_id, sizeKey]
+                );
+                if (resold.rows.length) {
+                    await client.query(
+                        `UPDATE public.sales SET stock_restored = true WHERE id = $1`,
+                        [sale.id]
+                    );
+                    await client.query('COMMIT');
+                    marked += 1;
+                    continue;
+                }
+
+                const token = randomUUID();
+                await client.query(
+                    `
+                    INSERT INTO public.products
+                    (
+                        user_id, local_id, category, name, cost_price, color, size,
+                        quantity, qr_token, qr_created_at, selling_price, image_url
+                    )
+                    VALUES
+                    ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11)
+                    `,
+                    [
+                        userId,
+                        sale.local_id != null ? sale.local_id : 1,
+                        sale.category || null,
+                        sale.title || 'Tovar',
+                        sale.cost_price || 0,
+                        sale.color || null,
+                        sale.size || null,
+                        qty,
+                        token,
+                        sale.selling_price != null ? sale.selling_price : null,
+                        sale.image_url || null
+                    ]
+                );
+
+                await client.query(
+                    `UPDATE public.sales SET stock_restored = true WHERE id = $1`,
+                    [sale.id]
+                );
+
+                await client.query('COMMIT');
+                fixed += 1;
+            } catch (e) {
+                try { await client.query('ROLLBACK'); } catch (e2) { }
+                console.error('[repairMissingReturned] sale_id=' + sale.id, e.message);
+            } finally {
+                client.release();
+            }
+        }
+
+        if (fixed > 0 || marked > 0) {
+            console.log(
+                `[repairMissingReturned] omborga qo'shildi: ${fixed}, belgilangan: ${marked}`
+            );
+        }
+    } catch (err) {
+        console.error('[repairMissingReturned] xato:', err.message);
+    }
+};
 
 // ====================================================
 // YORDAMCHI FUNKSIYALAR
@@ -879,6 +1029,7 @@ const ensureTables = async () => {
     ADD COLUMN IF NOT EXISTS image_url TEXT;
 `);
         await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS paid_now NUMERIC DEFAULT 0;`);
+        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS stock_restored BOOLEAN NOT NULL DEFAULT false;`);
         await pool.query(`
             CREATE INDEX IF NOT EXISTS
             idx_sales_user_id
@@ -3125,6 +3276,12 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
                 [restoredProductId, randomUUID(), userId]
             );
         }
+
+        // Omborga muvaffaqiyatli qaytarildi
+        await client.query(
+            `UPDATE public.sales SET stock_restored = true WHERE id = $1`,
+            [saleId]
+        );
 
         await client.query('COMMIT');
 
