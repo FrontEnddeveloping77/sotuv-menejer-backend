@@ -4032,7 +4032,7 @@ app.get(
                 FROM public.sales
                 WHERE user_id = $1
                 ORDER BY sold_at DESC
-                LIMIT 200
+                LIMIT 5000
                 `,
                 [req.user.userId]
             );
