@@ -306,32 +306,38 @@ const repairMissingReturnedStock = async () => {
 
                 let done = false;
 
-                // 1) product_id omborda bor → miqdorni qo'shish
+                // 1) product_id omborda bor VA razmer mos → miqdorni qo'shish
                 if (sale.product_id) {
                     const byId = await client.query(
                         `
-                        UPDATE public.products
-                        SET quantity = COALESCE(quantity, 0) + $1
-                        WHERE id = $2 AND user_id = $3
-                        RETURNING id
+                        SELECT id, size FROM public.products
+                        WHERE id = $1 AND user_id = $2
+                        FOR UPDATE
                         `,
-                        [qty, sale.product_id, userId]
+                        [sale.product_id, userId]
                     );
                     if (byId.rows.length) {
-                        await client.query(
-                            `
-                            UPDATE public.products
-                            SET
-                                qr_token = COALESCE(qr_token, $2::uuid),
-                                qr_created_at = CASE
-                                    WHEN qr_token IS NULL THEN NOW()
-                                    ELSE COALESCE(qr_created_at, NOW())
-                                END
-                            WHERE id = $1 AND user_id = $3
-                            `,
-                            [byId.rows[0].id, randomUUID(), userId]
-                        );
-                        done = true;
+                        const rowSizeKey = String(byId.rows[0].size ?? '').trim();
+                        if (rowSizeKey === sizeKey) {
+                            await client.query(
+                                `UPDATE public.products SET quantity = COALESCE(quantity, 0) + $1 WHERE id = $2 AND user_id = $3`,
+                                [qty, byId.rows[0].id, userId]
+                            );
+                            await client.query(
+                                `
+                                UPDATE public.products
+                                SET
+                                    qr_token = COALESCE(qr_token, $2::uuid),
+                                    qr_created_at = CASE
+                                        WHEN qr_token IS NULL THEN NOW()
+                                        ELSE COALESCE(qr_created_at, NOW())
+                                    END
+                                WHERE id = $1 AND user_id = $3
+                                `,
+                                [byId.rows[0].id, randomUUID(), userId]
+                            );
+                            done = true;
+                        }
                     }
                 }
 
@@ -3214,9 +3220,9 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
 
 // VOZVRAT — TOVARNI QAYTARISH (POST /api/sales/:saleId/return)
 // ====================================================
-// Faqat SHU sotuvni omborga qaytaradi.
+// Faqat SHU sotuvning razmeriga qaytaradi.
+// Boshqa razmerga (masalan 41 → 40) QO'SHILMAYDI.
 // entered_* ga tegilMAYDI.
-// local_id+size bo'yicha boshqa variantga QO'SHILMAYDI (noto'g'ri omborga tushmasin).
 app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -3254,35 +3260,68 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
             return res.status(400).json({ message: "Qaytariladigan son noto'g'ri!" });
         }
 
-        // Sotuvni qaytarilgan deb belgilash
         await client.query(
             `UPDATE public.sales SET returned = true WHERE id = $1`,
             [saleId]
         );
 
+        const saleSizeKey = String(sale.size ?? '').trim();
         let restoredImageUrl = sale.image_url || null;
         let restoredProductId = null;
 
-        // 1) Aynan shu product_id omborda qolgan bo'lsa — faqat shu qatorga qaytarish
+        // 1) product_id bor VA razmer AYNAN shu sotuvnikiga teng bo'lsagina qo'shish
         if (sale.product_id) {
             const byId = await client.query(
                 `
-                UPDATE public.products
-                SET quantity = COALESCE(quantity, 0) + $1
-                WHERE id = $2
-                  AND user_id = $3
-                RETURNING id, image_url, qr_token
+                SELECT id, size, image_url, qr_token
+                FROM public.products
+                WHERE id = $1 AND user_id = $2
+                FOR UPDATE
                 `,
-                [qtyToReturn, sale.product_id, userId]
+                [sale.product_id, userId]
             );
             if (byId.rows.length) {
-                restoredProductId = byId.rows[0].id;
-                restoredImageUrl = restoredImageUrl || byId.rows[0].image_url || null;
+                const row = byId.rows[0];
+                const rowSizeKey = String(row.size ?? '').trim();
+                if (rowSizeKey === saleSizeKey) {
+                    await client.query(
+                        `UPDATE public.products SET quantity = COALESCE(quantity, 0) + $1 WHERE id = $2 AND user_id = $3`,
+                        [qtyToReturn, row.id, userId]
+                    );
+                    restoredProductId = row.id;
+                    restoredImageUrl = restoredImageUrl || row.image_url || null;
+                }
+                // razmer mos kelmasa — boshqa qatorga QO'SHILMAYDI, pastda yangi ochiladi
             }
         }
 
-        // 2) To'liq sotilib o'chirilgan — YANGI qator (shu sotuv ma'lumotlari + QR)
-        //    Boshqa local_id/size variantiga QO'SHILMAYDI
+        // 2) Shu local_id + AYNAN shu size bo'yicha qator bormi?
+        if (!restoredProductId && sale.local_id != null) {
+            const sameSize = await client.query(
+                `
+                SELECT id, image_url, qr_token
+                FROM public.products
+                WHERE user_id = $1
+                  AND local_id = $2
+                  AND COALESCE(NULLIF(TRIM(COALESCE(size, '')), ''), '') = $3
+                ORDER BY id ASC
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [userId, sale.local_id, saleSizeKey]
+            );
+            if (sameSize.rows.length) {
+                const row = sameSize.rows[0];
+                await client.query(
+                    `UPDATE public.products SET quantity = COALESCE(quantity, 0) + $1 WHERE id = $2 AND user_id = $3`,
+                    [qtyToReturn, row.id, userId]
+                );
+                restoredProductId = row.id;
+                restoredImageUrl = restoredImageUrl || row.image_url || null;
+            }
+        }
+
+        // 3) Yo'q — shu razmer bilan YANGI qator + QR
         if (!restoredProductId) {
             const newToken = randomUUID();
             const insertRes = await client.query(
@@ -3334,7 +3373,6 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
             );
         }
 
-        // Omborga muvaffaqiyatli qaytarildi
         await client.query(
             `UPDATE public.sales SET stock_restored = true WHERE id = $1`,
             [saleId]
@@ -3342,7 +3380,6 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
 
         await client.query('COMMIT');
 
-        // Telegram (xato bo'lsa ham vozvrat saqlanadi)
         try {
             const userRes = await pool.query(
                 `SELECT site_login FROM public.users WHERE id = $1`,
@@ -3366,7 +3403,8 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
 
         res.json({
             message: "Tovar muvaffaqiyatli qaytarildi",
-            product_id: restoredProductId
+            product_id: restoredProductId,
+            size: sale.size || null
         });
     } catch (err) {
         try { await client.query('ROLLBACK'); } catch (e) { }
