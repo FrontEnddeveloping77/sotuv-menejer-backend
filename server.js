@@ -3046,6 +3046,7 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
         const qtyToReturn = Number(sale.quantity) || 0;
         let restoredImageUrl = sale.image_url || null;
         let restored = false;
+        let restoredProductId = null;
 
         // 1) product_id hali mavjud bo'lsa — faqat shu qator
         if (sale.product_id) {
@@ -3054,12 +3055,13 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
                 UPDATE public.products
                 SET quantity = quantity + $1
                 WHERE id = $2 AND user_id = $3
-                RETURNING id, image_url
+                RETURNING id, image_url, qr_token
                 `,
                 [qtyToReturn, sale.product_id, userId]
             );
             if (byId.rows.length) {
                 restored = true;
+                restoredProductId = byId.rows[0].id;
                 restoredImageUrl = restoredImageUrl || byId.rows[0].image_url || null;
             }
         }
@@ -3068,7 +3070,7 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
         if (!restored && sale.local_id != null) {
             const findRes = await client.query(
                 `
-                SELECT id, image_url
+                SELECT id, image_url, qr_token
                 FROM public.products
                 WHERE user_id = $1
                   AND local_id = $2
@@ -3086,11 +3088,12 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
                     [qtyToReturn, row.id, userId]
                 );
                 restored = true;
+                restoredProductId = row.id;
                 restoredImageUrl = restoredImageUrl || row.image_url || null;
             }
         }
 
-        // 3) Butunlay yo'q (0 bo'lib o'chirilgan) — shu razmer bilan qayta yaratamiz
+        // 3) Butunlay yo'q (0 bo'lib o'chirilgan) — shu razmer bilan qayta yaratamiz (+ QR)
         if (!restored) {
             const insertRes = await client.query(
                 `
@@ -3121,7 +3124,25 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
                 ]
             );
             restoredImageUrl = restoredImageUrl || insertRes.rows[0]?.image_url || null;
+            restoredProductId = insertRes.rows[0]?.id || null;
             restored = true;
+        }
+
+        // Vozvrat qilingan tovar uchun QR yo'q bo'lsa — avtomatik yaratish
+        if (restoredProductId) {
+            await client.query(
+                `
+                UPDATE public.products
+                SET
+                    qr_token = COALESCE(qr_token, $2::uuid),
+                    qr_created_at = CASE
+                        WHEN qr_token IS NULL THEN NOW()
+                        ELSE COALESCE(qr_created_at, NOW())
+                    END
+                WHERE id = $1 AND user_id = $3
+                `,
+                [restoredProductId, randomUUID(), userId]
+            );
         }
 
         await client.query('COMMIT');
