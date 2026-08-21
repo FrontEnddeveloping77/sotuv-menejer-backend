@@ -39,13 +39,18 @@ let tablesReadyPromise = null;
 
 const ensureTablesOnce = () => {
     if (!tablesReadyPromise) {
-        tablesReadyPromise = ensureTables().catch((err) => {
-            console.error(
-                '❌ ensureTables() umumiy xatosi:',
-                err
-            );
-            tablesReadyPromise = null;
-        });
+        tablesReadyPromise = ensureTables()
+            .then(async () => {
+                // Vozvrat qilingan lekin omborda yo'q tovarlarni qayta joylash
+                await repairReturnedProductsToStock();
+            })
+            .catch((err) => {
+                console.error(
+                    '❌ ensureTables() umumiy xatosi:',
+                    err
+                );
+                tablesReadyPromise = null;
+            });
     }
     return tablesReadyPromise;
 };
@@ -215,6 +220,78 @@ const ensureEnteredStatsInitialized = async (clientOrPool, userId) => {
         `,
         [userId, qty, sumVal, types]
     );
+};
+
+
+/**
+ * Oldin vozvrat qilingan, lekin omborda qatori yo'q tovarlarni
+ * qayta joylash + QR yaratish (bir marta / server ishga tushganda)
+ */
+const repairReturnedProductsToStock = async () => {
+    try {
+        const missing = await pool.query(
+            `
+            SELECT s.*
+            FROM public.sales s
+            WHERE COALESCE(s.returned, false) = true
+              AND COALESCE(s.quantity, 0) > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM public.products p
+                  WHERE p.id = s.product_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM public.products p
+                  WHERE p.user_id = s.user_id
+                    AND p.local_id IS NOT DISTINCT FROM s.local_id
+                    AND COALESCE(NULLIF(TRIM(COALESCE(p.size, '')), ''), '')
+                        = COALESCE(NULLIF(TRIM(COALESCE(s.size, '')), ''), '')
+              )
+            ORDER BY s.id ASC
+            `
+        );
+
+        let fixed = 0;
+        for (const sale of missing.rows) {
+            try {
+                const token = randomUUID();
+                await pool.query(
+                    `
+                    INSERT INTO public.products
+                    (
+                        user_id, local_id, category, name, cost_price, color, size,
+                        quantity, qr_token, qr_created_at, selling_price, image_url
+                    )
+                    VALUES
+                    (
+                        $1, $2, $3, $4, $5, $6, $7,
+                        $8, $9, NOW(), $10, $11
+                    )
+                    `,
+                    [
+                        sale.user_id,
+                        sale.local_id != null ? sale.local_id : 1,
+                        sale.category || null,
+                        sale.title || 'Tovar',
+                        sale.cost_price || 0,
+                        sale.color || null,
+                        sale.size || null,
+                        Number(sale.quantity) || 0,
+                        token,
+                        sale.selling_price != null ? sale.selling_price : null,
+                        sale.image_url || null
+                    ]
+                );
+                fixed += 1;
+            } catch (e) {
+                console.error('[repairReturned] sale_id=' + sale.id, e.message);
+            }
+        }
+        if (fixed > 0) {
+            console.log(`[repairReturned] Omborga qaytarildi: ${fixed} ta tovar (QR bilan)`);
+        }
+    } catch (err) {
+        console.error('[repairReturned] xato:', err.message);
+    }
 };
 
 // ====================================================
@@ -3042,59 +3119,59 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
             [saleId]
         );
 
-        // Omborga FAQAT SHU RAZMER / SHU QATOR ga qaytarish
+        // Omborga qaytarish + QR
         const qtyToReturn = Number(sale.quantity) || 0;
         let restoredImageUrl = sale.image_url || null;
-        let restored = false;
         let restoredProductId = null;
 
-        // 1) product_id hali mavjud bo'lsa — faqat shu qator
+        const sizeKey = String(sale.size ?? '').trim();
+
+        // 1) product_id hali omborda bormi?
         if (sale.product_id) {
             const byId = await client.query(
                 `
                 UPDATE public.products
-                SET quantity = quantity + $1
+                SET quantity = COALESCE(quantity, 0) + $1
                 WHERE id = $2 AND user_id = $3
                 RETURNING id, image_url, qr_token
                 `,
                 [qtyToReturn, sale.product_id, userId]
             );
             if (byId.rows.length) {
-                restored = true;
                 restoredProductId = byId.rows[0].id;
                 restoredImageUrl = restoredImageUrl || byId.rows[0].image_url || null;
             }
         }
 
-        // 2) O'chirilgan bo'lishi mumkin — local_id + size (bitta qator)
-        if (!restored && sale.local_id != null) {
+        // 2) local_id + size bo'yicha qidirish (to'liq sotilib o'chirilgan bo'lishi mumkin)
+        if (!restoredProductId && sale.local_id != null) {
             const findRes = await client.query(
                 `
                 SELECT id, image_url, qr_token
                 FROM public.products
                 WHERE user_id = $1
                   AND local_id = $2
-                  AND COALESCE(TRIM(size), '') = COALESCE(TRIM($3::text), '')
+                  AND COALESCE(NULLIF(TRIM(COALESCE(size, '')), ''), '') = $3
                 ORDER BY id ASC
                 LIMIT 1
                 FOR UPDATE
                 `,
-                [userId, sale.local_id, sale.size || '']
+                [userId, sale.local_id, sizeKey]
             );
             if (findRes.rows.length) {
                 const row = findRes.rows[0];
                 await client.query(
-                    `UPDATE public.products SET quantity = quantity + $1 WHERE id = $2 AND user_id = $3`,
+                    `UPDATE public.products SET quantity = COALESCE(quantity, 0) + $1 WHERE id = $2 AND user_id = $3`,
                     [qtyToReturn, row.id, userId]
                 );
-                restored = true;
                 restoredProductId = row.id;
                 restoredImageUrl = restoredImageUrl || row.image_url || null;
             }
         }
 
-        // 3) Butunlay yo'q (0 bo'lib o'chirilgan) — shu razmer bilan qayta yaratamiz (+ QR)
-        if (!restored) {
+        // 3) Omborda umuman yo'q — yangi qator + QR yaratamiz
+        if (!restoredProductId) {
+            const newToken = randomUUID();
             const insertRes = await client.query(
                 `
                 INSERT INTO public.products
@@ -3111,24 +3188,23 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
                 `,
                 [
                     userId,
-                    sale.local_id || 1,
+                    sale.local_id != null ? sale.local_id : 1,
                     sale.category || null,
                     sale.title || 'Tovar',
                     sale.cost_price || 0,
                     sale.color || null,
                     sale.size || null,
                     qtyToReturn,
-                    randomUUID(),
+                    newToken,
                     sale.selling_price != null ? sale.selling_price : null,
                     sale.image_url || null
                 ]
             );
-            restoredImageUrl = restoredImageUrl || insertRes.rows[0]?.image_url || null;
             restoredProductId = insertRes.rows[0]?.id || null;
-            restored = true;
+            restoredImageUrl = restoredImageUrl || insertRes.rows[0]?.image_url || null;
         }
 
-        // Vozvrat qilingan tovar uchun QR yo'q bo'lsa — avtomatik yaratish
+        // QR yo'q bo'lsa — majburiy yaratish
         if (restoredProductId) {
             await client.query(
                 `
@@ -3170,15 +3246,19 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
             console.error('[Telegram] Vozvrat bildirishnomasida xatolik:', tgErr.message);
         }
 
-        res.json({ message: "Tovar muvaffaqiyatli qaytarildi" });
+        res.json({
+            message: "Tovar muvaffaqiyatli qaytarildi",
+            product_id: restoredProductId
+        });
     } catch (err) {
-        await client.query('ROLLBACK');
+        try { await client.query('ROLLBACK'); } catch (e) { }
         console.error('POST /api/sales/:saleId/return xatosi:', err);
         res.status(500).json({ message: "Serverda xatolik yuz berdi" });
     } finally {
         client.release();
     }
 });
+
 
 // ====================================================
 // SOTUV (NAQD) — entered ga TA'SIR QILMAYDI
