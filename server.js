@@ -3006,6 +3006,9 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
 
 // VOZVRAT — TOVARNI QAYTARISH (POST /api/sales/:saleId/return)
 // ====================================================
+// Faqat SHU sotuvni omborga qaytaradi.
+// entered_* ga tegilMAYDI.
+// local_id+size bo'yicha boshqa variantga QO'SHILMAYDI (noto'g'ri omborga tushmasin).
 app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
     const client = await pool.connect();
     try {
@@ -3037,26 +3040,29 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
             });
         }
 
+        const qtyToReturn = Number(sale.quantity) || 0;
+        if (qtyToReturn <= 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: "Qaytariladigan son noto'g'ri!" });
+        }
+
         // Sotuvni qaytarilgan deb belgilash
         await client.query(
             `UPDATE public.sales SET returned = true WHERE id = $1`,
             [saleId]
         );
 
-        // Omborga qaytarish + QR
-        const qtyToReturn = Number(sale.quantity) || 0;
         let restoredImageUrl = sale.image_url || null;
         let restoredProductId = null;
 
-        const sizeKey = String(sale.size ?? '').trim();
-
-        // 1) product_id hali omborda bormi?
+        // 1) Aynan shu product_id omborda qolgan bo'lsa — faqat shu qatorga qaytarish
         if (sale.product_id) {
             const byId = await client.query(
                 `
                 UPDATE public.products
                 SET quantity = COALESCE(quantity, 0) + $1
-                WHERE id = $2 AND user_id = $3
+                WHERE id = $2
+                  AND user_id = $3
                 RETURNING id, image_url, qr_token
                 `,
                 [qtyToReturn, sale.product_id, userId]
@@ -3067,33 +3073,8 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
             }
         }
 
-        // 2) local_id + size bo'yicha qidirish (to'liq sotilib o'chirilgan bo'lishi mumkin)
-        if (!restoredProductId && sale.local_id != null) {
-            const findRes = await client.query(
-                `
-                SELECT id, image_url, qr_token
-                FROM public.products
-                WHERE user_id = $1
-                  AND local_id = $2
-                  AND COALESCE(NULLIF(TRIM(COALESCE(size, '')), ''), '') = $3
-                ORDER BY id ASC
-                LIMIT 1
-                FOR UPDATE
-                `,
-                [userId, sale.local_id, sizeKey]
-            );
-            if (findRes.rows.length) {
-                const row = findRes.rows[0];
-                await client.query(
-                    `UPDATE public.products SET quantity = COALESCE(quantity, 0) + $1 WHERE id = $2 AND user_id = $3`,
-                    [qtyToReturn, row.id, userId]
-                );
-                restoredProductId = row.id;
-                restoredImageUrl = restoredImageUrl || row.image_url || null;
-            }
-        }
-
-        // 3) Omborda umuman yo'q — yangi qator + QR yaratamiz
+        // 2) To'liq sotilib o'chirilgan — YANGI qator (shu sotuv ma'lumotlari + QR)
+        //    Boshqa local_id/size variantiga QO'SHILMAYDI
         if (!restoredProductId) {
             const newToken = randomUUID();
             const insertRes = await client.query(
@@ -3128,7 +3109,7 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
             restoredImageUrl = restoredImageUrl || insertRes.rows[0]?.image_url || null;
         }
 
-        // QR yo'q bo'lsa — majburiy yaratish
+        // QR yo'q bo'lsa yaratish
         if (restoredProductId) {
             await client.query(
                 `
@@ -3147,13 +3128,13 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
 
         await client.query('COMMIT');
 
-        const returnImageUrl = restoredImageUrl || null;
-
-        // 🟢 TELEGRAM NOTIFICATION (RASMI BILAN)
+        // Telegram (xato bo'lsa ham vozvrat saqlanadi)
         try {
-            const userRes = await pool.query(`SELECT site_login FROM public.users WHERE id = $1`, [userId]);
+            const userRes = await pool.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [userId]
+            );
             const siteLogin = userRes.rows[0]?.site_login;
-
             if (siteLogin) {
                 const msg =
                     `🔄 <b>TOVAR QAYTARILDI (VOZVRAT)</b>\n` +
@@ -3163,8 +3144,7 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
                     `🔢 <b>Soni:</b> ${qtyToReturn} dona\n` +
                     `💰 <b>Qaytarilgan summa:</b> ${formatSum(qtyToReturn * Number(sale.selling_price || 0))} so'm\n` +
                     `━━━━━━━━━━━━━━━━━━━━`;
-
-                await queueTelegramNotification(pool, siteLogin, msg, returnImageUrl);
+                await queueTelegramNotification(pool, siteLogin, msg, restoredImageUrl || null);
             }
         } catch (tgErr) {
             console.error('[Telegram] Vozvrat bildirishnomasida xatolik:', tgErr.message);
