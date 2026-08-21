@@ -234,6 +234,28 @@ const ensureEnteredStatsInitialized = async (clientOrPool, userId) => {
  */
 const repairMissingReturnedStock = async () => {
     try {
+        // Oldin "tiklangan" deb belgilangan, lekin omborda umuman yo'q bo'lganlarni qayta ochish
+        await pool.query(
+            `
+            UPDATE public.sales s
+            SET stock_restored = false
+            WHERE COALESCE(s.returned, false) = true
+              AND COALESCE(s.stock_restored, false) = true
+              AND COALESCE(s.quantity, 0) > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM public.products p
+                  WHERE p.id = s.product_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM public.products p
+                  WHERE p.user_id = s.user_id
+                    AND p.local_id IS NOT DISTINCT FROM s.local_id
+                    AND COALESCE(NULLIF(TRIM(COALESCE(p.size, '')), ''), '')
+                        = COALESCE(NULLIF(TRIM(COALESCE(s.size, '')), ''), '')
+              )
+            `
+        );
+
         const rows = await pool.query(
             `
             SELECT s.*
@@ -248,6 +270,8 @@ const repairMissingReturnedStock = async () => {
         let fixed = 0;
         let marked = 0;
 
+        console.log(`[repairMissingReturned] tekshirilmoqda: ${rows.rows.length} ta vozvrat`);
+
         for (const sale of rows.rows) {
             const client = await pool.connect();
             try {
@@ -257,44 +281,7 @@ const repairMissingReturnedStock = async () => {
                 const qty = Number(sale.quantity) || 0;
                 const sizeKey = String(sale.size ?? '').trim();
 
-                if (sale.product_id) {
-                    const exists = await client.query(
-                        `SELECT id FROM public.products WHERE id = $1 AND user_id = $2 LIMIT 1`,
-                        [sale.product_id, userId]
-                    );
-                    if (exists.rows.length) {
-                        await client.query(
-                            `UPDATE public.sales SET stock_restored = true WHERE id = $1`,
-                            [sale.id]
-                        );
-                        await client.query('COMMIT');
-                        marked += 1;
-                        continue;
-                    }
-                }
-
-                if (sale.local_id != null) {
-                    const sib = await client.query(
-                        `
-                        SELECT id FROM public.products
-                        WHERE user_id = $1
-                          AND local_id = $2
-                          AND COALESCE(NULLIF(TRIM(COALESCE(size, '')), ''), '') = $3
-                        LIMIT 1
-                        `,
-                        [userId, sale.local_id, sizeKey]
-                    );
-                    if (sib.rows.length) {
-                        await client.query(
-                            `UPDATE public.sales SET stock_restored = true WHERE id = $1`,
-                            [sale.id]
-                        );
-                        await client.query('COMMIT');
-                        marked += 1;
-                        continue;
-                    }
-                }
-
+                // Vozvratdan KEYIN qayta sotilgan → omborga qayta qo'yilMAYDI
                 const resold = await client.query(
                     `
                     SELECT id FROM public.sales
@@ -317,37 +304,108 @@ const repairMissingReturnedStock = async () => {
                     continue;
                 }
 
-                const token = randomUUID();
-                await client.query(
-                    `
-                    INSERT INTO public.products
-                    (
-                        user_id, local_id, category, name, cost_price, color, size,
-                        quantity, qr_token, qr_created_at, selling_price, image_url
-                    )
-                    VALUES
-                    ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11)
-                    `,
-                    [
-                        userId,
-                        sale.local_id != null ? sale.local_id : 1,
-                        sale.category || null,
-                        sale.title || 'Tovar',
-                        sale.cost_price || 0,
-                        sale.color || null,
-                        sale.size || null,
-                        qty,
-                        token,
-                        sale.selling_price != null ? sale.selling_price : null,
-                        sale.image_url || null
-                    ]
-                );
+                let done = false;
+
+                // 1) product_id omborda bor → miqdorni qo'shish
+                if (sale.product_id) {
+                    const byId = await client.query(
+                        `
+                        UPDATE public.products
+                        SET quantity = COALESCE(quantity, 0) + $1
+                        WHERE id = $2 AND user_id = $3
+                        RETURNING id
+                        `,
+                        [qty, sale.product_id, userId]
+                    );
+                    if (byId.rows.length) {
+                        await client.query(
+                            `
+                            UPDATE public.products
+                            SET
+                                qr_token = COALESCE(qr_token, $2::uuid),
+                                qr_created_at = CASE
+                                    WHEN qr_token IS NULL THEN NOW()
+                                    ELSE COALESCE(qr_created_at, NOW())
+                                END
+                            WHERE id = $1 AND user_id = $3
+                            `,
+                            [byId.rows[0].id, randomUUID(), userId]
+                        );
+                        done = true;
+                    }
+                }
+
+                // 2) local_id + size bo'yicha bor → miqdorni qo'shish
+                if (!done && sale.local_id != null) {
+                    const sib = await client.query(
+                        `
+                        SELECT id FROM public.products
+                        WHERE user_id = $1
+                          AND local_id = $2
+                          AND COALESCE(NULLIF(TRIM(COALESCE(size, '')), ''), '') = $3
+                        ORDER BY id ASC
+                        LIMIT 1
+                        FOR UPDATE
+                        `,
+                        [userId, sale.local_id, sizeKey]
+                    );
+                    if (sib.rows.length) {
+                        const pid = sib.rows[0].id;
+                        await client.query(
+                            `UPDATE public.products SET quantity = COALESCE(quantity, 0) + $1 WHERE id = $2 AND user_id = $3`,
+                            [qty, pid, userId]
+                        );
+                        await client.query(
+                            `
+                            UPDATE public.products
+                            SET
+                                qr_token = COALESCE(qr_token, $2::uuid),
+                                qr_created_at = CASE
+                                    WHEN qr_token IS NULL THEN NOW()
+                                    ELSE COALESCE(qr_created_at, NOW())
+                                END
+                            WHERE id = $1 AND user_id = $3
+                            `,
+                            [pid, randomUUID(), userId]
+                        );
+                        done = true;
+                    }
+                }
+
+                // 3) Umuman yo'q → yangi qator + QR
+                if (!done) {
+                    const token = randomUUID();
+                    await client.query(
+                        `
+                        INSERT INTO public.products
+                        (
+                            user_id, local_id, category, name, cost_price, color, size,
+                            quantity, qr_token, qr_created_at, selling_price, image_url
+                        )
+                        VALUES
+                        ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11)
+                        `,
+                        [
+                            userId,
+                            sale.local_id != null ? sale.local_id : 1,
+                            sale.category || null,
+                            sale.title || 'Tovar',
+                            sale.cost_price || 0,
+                            sale.color || null,
+                            sale.size || null,
+                            qty,
+                            token,
+                            sale.selling_price != null ? sale.selling_price : null,
+                            sale.image_url || null
+                        ]
+                    );
+                    done = true;
+                }
 
                 await client.query(
                     `UPDATE public.sales SET stock_restored = true WHERE id = $1`,
                     [sale.id]
                 );
-
                 await client.query('COMMIT');
                 fixed += 1;
             } catch (e) {
@@ -358,15 +416,14 @@ const repairMissingReturnedStock = async () => {
             }
         }
 
-        if (fixed > 0 || marked > 0) {
-            console.log(
-                `[repairMissingReturned] omborga qo'shildi: ${fixed}, belgilangan: ${marked}`
-            );
-        }
+        console.log(
+            `[repairMissingReturned] omborga qo'shildi/yangilandi: ${fixed}, qayta sotilgan (o'tkazib yuborildi): ${marked}`
+        );
     } catch (err) {
         console.error('[repairMissingReturned] xato:', err.message);
     }
 };
+
 
 // ====================================================
 // YORDAMCHI FUNKSIYALAR
