@@ -10,12 +10,6 @@
 // MUHIM TUZATISH (2026-08):
 // Do'konga kirgan tovarlar (entered_*) FAQAT qo'shish / o'chirish / restore da o'zgaradi.
 // Sotuv, vozvrat, tahrirlash HECH QACHON entered_* ni o'zgartirmaydi.
-//
-// ★★★ 2026-08-22 TUZATISH:
-// Sotuv (hatto oxirgi dona) endi yetkazib beruvchi qarzini HECH QACHON kamaytirmaydi.
-// Qarz = (ombor + sotilgan qaytarilmagan) cost − paid_amount.
-// Credit tovar to'liq sotilganda quantity=0 qilib qoldiriladi (DELETE qilinmaydi).
-// Oldin to'liq sotilgan credit local_id lar qayta tiklanadi.
 
 require('dotenv').config();
 
@@ -49,7 +43,6 @@ const ensureTablesOnce = () => {
             .then(async () => {
                 await repairMissingReturnedStock();
                 await splitProductQuantitiesToOne();
-                await repairSoldCreditDebts(); // ★ yangi: oldin sotilgan creditlarni qarzga qaytarish
             })
             .catch((err) => {
                 console.error(
@@ -537,102 +530,6 @@ const splitProductQuantitiesToOne = async () => {
     }
 };
 
-/**
- * ★★★ YANGI: Oldin to'liq sotilgan (products dan o'chirilgan) local_id larni
- * qarz ro'yxatiga qaytarish. quantity=0 + payment_type=credit + paid=0.
- * Sotuv endi qarzni kamaytirmaydi, shuning uchun ularni qayta tiklaymiz.
- */
-const repairSoldCreditDebts = async () => {
-    try {
-        const missing = await pool.query(
-            `
-            SELECT DISTINCT s.user_id, s.local_id
-            FROM public.sales s
-            WHERE COALESCE(s.returned, false) = false
-              AND s.local_id IS NOT NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM public.products p
-                  WHERE p.user_id = s.user_id AND p.local_id = s.local_id
-              )
-            `
-        );
-
-        let fixed = 0;
-
-        for (const row of missing.rows) {
-            const client = await pool.connect();
-            try {
-                await client.query('BEGIN');
-
-                const agg = await client.query(
-                    `
-                    SELECT
-                        MAX(title) AS name,
-                        MAX(category) AS category,
-                        MAX(color) AS color,
-                        COALESCE(MAX(cost_price), 0) AS cost_price,
-                        MAX(image_url) AS image_url
-                    FROM public.sales
-                    WHERE user_id = $1
-                      AND local_id = $2
-                      AND COALESCE(returned, false) = false
-                    `,
-                    [row.user_id, row.local_id]
-                );
-
-                if (!agg.rows.length) {
-                    await client.query('ROLLBACK');
-                    continue;
-                }
-
-                const a = agg.rows[0];
-
-                await client.query(
-                    `
-                    INSERT INTO public.products
-                    (
-                        user_id, local_id, category, name, cost_price, color, size,
-                        quantity, qr_token, qr_created_at, payment_type, supplier,
-                        paid_amount, supplier_phone, selling_price, image_url
-                    )
-                    VALUES
-                    (
-                        $1, $2, $3, $4, $5, $6, NULL,
-                        0, $7, NOW(), 'credit', $8,
-                        0, NULL, NULL, $9
-                    )
-                    `,
-                    [
-                        row.user_id,
-                        row.local_id,
-                        a.category || null,
-                        a.name || 'Tovar',
-                        a.cost_price || 0,
-                        a.color || null,
-                        randomUUID(),
-                        'Avvalgi sotuvdan qayta tiklangan',
-                        a.image_url || null
-                    ]
-                );
-
-                await client.query('COMMIT');
-                fixed += 1;
-            } catch (e) {
-                try { await client.query('ROLLBACK'); } catch (e2) { }
-                console.error('[repairSoldCreditDebts] local_id=' + row.local_id, e.message);
-            } finally {
-                client.release();
-            }
-        }
-
-        if (fixed > 0) {
-            console.log(`[repairSoldCreditDebts] qayta tiklandi: ${fixed} ta local_id (qarz ro'yxatiga qaytdi)`);
-        }
-    } catch (err) {
-        console.error('[repairSoldCreditDebts] xato:', err.message);
-    }
-};
-
 // ====================================================
 // YORDAMCHI FUNKSIYALAR
 // ====================================================
@@ -755,7 +652,6 @@ const getMonthReport = async (clientOrPool, userId) => {
         [userId]
     );
 
-    // ★★★ Qarz endi ombor + sotilgan (qaytarilmagan) asosida
     const debtResult = await clientOrPool.query(
         `
         SELECT COALESCE(SUM(debt), 0) AS total_debt
@@ -1833,7 +1729,6 @@ app.get(
                 [userId]
             );
 
-            // ★★★ Qarz = (ombor + sotilgan qaytarilmagan) − paid  (sotuv ta'sir qilmaydi)
             const debtStats = await pool.query(
                 `
                 SELECT COALESCE(SUM(debt), 0) AS "totalDebt"
@@ -2497,7 +2392,6 @@ app.get(
                     image_url
                 FROM public.products
                 WHERE user_id = $1
-                  AND COALESCE(quantity, 0) > 0
                 ORDER BY
                     local_id DESC,
                     CASE
@@ -2668,31 +2562,53 @@ app.get('/api/debts', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId;
 
-        // ★★★ Har bir local_id uchun (ombor + sotilgan) asosida hisoblanadi
         const result = await pool.query(
             `
             SELECT
-                local_id,
-                MAX(name) AS name,
-                MAX(category) AS category,
-                MAX(color) AS color,
                 COALESCE(NULLIF(TRIM(MAX(supplier)), ''), 'Noma''lum') AS supplier,
                 MAX(NULLIF(TRIM(supplier_phone), '')) AS supplier_phone,
-                (
-                    COALESCE(SUM(quantity * cost_price), 0)
-                    +
-                    COALESCE((
-                        SELECT SUM(s.quantity * s.cost_price)
-                        FROM public.sales s
-                        WHERE s.user_id = p.user_id
-                          AND s.local_id = p.local_id
-                          AND COALESCE(s.returned, false) = false
-                    ), 0)
+                SUM(
+                    (
+                        COALESCE(quantity * cost_price, 0)
+                        +
+                        COALESCE((
+                            SELECT SUM(s.quantity * s.cost_price)
+                            FROM public.sales s
+                            WHERE s.user_id = p.user_id
+                              AND s.local_id = p.local_id
+                              AND COALESCE(s.returned, false) = false
+                        ), 0)
+                    )
                 ) AS total_cost,
-                MAX(COALESCE(paid_amount, 0)) AS total_paid,
+                SUM(MAX(COALESCE(paid_amount, 0))) AS total_paid,
+                SUM(
+                    GREATEST(
+                        (
+                            COALESCE(quantity * cost_price, 0)
+                            +
+                            COALESCE((
+                                SELECT SUM(s.quantity * s.cost_price)
+                                FROM public.sales s
+                                WHERE s.user_id = p.user_id
+                                  AND s.local_id = p.local_id
+                                  AND COALESCE(s.returned, false) = false
+                            ), 0)
+                        ) - MAX(COALESCE(paid_amount, 0)),
+                        0
+                    )
+                ) AS debt,
+                COUNT(DISTINCT local_id) AS products_count,
+                array_agg(DISTINCT category) FILTER (WHERE category IS NOT NULL AND TRIM(category) <> '') AS categories
+            FROM public.products p
+            WHERE user_id = $1
+              AND payment_type = 'credit'
+              AND supplier IS NOT NULL
+              AND TRIM(supplier) <> ''
+            GROUP BY COALESCE(NULLIF(TRIM(supplier), ''), 'Noma''lum')
+            HAVING SUM(
                 GREATEST(
                     (
-                        COALESCE(SUM(quantity * cost_price), 0)
+                        COALESCE(quantity * cost_price, 0)
                         +
                         COALESCE((
                             SELECT SUM(s.quantity * s.cost_price)
@@ -2703,65 +2619,22 @@ app.get('/api/debts', authenticateToken, async (req, res) => {
                         ), 0)
                     ) - MAX(COALESCE(paid_amount, 0)),
                     0
-                ) AS debt
-            FROM public.products p
-            WHERE user_id = $1
-              AND payment_type = 'credit'
-              AND supplier IS NOT NULL
-              AND TRIM(supplier) <> ''
-            GROUP BY user_id, local_id
-            HAVING GREATEST(
-                (
-                    COALESCE(SUM(quantity * cost_price), 0)
-                    +
-                    COALESCE((
-                        SELECT SUM(s.quantity * s.cost_price)
-                        FROM public.sales s
-                        WHERE s.user_id = p.user_id
-                          AND s.local_id = p.local_id
-                          AND COALESCE(s.returned, false) = false
-                    ), 0)
-                ) - MAX(COALESCE(paid_amount, 0)),
-                0
+                )
             ) > 0
             ORDER BY debt DESC
             `,
             [userId]
         );
 
-        // Supplier bo'yicha guruhlash
-        const grouped = {};
-        for (const row of result.rows) {
-            const key = (row.supplier || "Noma'lum").toLowerCase();
-            if (!grouped[key]) {
-                grouped[key] = {
-                    supplier: row.supplier,
-                    supplier_phone: row.supplier_phone || null,
-                    total_cost: 0,
-                    total_paid: 0,
-                    debt: 0,
-                    products_count: 0,
-                    categories: new Set()
-                };
-            }
-            grouped[key].total_cost += Number(row.total_cost) || 0;
-            grouped[key].total_paid += Number(row.total_paid) || 0;
-            grouped[key].debt += Number(row.debt) || 0;
-            grouped[key].products_count += 1;
-            if (row.category) grouped[key].categories.add(row.category);
-        }
-
-        const debts = Object.values(grouped)
-            .map((g) => ({
-                supplier: g.supplier,
-                supplier_phone: g.supplier_phone,
-                total_cost: g.total_cost,
-                total_paid: g.total_paid,
-                debt: g.debt,
-                products_count: g.products_count,
-                categories: Array.from(g.categories)
-            }))
-            .sort((a, b) => b.debt - a.debt);
+        const debts = result.rows.map((row) => ({
+            supplier: row.supplier,
+            supplier_phone: row.supplier_phone || null,
+            total_cost: Number(row.total_cost) || 0,
+            total_paid: Number(row.total_paid) || 0,
+            debt: Number(row.debt) || 0,
+            products_count: Number(row.products_count) || 0,
+            categories: row.categories || []
+        }));
 
         res.json({ debts });
     } catch (err) {
@@ -2781,7 +2654,7 @@ app.get(
         try {
             const userId = req.user.userId;
 
-            // ★★★ total_cost = ombor + sotilgan
+            // To'lov qilingan (paid_amount > 0) barcha nasiya tovarlar
             const result = await pool.query(
                 `
                 SELECT
@@ -2792,38 +2665,18 @@ app.get(
                     MAX(supplier) AS supplier,
                     MAX(supplier_phone) AS supplier_phone,
                     SUM(quantity) AS total_quantity,
-                    (
-                        COALESCE(SUM(quantity * cost_price), 0)
-                        +
-                        COALESCE((
-                            SELECT SUM(s.quantity * s.cost_price)
-                            FROM public.sales s
-                            WHERE s.user_id = p.user_id
-                              AND s.local_id = p.local_id
-                              AND COALESCE(s.returned, false) = false
-                        ), 0)
-                    ) AS total_cost,
+                    SUM(cost_price * quantity) AS total_cost,
                     MAX(COALESCE(paid_amount, 0)) AS total_paid,
                     GREATEST(
-                        (
-                            COALESCE(SUM(quantity * cost_price), 0)
-                            +
-                            COALESCE((
-                                SELECT SUM(s.quantity * s.cost_price)
-                                FROM public.sales s
-                                WHERE s.user_id = p.user_id
-                                  AND s.local_id = p.local_id
-                                  AND COALESCE(s.returned, false) = false
-                            ), 0)
-                        ) - MAX(COALESCE(paid_amount, 0)),
+                        SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
                         0
                     ) AS debt,
                     MAX(created_at) AS last_created
-                FROM public.products p
+                FROM public.products
                 WHERE user_id = $1
                   AND payment_type = 'credit'
                   AND COALESCE(paid_amount, 0) > 0
-                GROUP BY user_id, local_id
+                GROUP BY local_id
                 ORDER BY MAX(created_at) DESC
                 `,
                 [userId]
@@ -2922,44 +2775,24 @@ app.post(
         try {
             await client.query('BEGIN');
 
-            // ★★★ debt endi ombor + sotilgan asosida
+            // Shu supplierga tegishli nasiya tovarlarni olamiz
             const groupsResult = await client.query(
                 `
                 SELECT
                     local_id,
                     MAX(name) AS name,
-                    (
-                        COALESCE(SUM(quantity * cost_price), 0)
-                        +
-                        COALESCE((
-                            SELECT SUM(s.quantity * s.cost_price)
-                            FROM public.sales s
-                            WHERE s.user_id = p.user_id
-                              AND s.local_id = p.local_id
-                              AND COALESCE(s.returned, false) = false
-                        ), 0)
-                    ) AS total_cost,
+                    SUM(cost_price * quantity) AS total_cost,
                     MAX(COALESCE(paid_amount, 0)) AS total_paid,
                     GREATEST(
-                        (
-                            COALESCE(SUM(quantity * cost_price), 0)
-                            +
-                            COALESCE((
-                                SELECT SUM(s.quantity * s.cost_price)
-                                FROM public.sales s
-                                WHERE s.user_id = p.user_id
-                                  AND s.local_id = p.local_id
-                                  AND COALESCE(s.returned, false) = false
-                            ), 0)
-                        ) - MAX(COALESCE(paid_amount, 0)),
+                        SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
                         0
                     ) AS debt,
                     MAX(created_at) AS created_at
-                FROM public.products p
+                FROM public.products
                 WHERE user_id = $1
                   AND payment_type = 'credit'
                   AND supplier = $2
-                GROUP BY user_id, local_id
+                GROUP BY local_id
                 HAVING MAX(COALESCE(paid_amount, 0)) > 0
                 ORDER BY local_id ASC
                 `,
@@ -3062,31 +2895,21 @@ app.post(
                 });
             }
 
-            // Qolgan qarz (yangi formula bilan)
+            // Qolgan qarz
             const remainingDebtResult = await client.query(
                 `
                 SELECT COALESCE(SUM(debt), 0) AS remaining
                 FROM (
                     SELECT
                         GREATEST(
-                            (
-                                COALESCE(SUM(quantity * cost_price), 0)
-                                +
-                                COALESCE((
-                                    SELECT SUM(s.quantity * s.cost_price)
-                                    FROM public.sales s
-                                    WHERE s.user_id = p.user_id
-                                      AND s.local_id = p.local_id
-                                      AND COALESCE(s.returned, false) = false
-                                ), 0)
-                            ) - MAX(COALESCE(paid_amount, 0)),
+                            SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
                             0
                         ) AS debt
-                    FROM public.products p
+                    FROM public.products
                     WHERE user_id = $1
                       AND payment_type = 'credit'
                       AND supplier = $2
-                    GROUP BY user_id, local_id
+                    GROUP BY local_id
                 ) t
                 `,
                 [userId, cleanSupplier]
@@ -3179,54 +3002,23 @@ app.post(
         try {
             await client.query('BEGIN');
 
-            // ★★★ debt = (ombor + sotilgan) − paid
             const groupsResult = await client.query(
                 `
                 SELECT
                     local_id,
                     MAX(name) AS name,
-                    (
-                        COALESCE(SUM(quantity * cost_price), 0)
-                        +
-                        COALESCE((
-                            SELECT SUM(s.quantity * s.cost_price)
-                            FROM public.sales s
-                            WHERE s.user_id = p.user_id
-                              AND s.local_id = p.local_id
-                              AND COALESCE(s.returned, false) = false
-                        ), 0)
-                    ) AS total_cost,
+                    SUM(cost_price * quantity) AS total_cost,
                     MAX(COALESCE(paid_amount, 0)) AS total_paid,
                     GREATEST(
-                        (
-                            COALESCE(SUM(quantity * cost_price), 0)
-                            +
-                            COALESCE((
-                                SELECT SUM(s.quantity * s.cost_price)
-                                FROM public.sales s
-                                WHERE s.user_id = p.user_id
-                                  AND s.local_id = p.local_id
-                                  AND COALESCE(s.returned, false) = false
-                            ), 0)
-                        ) - MAX(COALESCE(paid_amount, 0)),
+                        SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
                         0
                     ) AS debt
-                FROM public.products p
+                FROM public.products
                 WHERE user_id = $1
                   AND payment_type = 'credit'
                   AND supplier = $2
-                GROUP BY user_id, local_id
-                HAVING (
-                    COALESCE(SUM(quantity * cost_price), 0)
-                    +
-                    COALESCE((
-                        SELECT SUM(s.quantity * s.cost_price)
-                        FROM public.sales s
-                        WHERE s.user_id = p.user_id
-                          AND s.local_id = p.local_id
-                          AND COALESCE(s.returned, false) = false
-                    ), 0)
-                ) - MAX(COALESCE(paid_amount, 0)) > 0
+                GROUP BY local_id
+                HAVING SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)) > 0
                 ORDER BY local_id ASC
                 `,
                 [userId, cleanSupplier]
@@ -3288,24 +3080,14 @@ app.post(
                 FROM (
                     SELECT
                         GREATEST(
-                            (
-                                COALESCE(SUM(quantity * cost_price), 0)
-                                +
-                                COALESCE((
-                                    SELECT SUM(s.quantity * s.cost_price)
-                                    FROM public.sales s
-                                    WHERE s.user_id = p.user_id
-                                      AND s.local_id = p.local_id
-                                      AND COALESCE(s.returned, false) = false
-                                ), 0)
-                            ) - MAX(COALESCE(paid_amount, 0)),
+                            SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
                             0
                         ) AS debt
-                    FROM public.products p
+                    FROM public.products
                     WHERE user_id = $1
                       AND payment_type = 'credit'
                       AND supplier = $2
-                    GROUP BY user_id, local_id
+                    GROUP BY local_id
                 ) t
                 `,
                 [userId, cleanSupplier]
@@ -3729,7 +3511,6 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
 
 // ====================================================
 // SOTUV (NAQD) — entered ga TA'SIR QILMAYDI
-// ★★★ Credit tovar to'liq sotilganda DELETE qilinMAYDI (quantity=0 qoldiriladi)
 // ====================================================
 
 app.post(
@@ -3869,7 +3650,6 @@ VALUES
                     ]
                 );
 
-                // ★★★ Credit bo'lsa quantity=0 qilib qoldiramiz (qarz saqlansin)
                 if (newQty === 0) {
                     if ((product.payment_type || 'cash') === 'credit') {
                         await client.query(
@@ -3933,7 +3713,6 @@ VALUES
                         SELECT local_id, size, quantity
                         FROM public.products
                         WHERE user_id = $1 AND local_id = ANY($2::int[])
-                          AND COALESCE(quantity, 0) > 0
                         ORDER BY local_id, size
                         `,
                         [userId, localIds]
@@ -4007,7 +3786,6 @@ VALUES
 
 // ====================================================
 // YANGI: NASIYAGA SOTISH — entered ga TA'SIR QILMAYDI
-// ★★★ Credit tovar to'liq sotilganda DELETE qilinMAYDI
 // ====================================================
 
 app.post(
@@ -4171,7 +3949,6 @@ VALUES
                     ]
                 );
 
-                // ★★★ Credit bo'lsa quantity=0 qilib qoldiramiz
                 if (newQty === 0) {
                     if ((product.payment_type || 'cash') === 'credit') {
                         await client.query(
@@ -4230,7 +4007,6 @@ VALUES
                         SELECT local_id, size, quantity
                         FROM public.products
                         WHERE user_id = $1 AND local_id = ANY($2::int[])
-                          AND COALESCE(quantity, 0) > 0
                         ORDER BY local_id, size
                         `,
                         [userId, localIds]
@@ -4544,7 +4320,6 @@ app.post(
                         SELECT local_id, size, quantity
                         FROM public.products
                         WHERE user_id = $1 AND local_id = ANY($2::int[])
-                          AND COALESCE(quantity, 0) > 0
                         ORDER BY local_id, size
                         `,
                         [userId, localIds]
@@ -5014,7 +4789,6 @@ app.get(
 
 // ====================================================
 // QR SOTUV — entered ga TA'SIR QILMAYDI
-// ★★★ Credit tovar to'liq sotilganda DELETE qilinMAYDI
 // ====================================================
 
 app.post(
@@ -5117,7 +4891,6 @@ VALUES
                 ]
             );
 
-            // ★★★ Credit bo'lsa quantity=0 qilib qoldiramiz
             if (newQty === 0) {
                 if ((product.payment_type || 'cash') === 'credit') {
                     await client.query(
@@ -5333,7 +5106,6 @@ app.post(
 
 // ====================================================
 // QR NASIYAGA SOTISH — entered ga TA'SIR QILMAYDI
-// ★★★ Credit tovar to'liq sotilganda DELETE qilinMAYDI
 // ====================================================
 
 app.post(
@@ -5447,7 +5219,6 @@ app.post(
                 ]
             );
 
-            // ★★★ Credit bo'lsa quantity=0 qilib qoldiramiz
             if (newQty === 0) {
                 if ((product.payment_type || 'cash') === 'credit') {
                     await client.query(
