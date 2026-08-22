@@ -1972,38 +1972,108 @@ app.post(
             });
         }
 
-        const cleanPaymentType =
-            payment_type === 'credit' ? 'credit' : 'cash';
+        // ====================================================
+        // TO'LOV TURINI TO'G'RI ANIQLASH
+        // ====================================================
+
+        // Frontenddan kelgan qiymatni tozalaymiz
+        const rawPaymentType = String(
+            payment_type ?? ''
+        )
+            .trim()
+            .toLowerCase();
+
+        // Nasiya uchun barcha mumkin bo'lgan nomlar
+        const creditPaymentTypes = [
+            'credit',
+            'nasiya',
+            'nasiyaga',
+            'nasiyaга',
+            'qarz',
+            'debt',
+            'installment'
+        ];
+
+        // Agar yuqoridagilardan biri kelsa credit,
+        // qolgan holatda cash
+        const cleanPaymentType = creditPaymentTypes.includes(rawPaymentType)
+            ? 'credit'
+            : 'cash';
 
         let cleanSupplier =
             typeof supplier === 'string'
                 ? supplier.trim()
                 : '';
-        // Kimdan / telefon — ixtiyoriy (bo'sh bo'lishi mumkin)
 
         let cleanSupplierPhone =
             typeof supplier_phone === 'string'
                 ? supplier_phone.trim()
                 : '';
 
-        // Telefon ixtiyoriy — bo'sh bo'lishi mumkin
+        // ====================================================
+        // TO'LANGAN SUMMANI TO'G'RI O'QISH
+        // ====================================================
 
         let parsedPaidAmount = 0;
 
         if (cleanPaymentType === 'credit') {
-            if (paid_amount !== undefined && paid_amount !== null && paid_amount !== '') {
-                const n = Number(paid_amount);
-                if (!Number.isFinite(n) || n < 0) {
-                    return res.status(400).json({
-                        message:
-                            "To'langan summa noto'g'ri!"
-                    });
-                }
-                parsedPaidAmount = n;
-            } else {
-                parsedPaidAmount = 0;
+
+            // Frontenddan turli nomlar bilan kelishi mumkin
+            const rawPaidAmount =
+                paid_amount ??
+                req.body.paidAmount ??
+                req.body.paid ??
+                req.body.payment_amount ??
+                0;
+
+            // "50 000", "50,000", "50000 so'm" kabi
+            // qiymatlarni ham raqamga aylantiramiz
+            const paidCleaned = String(rawPaidAmount)
+                .replace(/\s/g, '')
+                .replace(/,/g, '')
+                .replace(/[^\d.-]/g, '');
+
+            const n = Number(paidCleaned || 0);
+
+            if (!Number.isFinite(n) || n < 0) {
+                return res.status(400).json({
+                    message: "To'langan summa noto'g'ri!"
+                });
             }
+
+            parsedPaidAmount = n;
         }
+
+        // ====================================================
+        // NASIYA UCHUN QARZ HISOBI
+        // ====================================================
+
+        // Tovarning jami tannarxi
+        const totalProductCost = parsedCostPrice * totalQty;
+
+        // To'langan summa jami tannarxdan oshmasin
+        if (
+            cleanPaymentType === 'credit' &&
+            parsedPaidAmount > totalProductCost
+        ) {
+            return res.status(400).json({
+                message: `To'langan summa jami tovar narxidan katta bo'lishi mumkin emas! Jami: ${totalProductCost}`
+            });
+        }
+
+        // Qolgan qarz
+        const totalDebtAmount =
+            cleanPaymentType === 'credit'
+                ? Math.max(0, totalProductCost - parsedPaidAmount)
+                : 0;
+
+        console.log('===== TOVAR TO\'LOVI =====');
+        console.log('Frontend payment_type:', payment_type);
+        console.log('Backend payment_type:', cleanPaymentType);
+        console.log('Jami tovar narxi:', totalProductCost);
+        console.log('To\'langan summa:', parsedPaidAmount);
+        console.log('Qolgan qarz:', totalDebtAmount);
+        console.log('===========================');
 
         let parsedSellingPrice = null;
         if (selling_price !== undefined && selling_price !== null && selling_price !== '') {
@@ -2101,6 +2171,24 @@ app.post(
                         last.rows[0].local_id
                     ) + 1
                     : 1;
+
+            // Nasiya bo'lsa, to'langan pulni faqat BITTA qatorga yozamiz.
+            // Sababi bitta local_id dagi barcha tovarlar bitta xarid hisoblanadi.
+            // Qolgan qatorlarga 0 yoziladi.
+            let paidAmountWritten = false;
+
+            const getPaidAmountForRow = () => {
+                if (cleanPaymentType !== 'credit') {
+                    return 0;
+                }
+
+                if (!paidAmountWritten) {
+                    paidAmountWritten = true;
+                    return parsedPaidAmount;
+                }
+
+                return 0;
+            };
 
             const insertedRows = [];
 
