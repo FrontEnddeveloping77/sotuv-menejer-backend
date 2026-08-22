@@ -10,6 +10,11 @@
 // MUHIM TUZATISH (2026-08):
 // Do'konga kirgan tovarlar (entered_*) FAQAT qo'shish / o'chirish / restore da o'zgaradi.
 // Sotuv, vozvrat, tahrirlash HECH QACHON entered_* ni o'zgartirmaydi.
+//
+// MUHIM TUZATISH (ombor/sotuv):
+// quantity === 0 bo'lganda HECH QACHON UPDATE quantity=0 qilinmaydi.
+// Har doim aniq product.id bo'yicha DELETE qilinadi (local_id bo'yicha emas).
+// Boshqa razmerlar saqlanadi. QR ham shu qator bilan yo'qoladi.
 
 require('dotenv').config();
 
@@ -1132,6 +1137,12 @@ const ensureTables = async () => {
             CREATE INDEX IF NOT EXISTS
             idx_products_user_id
             ON public.products(user_id);
+        `);
+
+        // ★★★ Eski quantity <= 0 qatorlarni tozalash (frontendda 0 ko'rinmasin)
+        await pool.query(`
+            DELETE FROM public.products
+            WHERE COALESCE(quantity, 0) <= 0
         `);
     } catch (err) {
         console.error(
@@ -2480,6 +2491,7 @@ app.get(
                     image_url
                 FROM public.products
                 WHERE user_id = $1
+                  AND COALESCE(quantity, 0) > 0
                 ORDER BY
                     local_id DESC,
                     CASE
@@ -3738,18 +3750,13 @@ VALUES
                     ]
                 );
 
+                // ★★★ TUZATILGAN: quantity === 0 bo'lsa HAR DOIM aniq product.id bo'yicha DELETE
+                // payment_type ga qarab quantity=0 qoldirish YO'Q
                 if (newQty === 0) {
-                    if ((product.payment_type || 'cash') === 'credit') {
-                        await client.query(
-                            `UPDATE public.products SET quantity = 0 WHERE id = $1 AND user_id = $2`,
-                            [product.id, userId]
-                        );
-                    } else {
-                        await client.query(
-                            `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
-                            [product.id, userId]
-                        );
-                    }
+                    await client.query(
+                        `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
+                        [product.id, userId]
+                    );
                     anyFullySoldOut = true;
                 } else {
                     await client.query(
@@ -3801,6 +3808,7 @@ VALUES
                         SELECT local_id, size, quantity
                         FROM public.products
                         WHERE user_id = $1 AND local_id = ANY($2::int[])
+                          AND COALESCE(quantity, 0) > 0
                         ORDER BY local_id, size
                         `,
                         [userId, localIds]
@@ -4037,18 +4045,12 @@ VALUES
                     ]
                 );
 
+                // ★★★ TUZATILGAN: quantity === 0 bo'lsa HAR DOIM aniq product.id bo'yicha DELETE
                 if (newQty === 0) {
-                    if ((product.payment_type || 'cash') === 'credit') {
-                        await client.query(
-                            `UPDATE public.products SET quantity = 0 WHERE id = $1 AND user_id = $2`,
-                            [product.id, userId]
-                        );
-                    } else {
-                        await client.query(
-                            `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
-                            [product.id, userId]
-                        );
-                    }
+                    await client.query(
+                        `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
+                        [product.id, userId]
+                    );
                     anyFullySoldOut = true;
                 } else {
                     await client.query(
@@ -4095,6 +4097,7 @@ VALUES
                         SELECT local_id, size, quantity
                         FROM public.products
                         WHERE user_id = $1 AND local_id = ANY($2::int[])
+                          AND COALESCE(quantity, 0) > 0
                         ORDER BY local_id, size
                         `,
                         [userId, localIds]
@@ -4408,6 +4411,7 @@ app.post(
                         SELECT local_id, size, quantity
                         FROM public.products
                         WHERE user_id = $1 AND local_id = ANY($2::int[])
+                          AND COALESCE(quantity, 0) > 0
                         ORDER BY local_id, size
                         `,
                         [userId, localIds]
@@ -4979,18 +4983,12 @@ VALUES
                 ]
             );
 
+            // ★★★ TUZATILGAN: quantity === 0 bo'lsa HAR DOIM aniq product.id bo'yicha DELETE
             if (newQty === 0) {
-                if ((product.payment_type || 'cash') === 'credit') {
-                    await client.query(
-                        `UPDATE public.products SET quantity = 0 WHERE id = $1 AND user_id = $2`,
-                        [product.id, product.user_id]
-                    );
-                } else {
-                    await client.query(
-                        `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
-                        [product.id, product.user_id]
-                    );
-                }
+                await client.query(
+                    `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
+                    [product.id, product.user_id]
+                );
             } else {
                 await client.query(
                     `UPDATE public.products SET quantity = $1 WHERE id = $2 AND user_id = $3`,
@@ -5307,18 +5305,12 @@ app.post(
                 ]
             );
 
+            // ★★★ TUZATILGAN: quantity === 0 bo'lsa HAR DOIM aniq product.id bo'yicha DELETE
             if (newQty === 0) {
-                if ((product.payment_type || 'cash') === 'credit') {
-                    await client.query(
-                        `UPDATE public.products SET quantity = 0 WHERE id = $1 AND user_id = $2`,
-                        [product.id, product.user_id]
-                    );
-                } else {
-                    await client.query(
-                        `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
-                        [product.id, product.user_id]
-                    );
-                }
+                await client.query(
+                    `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
+                    [product.id, product.user_id]
+                );
             } else {
                 await client.query(
                     `UPDATE public.products SET quantity = $1 WHERE id = $2 AND user_id = $3`,
