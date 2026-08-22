@@ -658,27 +658,13 @@ const getMonthReport = async (clientOrPool, userId) => {
         FROM (
             SELECT
                 GREATEST(
-                    (
-                        COALESCE((
-                            SELECT SUM(p2.quantity * p2.cost_price)
-                            FROM public.products p2
-                            WHERE p2.user_id = p.user_id AND p2.local_id = p.local_id
-                        ), 0)
-                        +
-                        COALESCE((
-                            SELECT SUM(s.quantity * s.cost_price)
-                            FROM public.sales s
-                            WHERE s.user_id = p.user_id
-                              AND s.local_id = p.local_id
-                              AND COALESCE(s.returned, false) = false
-                        ), 0)
-                    ) - MAX(COALESCE(p.paid_amount, 0)),
+                    SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
                     0
                 ) AS debt
-            FROM public.products p
-            WHERE p.user_id = $1
-              AND p.payment_type = 'credit'
-            GROUP BY p.user_id, p.local_id
+            FROM public.products
+            WHERE user_id = $1
+              AND payment_type = 'credit'
+            GROUP BY local_id
         ) t
         `,
         [userId]
@@ -1735,27 +1721,13 @@ app.get(
                 FROM (
                     SELECT
                         GREATEST(
-                            (
-                                COALESCE((
-                                    SELECT SUM(p2.quantity * p2.cost_price)
-                                    FROM public.products p2
-                                    WHERE p2.user_id = p.user_id AND p2.local_id = p.local_id
-                                ), 0)
-                                +
-                                COALESCE((
-                                    SELECT SUM(s.quantity * s.cost_price)
-                                    FROM public.sales s
-                                    WHERE s.user_id = p.user_id
-                                      AND s.local_id = p.local_id
-                                      AND COALESCE(s.returned, false) = false
-                                ), 0)
-                            ) - MAX(COALESCE(p.paid_amount, 0)),
+                            SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
                             0
                         ) AS debt
-                    FROM public.products p
-                    WHERE p.user_id = $1
-                      AND p.payment_type = 'credit'
-                    GROUP BY p.user_id, p.local_id
+                    FROM public.products
+                    WHERE user_id = $1
+                      AND payment_type = 'credit'
+                    GROUP BY local_id
                 ) t
                 `,
                 [userId]
@@ -2565,61 +2537,25 @@ app.get('/api/debts', authenticateToken, async (req, res) => {
         const result = await pool.query(
             `
             SELECT
-                COALESCE(NULLIF(TRIM(MAX(supplier)), ''), 'Noma''lum') AS supplier,
+                COALESCE(NULLIF(TRIM(supplier), ''), 'Noma''lum') AS supplier,
                 MAX(NULLIF(TRIM(supplier_phone), '')) AS supplier_phone,
-                SUM(
-                    (
-                        COALESCE(quantity * cost_price, 0)
-                        +
-                        COALESCE((
-                            SELECT SUM(s.quantity * s.cost_price)
-                            FROM public.sales s
-                            WHERE s.user_id = p.user_id
-                              AND s.local_id = p.local_id
-                              AND COALESCE(s.returned, false) = false
-                        ), 0)
-                    )
-                ) AS total_cost,
-                SUM(MAX(COALESCE(paid_amount, 0))) AS total_paid,
-                SUM(
-                    GREATEST(
-                        (
-                            COALESCE(quantity * cost_price, 0)
-                            +
-                            COALESCE((
-                                SELECT SUM(s.quantity * s.cost_price)
-                                FROM public.sales s
-                                WHERE s.user_id = p.user_id
-                                  AND s.local_id = p.local_id
-                                  AND COALESCE(s.returned, false) = false
-                            ), 0)
-                        ) - MAX(COALESCE(paid_amount, 0)),
-                        0
-                    )
+                SUM(cost_price * quantity) AS total_cost,
+                MAX(COALESCE(paid_amount, 0)) AS total_paid,
+                GREATEST(
+                    SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
+                    0
                 ) AS debt,
                 COUNT(DISTINCT local_id) AS products_count,
                 array_agg(DISTINCT category) FILTER (WHERE category IS NOT NULL AND TRIM(category) <> '') AS categories
-            FROM public.products p
+            FROM public.products
             WHERE user_id = $1
               AND payment_type = 'credit'
               AND supplier IS NOT NULL
               AND TRIM(supplier) <> ''
             GROUP BY COALESCE(NULLIF(TRIM(supplier), ''), 'Noma''lum')
-            HAVING SUM(
-                GREATEST(
-                    (
-                        COALESCE(quantity * cost_price, 0)
-                        +
-                        COALESCE((
-                            SELECT SUM(s.quantity * s.cost_price)
-                            FROM public.sales s
-                            WHERE s.user_id = p.user_id
-                              AND s.local_id = p.local_id
-                              AND COALESCE(s.returned, false) = false
-                        ), 0)
-                    ) - MAX(COALESCE(paid_amount, 0)),
-                    0
-                )
+            HAVING GREATEST(
+                SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
+                0
             ) > 0
             ORDER BY debt DESC
             `,
