@@ -2565,11 +2565,25 @@ app.get('/api/debts', authenticateToken, async (req, res) => {
         const result = await pool.query(
             `
             SELECT
-                COALESCE(NULLIF(TRIM(MAX(supplier)), ''), 'Noma''lum') AS supplier,
+                COALESCE(NULLIF(TRIM(supplier), ''), 'Noma''lum') AS supplier,
                 MAX(NULLIF(TRIM(supplier_phone), '')) AS supplier_phone,
-                SUM(
+                SUM(local_total_cost) AS total_cost,
+                SUM(local_paid) AS total_paid,
+                SUM(local_debt) AS debt,
+                COUNT(*) AS products_count,
+                array_agg(DISTINCT category) FILTER (WHERE category IS NOT NULL AND TRIM(category) <> '') AS categories
+            FROM (
+                SELECT
+                    p.local_id,
+                    MAX(p.supplier) AS supplier,
+                    MAX(p.supplier_phone) AS supplier_phone,
+                    MAX(p.category) AS category,
                     (
-                        COALESCE(quantity * cost_price, 0)
+                        COALESCE((
+                            SELECT SUM(p2.quantity * p2.cost_price)
+                            FROM public.products p2
+                            WHERE p2.user_id = p.user_id AND p2.local_id = p.local_id
+                        ), 0)
                         +
                         COALESCE((
                             SELECT SUM(s.quantity * s.cost_price)
@@ -2578,13 +2592,15 @@ app.get('/api/debts', authenticateToken, async (req, res) => {
                               AND s.local_id = p.local_id
                               AND COALESCE(s.returned, false) = false
                         ), 0)
-                    )
-                ) AS total_cost,
-                SUM(MAX(COALESCE(paid_amount, 0))) AS total_paid,
-                SUM(
+                    ) AS local_total_cost,
+                    MAX(COALESCE(p.paid_amount, 0)) AS local_paid,
                     GREATEST(
                         (
-                            COALESCE(quantity * cost_price, 0)
+                            COALESCE((
+                                SELECT SUM(p2.quantity * p2.cost_price)
+                                FROM public.products p2
+                                WHERE p2.user_id = p.user_id AND p2.local_id = p.local_id
+                            ), 0)
                             +
                             COALESCE((
                                 SELECT SUM(s.quantity * s.cost_price)
@@ -2593,34 +2609,18 @@ app.get('/api/debts', authenticateToken, async (req, res) => {
                                   AND s.local_id = p.local_id
                                   AND COALESCE(s.returned, false) = false
                             ), 0)
-                        ) - MAX(COALESCE(paid_amount, 0)),
+                        ) - MAX(COALESCE(p.paid_amount, 0)),
                         0
-                    )
-                ) AS debt,
-                COUNT(DISTINCT local_id) AS products_count,
-                array_agg(DISTINCT category) FILTER (WHERE category IS NOT NULL AND TRIM(category) <> '') AS categories
-            FROM public.products p
-            WHERE user_id = $1
-              AND payment_type = 'credit'
-              AND supplier IS NOT NULL
-              AND TRIM(supplier) <> ''
+                    ) AS local_debt
+                FROM public.products p
+                WHERE p.user_id = $1
+                  AND p.payment_type = 'credit'
+                  AND p.supplier IS NOT NULL
+                  AND TRIM(p.supplier) <> ''
+                GROUP BY p.user_id, p.local_id
+            ) sub
             GROUP BY COALESCE(NULLIF(TRIM(supplier), ''), 'Noma''lum')
-            HAVING SUM(
-                GREATEST(
-                    (
-                        COALESCE(quantity * cost_price, 0)
-                        +
-                        COALESCE((
-                            SELECT SUM(s.quantity * s.cost_price)
-                            FROM public.sales s
-                            WHERE s.user_id = p.user_id
-                              AND s.local_id = p.local_id
-                              AND COALESCE(s.returned, false) = false
-                        ), 0)
-                    ) - MAX(COALESCE(paid_amount, 0)),
-                    0
-                )
-            ) > 0
+            HAVING SUM(local_debt) > 0
             ORDER BY debt DESC
             `,
             [userId]
