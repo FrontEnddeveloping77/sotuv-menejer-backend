@@ -3275,7 +3275,7 @@ app.get(
 );
 
 // ====================================================
-// TOVARNI TAHRIRLASH (PUT /api/products/:localId) — TUZATILGAN (entered delta)
+// TOVARNI TAHRIRLASH (PUT /api/products/:localId) — TUZATILGAN
 // ====================================================
 app.put('/api/products/:localId', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
@@ -3347,7 +3347,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // Eski holatni olish (barcha variantlar)
+        // 1. Eski holatni olish (Mavjud variantlar va QR kodlar)
         const oldRes = await client.query(
             `SELECT * FROM public.products WHERE user_id = $1 AND local_id = $2 ORDER BY id`,
             [userId, localId]
@@ -3372,19 +3372,25 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
             .join(', ');
         const oldImage = oldFirst.image_url || null;
 
-        // Eski variantlarni o'chirish
+        // Eski razmerlar xaritasi (Har bir razmer bo'yicha mavjud QR kod va donalarni saqlab qolish uchun)
+        const oldSizeMap = {};
+        for (const row of oldRes.rows) {
+            const szKey = row.size ? String(row.size).trim() : 'Standart';
+            if (!oldSizeMap[szKey]) {
+                oldSizeMap[szKey] = [];
+            }
+            oldSizeMap[szKey].push(row);
+        }
+
+        // Eski variantlarni bazadan o'chirish
         await client.query(
             `DELETE FROM public.products WHERE user_id = $1 AND local_id = $2`,
             [userId, localId]
         );
 
-        // sizes string (faqat size_quantities yo'q bo'lsa ishlatiladi)
+        // sizes string bo'lsa
         let sizeList = [];
-        if (
-            !exactQuantities &&
-            sizes &&
-            typeof sizes === 'string'
-        ) {
+        if (!exactQuantities && sizes && typeof sizes === 'string') {
             const seen = new Set();
             sizes.split(',').forEach((item) => {
                 const clean = item.trim();
@@ -3396,10 +3402,25 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
         }
 
         const insertedRows = [];
+        let newlyAddedTotalQty = 0; // Faqat oshgan miqdorlar yig'indisi
+
+        // Qayta kiritish va yangi QR generatsiya qilish funksiyasi
         const insertOne = async (sizeVal, qtyVal) => {
-            // Har bir dona uchun alohida qator + alohida QR (ombor logikasi bilan mos)
+            const sizeKey = sizeVal ? String(sizeVal).trim() : 'Standart';
             const q = Math.max(1, parseInt(qtyVal, 10) || 1);
+
+            const existingRowsForSize = oldSizeMap[sizeKey] || [];
+            const oldQtyForSize = existingRowsForSize.length;
+
+            // Agar o'sha razmer uchun miqdor oshgan bo'lsa, farqini do'konga va omborga yangi kirgan deb hisoblaymiz
+            if (q > oldQtyForSize) {
+                newlyAddedTotalQty += (q - oldQtyForSize);
+            }
+
             for (let u = 0; u < q; u++) {
+                // Agar ilgari ushbu razmer va dona uchun QR bo'lsa o'shani saqlaymiz, aks holda yangi unikal randomUUID() yaratamiz
+                let qrToken = existingRowsForSize[u] ? existingRowsForSize[u].qr_token : randomUUID();
+
                 const result = await client.query(
                     `
                     INSERT INTO public.products
@@ -3418,7 +3439,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
                         color || null,
                         sizeVal || null,
                         1,
-                        randomUUID(),
+                        qrToken, // Saqlangan yoki yangi generatsiya qilingan QR
                         oldFirst.payment_type || 'cash',
                         oldFirst.supplier,
                         oldFirst.paid_amount || 0,
@@ -3433,17 +3454,16 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
         };
 
         if (exactQuantities) {
-            // Frontend aniq taqsimot yuborgan — 43:2 bo'lsa faqat 43 dan 2 dona
+            // Aniq razmer taqsimoti bo'yicha ishlaymiz
             for (const item of exactQuantities) {
                 await insertOne(item.size || null, item.quantity);
             }
         } else if (sizeList.length === 0) {
-            // Razmer yo'q
             if (totalQty > 0) {
                 await insertOne(null, totalQty);
             }
         } else {
-            // Eski usul: sizes string + jami quantity — teng taqsimot
+            // Razmerlar teng taqsimlanganda
             const count = sizeList.length;
             const base = Math.floor(totalQty / count);
             const remainder = totalQty % count;
@@ -3456,9 +3476,26 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
             }
         }
 
-        // Entered stats: tahrirlash HECH QACHON o'zgartirmaydi (faqat qo'shish / o'chirish / restore)
+        // ===== DO'KONGA KIRGAN TOVARLAR VA OMBORGA QO'SHISH LOGIKASI =====
+        // Faqat haqiqatdan ham soni oshgan razmerlarning oshgan farqi (newlyAddedTotalQty) tarixga va statsga yoziladi
+        if (newlyAddedTotalQty > 0) {
+            await client.query(
+                `
+                INSERT INTO public.incoming_stock_history 
+                (user_id, product_id, product_name, added_quantity, total_cost, created_at)
+                VALUES ($1, $2, $3, $4, $5, NOW())
+                `,
+                [
+                    userId,
+                    localId,
+                    String(name).trim(),
+                    newlyAddedTotalQty,
+                    newlyAddedTotalQty * parsedCostPrice
+                ]
+            );
+        }
 
-        // Telegram xabar (eski → yangi + rasm)
+        // Telegram xabarnoma yuborish
         const userResult = await client.query(
             `SELECT site_login FROM public.users WHERE id = $1`,
             [userId]
@@ -3467,7 +3504,6 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
 
         if (siteLogin && insertedRows.length) {
             const newFirst = insertedRows[0];
-            // Razmerlar bo'yicha guruhlab ko'rsatish
             const sizeMap = {};
             for (const r of insertedRows) {
                 const sk = r.size || 'Standart';
