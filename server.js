@@ -1,21 +1,3 @@
-// backend/server.js
-// To'liq ishlaydigan versiya — mavjud funksiyalar saqlangan + yangi:
-// - POST /api/dashboard/sell-credit  (nasiyaga sotish)
-// - GET  /api/debts/recent-payments  (oxirgi to'lovlar)
-// - POST /api/debts/undo-or-edit     (to'lovni bekor qilish / tahrirlash)
-// - POST /api/qr/:token/sell-credit  (QR orqali nasiyaga sotish)
-// - GET  /api/products/deleted       (o'chirilgan tovarlar)
-// - POST /api/products/restore       (omborga qaytarish)
-//
-// MUHIM TUZATISH (2026-08):
-// Do'konga kirgan tovarlar (entered_*) FAQAT qo'shish / o'chirish / restore da o'zgaradi.
-// Sotuv, vozvrat, tahrirlash HECH QACHON entered_* ni o'zgartirmaydi.
-//
-// MUHIM TUZATISH (ombor/sotuv):
-// quantity === 0 bo'lganda HECH QACHON UPDATE quantity=0 qilinmaydi.
-// Har doim aniq product.id bo'yicha DELETE qilinadi (local_id bo'yicha emas).
-// Boshqa razmerlar saqlanadi. QR ham shu qator bilan yo'qoladi.
-
 require('dotenv').config();
 
 const express = require('express');
@@ -3293,7 +3275,7 @@ app.get(
 );
 
 // ====================================================
-// TOVARNI TAHRIRLASH (PUT /api/products/:localId) — TUZATILGAN (entered delta)
+// TOVARNI TAHRIRLASH (PUT /api/products/:localId) — TUZATILGAN
 // ====================================================
 app.put('/api/products/:localId', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
