@@ -2388,7 +2388,7 @@ app.post(
                     `📦 <b>Nomi:</b> ${telegramEscape(first.name)}\n` +
                     `🎨 <b>Rangi:</b> ${telegramEscape(first.color || "Yo'q")}\n` +
                     `🗂 <b>Kategoriyasi:</b> ${telegramEscape(first.category || "Yo'q")}\n` +
-                    `💰 <b>Narxi:</b> ${formatSum(first.cost_price)} so'm` +
+                    `💰 <b>Kelgan narxi (TanNarxi):</b> ${formatSum(first.cost_price)} so'm` +
                     paymentInfo +
                     `\n📊 <b>Umumiy miqdori:</b> ${totalQty} dona` +
                     sizesBlock +
