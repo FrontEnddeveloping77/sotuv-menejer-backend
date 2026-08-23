@@ -2385,9 +2385,9 @@ app.post(
                 let message =
                     `🆕 <b>YANGI MAHSULOT QO'SHILDI (#${nextLocalId})</b>\n` +
                     `━━━━━━━━━━━━━━━━━━━━\n` +
+                    `🗂 <b>Kategoriyasi:</b> ${telegramEscape(first.category || "Yo'q")}\n` +
                     `📦 <b>Nomi:</b> ${telegramEscape(first.name)}\n` +
                     `🎨 <b>Rangi:</b> ${telegramEscape(first.color || "Yo'q")}\n` +
-                    `🗂 <b>Kategoriyasi:</b> ${telegramEscape(first.category || "Yo'q")}\n` +
                     `💰 <b>Kelgan narxi (TanNarxi):</b> ${formatSum(first.cost_price)} so'm` +
                     paymentInfo +
                     `\n📊 <b>Umumiy miqdori:</b> ${totalQty} dona` +
@@ -3451,8 +3451,8 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
             let message =
                 `✏️ <b>TOVAR TAHRIRLANDI (#${localId})</b>\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
-                `📦 <b>Nomi:</b> ${telegramEscape(oldFirst.name)} → <b>${telegramEscape(newFirst.name)}</b>\n` +
                 `🗂 <b>Kategoriya:</b> ${telegramEscape(oldFirst.category || '—')} → ${telegramEscape(newFirst.category || '—')}\n` +
+                `📦 <b>Nomi:</b> ${telegramEscape(oldFirst.name)} → <b>${telegramEscape(newFirst.name)}</b>\n` +
                 `🎨 <b>Rang:</b> ${telegramEscape(oldFirst.color || '—')} → ${telegramEscape(newFirst.color || '—')}\n` +
                 `💰 <b>Tannarx:</b> ${formatSum(oldFirst.cost_price)} → ${formatSum(newFirst.cost_price)} so'm\n` +
                 (parsedSellingPrice != null ? `💵 <b>Sotish narxi:</b> ${formatSum(parsedSellingPrice)} so'm\n` : '') +
@@ -4436,8 +4436,8 @@ app.post(
             let deleteMessage =
                 `${titleLine}\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
-                `📦 <b>Nomi:</b> ${telegramEscape(firstProductName)}\n` +
                 `🗂 <b>Kategoriyasi:</b> ${telegramEscape(firstCategory || "Yo'q")}\n` +
+                `📦 <b>Nomi:</b> ${telegramEscape(firstProductName)}\n` +
                 `🎨 <b>Rangi:</b> ${telegramEscape(firstColor || "Yo'q")}\n` +
                 `📏 <b>Razmerlar bo'yicha olib tashlandi:</b>\n` +
                 `${removedLines.join('\n')}\n` +
@@ -5157,10 +5157,10 @@ app.post(
             const messageBase =
                 `🗑️ <b>QR ORQALI TOVAR O'CHIRILDI</b>\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
+                `🗂 <b>Kategoriya:</b> ${telegramEscape(product.category || "Ko'rsatilmagan")}\n` +
                 `📦 <b>Tovar:</b> ${telegramEscape(product.name)}\n` +
                 `📏 <b>Razmer:</b> ${telegramEscape(product.size || 'Standart')}\n` +
                 `🎨 <b>Rang:</b> ${telegramEscape(product.color || "Ko'rsatilmagan")}\n` +
-                `🗂 <b>Kategoriya:</b> ${telegramEscape(product.category || "Ko'rsatilmagan")}\n` +
                 `💰 <b>Tannarx:</b> ${formatSum(product.cost_price)} so'm\n` +
                 `🔢 <b>Ombordagi miqdor:</b> ${removeQty} dona\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
