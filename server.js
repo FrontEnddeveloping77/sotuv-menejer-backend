@@ -1,3 +1,21 @@
+// backend/server.js
+// To'liq ishlaydigan versiya — mavjud funksiyalar saqlangan + yangi:
+// - POST /api/dashboard/sell-credit  (nasiyaga sotish)
+// - GET  /api/debts/recent-payments  (oxirgi to'lovlar)
+// - POST /api/debts/undo-or-edit     (to'lovni bekor qilish / tahrirlash)
+// - POST /api/qr/:token/sell-credit  (QR orqali nasiyaga sotish)
+// - GET  /api/products/deleted       (o'chirilgan tovarlar)
+// - POST /api/products/restore       (omborga qaytarish)
+//
+// MUHIM TUZATISH (2026-08):
+// Do'konga kirgan tovarlar (entered_*) FAQAT qo'shish / o'chirish / restore da o'zgaradi.
+// Sotuv, vozvrat, tahrirlash HECH QACHON entered_* ni o'zgartirmaydi.
+//
+// MUHIM TUZATISH (ombor/sotuv):
+// quantity === 0 bo'lganda HECH QACHON UPDATE quantity=0 qilinmaydi.
+// Har doim aniq product.id bo'yicha DELETE qilinadi (local_id bo'yicha emas).
+// Boshqa razmerlar saqlanadi. QR ham shu qator bilan yo'qoladi.
+
 require('dotenv').config();
 
 const express = require('express');
@@ -3275,7 +3293,7 @@ app.get(
 );
 
 // ====================================================
-// TOVARNI TAHRIRLASH (PUT /api/products/:localId) — TUZATILGAN
+// TOVARNI TAHRIRLASH (PUT /api/products/:localId) — TUZATILGAN (entered delta)
 // ====================================================
 app.put('/api/products/:localId', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
@@ -3299,12 +3317,14 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
         return res.status(400).json({ message: "Tannarx noto'g'ri!" });
     }
 
-    // ===== ANIQ razmer taqsimoti (frontend size_quantities yuborsa) =====
+    // Frontenddan kelgan aniq razmer + son (user kiritadi)
     let exactQuantities = null;
     if (Array.isArray(req.body.size_quantities) && req.body.size_quantities.length > 0) {
         exactQuantities = req.body.size_quantities
             .map((item) => ({
-                size: typeof item.size === 'string' ? item.size.trim() : (item.size != null ? String(item.size).trim() : ''),
+                size: typeof item.size === 'string'
+                    ? item.size.trim()
+                    : (item.size != null ? String(item.size).trim() : ''),
                 quantity: Math.max(0, parseInt(item.quantity, 10) || 0)
             }))
             .filter((item) => item.quantity > 0);
@@ -3347,7 +3367,6 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 1. Eski holatni olish (Mavjud variantlar va QR kodlar)
         const oldRes = await client.query(
             `SELECT * FROM public.products WHERE user_id = $1 AND local_id = $2 ORDER BY id`,
             [userId, localId]
@@ -3372,23 +3391,12 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
             .join(', ');
         const oldImage = oldFirst.image_url || null;
 
-        // Eski razmerlar xaritasi (Har bir razmer bo'yicha mavjud QR kod va donalarni saqlab qolish uchun)
-        const oldSizeMap = {};
-        for (const row of oldRes.rows) {
-            const szKey = row.size ? String(row.size).trim() : 'Standart';
-            if (!oldSizeMap[szKey]) {
-                oldSizeMap[szKey] = [];
-            }
-            oldSizeMap[szKey].push(row);
-        }
-
-        // Eski variantlarni bazadan o'chirish
+        // Eski qatorlarni o'chirish
         await client.query(
             `DELETE FROM public.products WHERE user_id = $1 AND local_id = $2`,
             [userId, localId]
         );
 
-        // sizes string bo'lsa
         let sizeList = [];
         if (!exactQuantities && sizes && typeof sizes === 'string') {
             const seen = new Set();
@@ -3402,32 +3410,21 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
         }
 
         const insertedRows = [];
-        let newlyAddedTotalQty = 0; // Faqat oshgan miqdorlar yig'indisi
 
-        // Qayta kiritish va yangi QR generatsiya qilish funksiyasi
+        // Har bir dona = 1 qator + yangi QR
         const insertOne = async (sizeVal, qtyVal) => {
-            const sizeKey = sizeVal ? String(sizeVal).trim() : 'Standart';
-            const q = Math.max(1, parseInt(qtyVal, 10) || 1);
-
-            const existingRowsForSize = oldSizeMap[sizeKey] || [];
-            const oldQtyForSize = existingRowsForSize.length;
-
-            // Agar o'sha razmer uchun miqdor oshgan bo'lsa, farqini do'konga va omborga yangi kirgan deb hisoblaymiz
-            if (q > oldQtyForSize) {
-                newlyAddedTotalQty += (q - oldQtyForSize);
-            }
-
+            const q = Math.max(0, parseInt(qtyVal, 10) || 0);
             for (let u = 0; u < q; u++) {
-                // Agar ilgari ushbu razmer va dona uchun QR bo'lsa o'shani saqlaymiz, aks holda yangi unikal randomUUID() yaratamiz
-                let qrToken = existingRowsForSize[u] ? existingRowsForSize[u].qr_token : randomUUID();
-
                 const result = await client.query(
                     `
                     INSERT INTO public.products
-                    (user_id, local_id, category, name, cost_price, color, size, quantity,
-                     qr_token, qr_created_at, payment_type, supplier, paid_amount,
-                     supplier_phone, selling_price, image_url, created_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11,$12,$13,$14,$15,$16)
+                    (
+                        user_id, local_id, category, name, cost_price, color, size, quantity,
+                        qr_token, qr_created_at, payment_type, supplier, paid_amount,
+                        supplier_phone, selling_price, image_url, created_at
+                    )
+                    VALUES
+                    ($1,$2,$3,$4,$5,$6,$7,1,$8,NOW(),$9,$10,$11,$12,$13,$14,$15)
                     RETURNING *
                     `,
                     [
@@ -3438,12 +3435,11 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
                         parsedCostPrice,
                         color || null,
                         sizeVal || null,
-                        1,
-                        qrToken, // Saqlangan yoki yangi generatsiya qilingan QR
+                        randomUUID(),
                         oldFirst.payment_type || 'cash',
-                        oldFirst.supplier,
+                        oldFirst.supplier || null,
                         oldFirst.paid_amount || 0,
-                        oldFirst.supplier_phone,
+                        oldFirst.supplier_phone || null,
                         parsedSellingPrice,
                         cleanImageUrl || oldImage,
                         oldFirst.created_at
@@ -3454,7 +3450,6 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
         };
 
         if (exactQuantities) {
-            // Aniq razmer taqsimoti bo'yicha ishlaymiz
             for (const item of exactQuantities) {
                 await insertOne(item.size || null, item.quantity);
             }
@@ -3463,11 +3458,9 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
                 await insertOne(null, totalQty);
             }
         } else {
-            // Razmerlar teng taqsimlanganda
             const count = sizeList.length;
             const base = Math.floor(totalQty / count);
             const remainder = totalQty % count;
-
             for (let i = 0; i < count; i++) {
                 const sizeQty = base + (i < remainder ? 1 : 0);
                 if (sizeQty > 0) {
@@ -3476,62 +3469,56 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
             }
         }
 
-        // ===== DO'KONGA KIRGAN TOVARLAR VA OMBORGA QO'SHISH LOGIKASI =====
-        // Faqat haqiqatdan ham soni oshgan razmerlarning oshgan farqi (newlyAddedTotalQty) tarixga va statsga yoziladi
-        if (newlyAddedTotalQty > 0) {
-            await client.query(
-                `
-                INSERT INTO public.incoming_stock_history 
-                (user_id, product_id, product_name, added_quantity, total_cost, created_at)
-                VALUES ($1, $2, $3, $4, $5, NOW())
-                `,
-                [
-                    userId,
-                    localId,
-                    String(name).trim(),
-                    newlyAddedTotalQty,
-                    newlyAddedTotalQty * parsedCostPrice
-                ]
-            );
-        }
-
-        // Telegram xabarnoma yuborish
-        const userResult = await client.query(
-            `SELECT site_login FROM public.users WHERE id = $1`,
-            [userId]
-        );
-        const siteLogin = userResult.rows[0]?.site_login || null;
-
-        if (siteLogin && insertedRows.length) {
-            const newFirst = insertedRows[0];
-            const sizeMap = {};
-            for (const r of insertedRows) {
-                const sk = r.size || 'Standart';
-                sizeMap[sk] = (sizeMap[sk] || 0) + Number(r.quantity || 0);
-            }
-            const newSizes = Object.entries(sizeMap)
-                .map(([sz, qty]) => `${sz}: ${qty}`)
-                .join(', ');
-
-            let message =
-                `✏️ <b>TOVAR TAHRIRLANDI (#${localId})</b>\n` +
-                `━━━━━━━━━━━━━━━━━━━━\n` +
-                `📦 <b>Nomi:</b> ${telegramEscape(oldFirst.name)} → <b>${telegramEscape(newFirst.name)}</b>\n` +
-                `🗂 <b>Kategoriya:</b> ${telegramEscape(oldFirst.category || '—')} → ${telegramEscape(newFirst.category || '—')}\n` +
-                `🎨 <b>Rang:</b> ${telegramEscape(oldFirst.color || '—')} → ${telegramEscape(newFirst.color || '—')}\n` +
-                `💰 <b>Tannarx:</b> ${formatSum(oldFirst.cost_price)} → ${formatSum(newFirst.cost_price)} so'm\n` +
-                (parsedSellingPrice != null ? `💵 <b>Sotish narxi:</b> ${formatSum(parsedSellingPrice)} so'm\n` : '') +
-                `📊 <b>Jami son:</b> ${oldTotalQty} → <b>${totalQty}</b> dona\n` +
-                `📏 <b>Razmerlar:</b>\n   Eski: ${telegramEscape(oldSizes)}\n   Yangi: ${telegramEscape(newSizes)}\n` +
-                `━━━━━━━━━━━━━━━━━━━━`;
-
-            message += await getTodayReport(client, userId);
-            await queueTelegramNotification(client, siteLogin, message, cleanImageUrl || oldImage);
-        }
+        // entered_* tahrirlashda O'ZGARTIRILMAYDI
 
         await client.query('COMMIT');
 
-        res.json({
+        // Telegram — COMMIT dan KEYIN (xato bo'lsa ham saqlash buzilmasin)
+        try {
+            const userResult = await pool.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [userId]
+            );
+            const siteLogin = userResult.rows[0]?.site_login || null;
+
+            if (siteLogin && insertedRows.length) {
+                const newFirst = insertedRows[0];
+                const sizeMap = {};
+                for (const r of insertedRows) {
+                    const sk = r.size || 'Standart';
+                    sizeMap[sk] = (sizeMap[sk] || 0) + Number(r.quantity || 0);
+                }
+                const newSizes = Object.entries(sizeMap)
+                    .map(([sz, qty]) => `${sz}: ${qty}`)
+                    .join(', ');
+
+                let message =
+                    `✏️ <b>TOVAR TAHRIRLANDI (#${localId})</b>\n` +
+                    `━━━━━━━━━━━━━━━━━━━━\n` +
+                    `📦 <b>Nomi:</b> ${telegramEscape(oldFirst.name)} → <b>${telegramEscape(newFirst.name)}</b>\n` +
+                    `🗂 <b>Kategoriya:</b> ${telegramEscape(oldFirst.category || '—')} → ${telegramEscape(newFirst.category || '—')}\n` +
+                    `🎨 <b>Rang:</b> ${telegramEscape(oldFirst.color || '—')} → ${telegramEscape(newFirst.color || '—')}\n` +
+                    `💰 <b>Tannarx:</b> ${formatSum(oldFirst.cost_price)} → ${formatSum(newFirst.cost_price)} so'm\n` +
+                    (parsedSellingPrice != null
+                        ? `💵 <b>Sotish narxi:</b> ${formatSum(parsedSellingPrice)} so'm\n`
+                        : '') +
+                    `📊 <b>Jami son:</b> ${oldTotalQty} → <b>${totalQty}</b> dona\n` +
+                    `📏 <b>Razmerlar:</b>\n   Eski: ${telegramEscape(oldSizes)}\n   Yangi: ${telegramEscape(newSizes)}\n` +
+                    `━━━━━━━━━━━━━━━━━━━━`;
+
+                message += await getTodayReport(pool, userId);
+                await queueTelegramNotification(
+                    pool,
+                    siteLogin,
+                    message,
+                    cleanImageUrl || oldImage
+                );
+            }
+        } catch (tgErr) {
+            console.error('[Telegram] Tahrirlash bildirishnomasi xatosi:', tgErr.message);
+        }
+
+        return res.json({
             message: "Tovar muvaffaqiyatli tahrirlandi!",
             product: insertedRows[0] || null,
             products: insertedRows,
@@ -3540,7 +3527,10 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
     } catch (err) {
         try { await client.query('ROLLBACK'); } catch (e) { }
         console.error("Tovarni tahrirlashda xatolik:", err);
-        res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
+        return res.status(500).json({
+            message: "Serverda xatolik yuz berdi!",
+            error: err.message || String(err)
+        });
     } finally {
         client.release();
     }
