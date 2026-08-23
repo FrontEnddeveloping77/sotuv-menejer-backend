@@ -6221,6 +6221,178 @@ app.get('/api/bot/warehouse', async (req, res) => {
     }
 });
 
+/**
+ * GET /api/bot/debts?login=XXX
+ * Jami qarzimiz (tovar berganlarga — supplier credit)
+ * Javob: { total_debt, debts: [{ supplier, supplier_phone, total_cost, total_paid, debt, products_count, categories }] }
+ */
+app.get('/api/bot/debts', async (req, res) => {
+    const siteLogin = typeof req.query.login === 'string' ? req.query.login.trim() : '';
+
+    if (!siteLogin) {
+        return res.status(400).json({ message: "login kiritilmagan!" });
+    }
+
+    try {
+        const userResult = await pool.query(
+            `SELECT id FROM public.users WHERE site_login = $1 LIMIT 1`,
+            [siteLogin]
+        );
+        if (!userResult.rows.length) {
+            return res.status(404).json({ message: "Foydalanuvchi topilmadi!" });
+        }
+        const userId = userResult.rows[0].id;
+
+        const result = await pool.query(
+            `
+            SELECT
+                COALESCE(NULLIF(TRIM(supplier), ''), 'Noma''lum') AS supplier,
+                MAX(NULLIF(TRIM(supplier_phone), '')) AS supplier_phone,
+                SUM(local_total_cost) AS total_cost,
+                SUM(local_paid) AS total_paid,
+                SUM(local_debt) AS debt,
+                COUNT(*) AS products_count,
+                array_agg(DISTINCT category) FILTER (WHERE category IS NOT NULL AND TRIM(category) <> '') AS categories
+            FROM (
+                SELECT
+                    p.local_id,
+                    MAX(p.supplier) AS supplier,
+                    MAX(p.supplier_phone) AS supplier_phone,
+                    MAX(p.category) AS category,
+                    (
+                        COALESCE((
+                            SELECT SUM(p2.quantity * p2.cost_price)
+                            FROM public.products p2
+                            WHERE p2.user_id = p.user_id AND p2.local_id = p.local_id
+                        ), 0)
+                        +
+                        COALESCE((
+                            SELECT SUM(s.quantity * s.cost_price)
+                            FROM public.sales s
+                            WHERE s.user_id = p.user_id
+                              AND s.local_id = p.local_id
+                              AND COALESCE(s.returned, false) = false
+                        ), 0)
+                    ) AS local_total_cost,
+                    MAX(COALESCE(p.paid_amount, 0)) AS local_paid,
+                    GREATEST(
+                        (
+                            COALESCE((
+                                SELECT SUM(p2.quantity * p2.cost_price)
+                                FROM public.products p2
+                                WHERE p2.user_id = p.user_id AND p2.local_id = p.local_id
+                            ), 0)
+                            +
+                            COALESCE((
+                                SELECT SUM(s.quantity * s.cost_price)
+                                FROM public.sales s
+                                WHERE s.user_id = p.user_id
+                                  AND s.local_id = p.local_id
+                                  AND COALESCE(s.returned, false) = false
+                            ), 0)
+                        ) - MAX(COALESCE(p.paid_amount, 0)),
+                        0
+                    ) AS local_debt
+                FROM public.products p
+                WHERE p.user_id = $1
+                  AND p.payment_type = 'credit'
+                  AND p.supplier IS NOT NULL
+                  AND TRIM(p.supplier) <> ''
+                GROUP BY p.user_id, p.local_id
+            ) sub
+            GROUP BY COALESCE(NULLIF(TRIM(supplier), ''), 'Noma''lum')
+            HAVING SUM(local_debt) > 0
+            ORDER BY debt DESC
+            `,
+            [userId]
+        );
+
+        const debts = result.rows.map((row) => ({
+            supplier: row.supplier,
+            supplier_phone: row.supplier_phone || null,
+            total_cost: Number(row.total_cost) || 0,
+            total_paid: Number(row.total_paid) || 0,
+            debt: Number(row.debt) || 0,
+            products_count: Number(row.products_count) || 0,
+            categories: row.categories || []
+        }));
+
+        const total_debt = debts.reduce((acc, d) => acc + d.debt, 0);
+
+        return res.json({
+            total_debt,
+            debts
+        });
+    } catch (err) {
+        console.error('Bot debts xatosi:', err);
+        return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
+    }
+});
+
+/**
+ * GET /api/bot/customer-debts?login=XXX
+ * Bizga qarzdorlar (nasiyaga sotilgan mijozlar)
+ * Javob: { total_debt, debts: [{ customer_name, customer_phone, total_amount, total_paid, debt, sales_count }] }
+ */
+app.get('/api/bot/customer-debts', async (req, res) => {
+    const siteLogin = typeof req.query.login === 'string' ? req.query.login.trim() : '';
+
+    if (!siteLogin) {
+        return res.status(400).json({ message: "login kiritilmagan!" });
+    }
+
+    try {
+        const userResult = await pool.query(
+            `SELECT id FROM public.users WHERE site_login = $1 LIMIT 1`,
+            [siteLogin]
+        );
+        if (!userResult.rows.length) {
+            return res.status(404).json({ message: "Foydalanuvchi topilmadi!" });
+        }
+        const userId = userResult.rows[0].id;
+
+        const result = await pool.query(
+            `
+            SELECT
+                customer_name,
+                customer_phone,
+                SUM(quantity * selling_price) AS total_amount,
+                SUM(COALESCE(paid_now, 0)) AS total_paid,
+                GREATEST(SUM(quantity * selling_price) - SUM(COALESCE(paid_now, 0)), 0) AS debt,
+                COUNT(*) AS sales_count
+            FROM public.sales
+            WHERE user_id = $1
+              AND is_credit = true
+              AND returned = false
+              AND customer_name IS NOT NULL
+            GROUP BY customer_name, customer_phone
+            HAVING SUM(quantity * selling_price) - SUM(COALESCE(paid_now, 0)) > 0
+            ORDER BY debt DESC
+            `,
+            [userId]
+        );
+
+        const debts = result.rows.map((row) => ({
+            customer_name: row.customer_name,
+            customer_phone: row.customer_phone || null,
+            total_amount: Number(row.total_amount) || 0,
+            total_paid: Number(row.total_paid) || 0,
+            debt: Number(row.debt) || 0,
+            sales_count: Number(row.sales_count) || 0
+        }));
+
+        const total_debt = debts.reduce((acc, d) => acc + d.debt, 0);
+
+        return res.json({
+            total_debt,
+            debts
+        });
+    } catch (err) {
+        console.error('Bot customer-debts xatosi:', err);
+        return res.status(500).json({ message: "Serverda xatolik yuz berdi!" });
+    }
+});
+
 // ====================================================
 // 404
 // ====================================================
