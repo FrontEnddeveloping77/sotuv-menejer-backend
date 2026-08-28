@@ -6,6 +6,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jwt-simple');
 const { randomUUID } = require('crypto');
+const sharp = require('sharp');
 
 const app = express();
 
@@ -30,6 +31,7 @@ const ensureTablesOnce = () => {
             .then(async () => {
                 await repairMissingReturnedStock();
                 await splitProductQuantitiesToOne();
+                await migrateBase64ImagesOnce();
             })
             .catch((err) => {
                 console.error(
@@ -863,9 +865,26 @@ const queueTelegramNotification = async (
         return;
     }
 
-    const hasPhoto = !!(photoUrl && String(photoUrl).trim());
+    // Rasm: base64 bo'lsa Storage ga yuklab URL olamiz; DBga faqat qisqa URL
+    let safePhotoUrl = null;
+    if (photoUrl && String(photoUrl).trim()) {
+        try {
+            if (isDataImageUrl(photoUrl)) {
+                safePhotoUrl = await processProductImage(String(photoUrl), 'telegram');
+            } else if (isHttpImageUrl(photoUrl)) {
+                safePhotoUrl = String(photoUrl).trim();
+            } else {
+                console.warn("[Telegram queue] Nomalum rasm formati — photo otkazib yuborildi");
+            }
+        } catch (imgErr) {
+            console.error('[Telegram queue] Rasmni qayta ishlash xatosi:', imgErr.message);
+            safePhotoUrl = null;
+        }
+    }
 
-    // 1) Navbatga yozish (backup)
+    const hasPhoto = !!safePhotoUrl;
+
+    // 1) Navbatga yozish (backup) — FAQAT qisqa URL, base64 EMAS
     let inserted = false;
     try {
         await clientOrPool.query(
@@ -883,7 +902,7 @@ const queueTelegramNotification = async (
             [
                 siteLogin,
                 message,
-                hasPhoto ? photoUrl : null
+                safePhotoUrl
             ]
         );
         inserted = true;
@@ -892,8 +911,11 @@ const queueTelegramNotification = async (
     }
 
     console.log(
-        `[Telegram queue] site=${siteLogin} photo=${hasPhoto ? 'YES (' + Math.round(String(photoUrl).length / 1024) + 'KB)' : 'NO'}`
+        `[Telegram queue] site=${siteLogin} photo=${hasPhoto ? 'YES' : 'NO'}`
     );
+
+    // Telegramga yuborishda ham xavfsiz URL ishlatamiz
+    photoUrl = safePhotoUrl;
 
     // 2) To'g'ridan-to'g'ri Telegramga yuborish (rasm ishlashi uchun)
     if (!TELEGRAM_BOT_TOKEN) {
@@ -2078,14 +2100,33 @@ app.post(
             }
         }
 
-        // Rasm (ixtiyoriy) — data:image/... yoki https URL
+        // ====================================================
+        // RASM — SUPABASE STORAGE
+        // ====================================================
+
         let cleanImageUrl = null;
-        if (typeof image_url === 'string' && image_url.trim()) {
-            cleanImageUrl = image_url.trim();
-            // ~700KB limit (base64)
-            if (cleanImageUrl.length > 900000) {
+
+        if (
+            typeof image_url === 'string' &&
+            image_url.trim()
+        ) {
+            try {
+                cleanImageUrl =
+                    await processProductImage(
+                        image_url,
+                        String(name || 'product')
+                    );
+                cleanImageUrl = assertSafeImageUrl(cleanImageUrl);
+            } catch (imageError) {
+                console.error(
+                    'Rasmni saqlash xatosi:',
+                    imageError
+                );
+
                 return res.status(400).json({
-                    message: "Rasm juda katta! Iltimos, kichikroq rasm yuklang."
+                    message:
+                        'Rasmni saqlashda xatolik: ' +
+                        imageError.message
                 });
             }
         }
@@ -3336,11 +3377,37 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
         }
     }
 
+    // ====================================================
+    // RASM — SUPABASE STORAGE
+    // ====================================================
+
     let cleanImageUrl = null;
-    if (typeof image_url === 'string' && image_url.trim()) {
-        cleanImageUrl = image_url.trim();
-        if (cleanImageUrl.length > 900000) {
-            return res.status(400).json({ message: "Rasm juda katta!" });
+    let imageProvided = false;
+
+    if (
+        typeof image_url === 'string' &&
+        image_url.trim()
+    ) {
+        imageProvided = true;
+        try {
+            // Agar frontend allaqachon saqlangan HTTP URL ni qayta yuborsa — qayta yuklamaymiz
+            cleanImageUrl =
+                await processProductImage(
+                    image_url,
+                    String(name || 'product')
+                );
+            cleanImageUrl = assertSafeImageUrl(cleanImageUrl);
+        } catch (imageError) {
+            console.error(
+                'Tahrirlashda rasmni saqlash xatosi:',
+                imageError
+            );
+
+            return res.status(400).json({
+                message:
+                    'Rasmni saqlashda xatolik: ' +
+                    imageError.message
+            });
         }
     }
 
@@ -3423,7 +3490,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
                         oldFirst.paid_amount || 0,
                         oldFirst.supplier_phone || null,
                         parsedSellingPrice,
-                        cleanImageUrl || oldImage,
+                        (cleanImageUrl || (isDataImageUrl(oldImage) ? null : oldImage)),
                         oldFirst.created_at
                     ]
                 );
@@ -6454,6 +6521,222 @@ app.use((err, req, res, next) => {
         message: "Serverda kutilmagan xatolik yuz berdi!"
     });
 });
+
+// ====================================================
+// SUPABASE STORAGE — RASM SAQLASH
+// ====================================================
+
+const SUPABASE_URL =
+    String(process.env.SUPABASE_URL || '')
+        .replace(/\/+$/, '');
+
+const SUPABASE_SERVICE_ROLE_KEY =
+    String(
+        process.env.SUPABASE_SERVICE_ROLE_KEY || ''
+    ).trim();
+
+const SUPABASE_STORAGE_BUCKET =
+    String(
+        process.env.SUPABASE_STORAGE_BUCKET ||
+        'product-images'
+    ).trim();
+
+const IMAGE_MAX_WIDTH = 1280;
+const IMAGE_MAX_HEIGHT = 1280;
+const IMAGE_JPEG_QUALITY = 75;
+
+/**
+ * Rasmni kichraytirish va JPEG formatiga
+ * o'tkazish.
+ *
+ * Masalan:
+ * 4MB PNG -> taxminan 100-300KB JPEG
+ */
+const isHttpImageUrl = (value) => {
+    if (typeof value !== 'string') return false;
+    const v = value.trim();
+    return v.startsWith('https://') || v.startsWith('http://');
+};
+
+const isDataImageUrl = (value) => {
+    if (typeof value !== 'string') return false;
+    return value.trim().startsWith('data:image');
+};
+
+/** DB ga faqat qisqa HTTP URL yoziladi — base64 taqiqlanadi */
+const assertSafeImageUrl = (value) => {
+    if (value == null || value === '') return null;
+    const v = String(value).trim();
+    if (!v) return null;
+    if (isDataImageUrl(v)) {
+        throw new Error('Base64 rasmni DBga yozib bo‘lmaydi — avval Storage ga yuklang!');
+    }
+    if (v.length > 2048) {
+        throw new Error('image_url juda uzun — faqat Storage URL saqlanishi kerak!');
+    }
+    if (!isHttpImageUrl(v)) {
+        throw new Error('Rasm formati noto‘g‘ri! Faqat http(s) URL yoki data:image ruxsat etiladi.');
+    }
+    return v;
+};
+
+const compressProductImage = async (inputBuffer) => {
+    return await sharp(inputBuffer)
+        .rotate()
+        .resize({
+            width: IMAGE_MAX_WIDTH,
+            height: IMAGE_MAX_HEIGHT,
+            fit: 'inside',
+            withoutEnlargement: true
+        })
+        .jpeg({
+            quality: IMAGE_JPEG_QUALITY,
+            progressive: true,
+            mozjpeg: true
+        })
+        .toBuffer();
+};
+
+/**
+ * Supabase Storage'ga rasm yuklash.
+ * Bir xil rasm (content-hash) qayta yuklansa — YANGI fayl ochilMAYDI (x-upsert + hash path).
+ * DB ga faqat qisqa public URL qaytariladi.
+ */
+const uploadProductImageToStorage = async (inputBuffer, fileName = 'product') => {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+        throw new Error('SUPABASE_URL yoki SUPABASE_SERVICE_ROLE_KEY sozlanmagan!');
+    }
+
+    const compressedBuffer = await compressProductImage(inputBuffer);
+
+    // Content-hash: bir xil rasm = bir xil path → storage ko'paymaydi
+    const { createHash } = require('crypto');
+    const contentHash = createHash('sha256').update(compressedBuffer).digest('hex').slice(0, 32);
+
+    const storagePath = `products/${contentHash}.jpg`;
+
+    const uploadUrl =
+        `${SUPABASE_URL}/storage/v1/object/${SUPABASE_STORAGE_BUCKET}/${storagePath}`;
+
+    const response = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            apikey: SUPABASE_SERVICE_ROLE_KEY,
+            'Content-Type': 'image/jpeg',
+            'x-upsert': 'true'
+        },
+        body: compressedBuffer
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Supabase Storage xatosi: ${response.status} ${errorText}`);
+    }
+
+    return (
+        `${SUPABASE_URL}/storage/v1/object/public/` +
+        `${SUPABASE_STORAGE_BUCKET}/${storagePath}`
+    );
+};
+
+/**
+ * Frontenddan kelgan image_url ni to'g'ri formatga o'tkazadi.
+ * - http(s) URL → o'zini qaytaradi (qayta yuklamaydi)
+ * - data:image base64 → compress → Storage (hash path) → public URL
+ * - boshqa → xato
+ * HECH QACHON base64 qaytarmaydi.
+ */
+const processProductImage = async (imageUrl, fileName = 'product') => {
+    if (typeof imageUrl !== 'string' || !imageUrl.trim()) {
+        return null;
+    }
+
+    const cleanImageUrl = imageUrl.trim();
+
+    // Allaqachon URL — qayta yuklamaslik
+    if (isHttpImageUrl(cleanImageUrl)) {
+        // Ba'zi frontendlar uzun query bilan yuborishi mumkin — faqat asosiy URL
+        if (cleanImageUrl.length > 2048) {
+            throw new Error('Rasm URL juda uzun!');
+        }
+        return cleanImageUrl;
+    }
+
+    // Base64 → Storage
+    if (isDataImageUrl(cleanImageUrl)) {
+        const imageBuffer = dataUrlToBuffer(cleanImageUrl);
+        if (!imageBuffer) {
+            throw new Error('Base64 rasmni o‘qib bo‘lmadi!');
+        }
+        // Juda katta base64 ni rad etish (masalan 8MB dan ortiq raw)
+        if (imageBuffer.length > 8 * 1024 * 1024) {
+            throw new Error('Rasm hajmi 8MB dan katta!');
+        }
+        const publicUrl = await uploadProductImageToStorage(imageBuffer, fileName);
+        return assertSafeImageUrl(publicUrl);
+    }
+
+    throw new Error('Rasm formati noto‘g‘ri! Faqat http(s) URL yoki data:image qabul qilinadi.');
+};
+
+/**
+ * DBdagi eski base64 image_url larni bir marta Storage ga ko'chiradi.
+ * products + deleted_products + notifications.photo_url
+ */
+const migrateBase64ImagesOnce = async () => {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+        console.warn('[migrateBase64] SUPABASE env yo\'q — o\'tkazib yuborildi');
+        return;
+    }
+
+    const tables = [
+        { table: 'public.products', column: 'image_url', idCol: 'id' },
+        { table: 'public.deleted_products', column: 'image_url', idCol: 'id' },
+        { table: 'public.sales', column: 'image_url', idCol: 'id' },
+        { table: 'public.notifications', column: 'photo_url', idCol: 'id' }
+    ];
+
+    for (const t of tables) {
+        try {
+            const rows = await pool.query(
+                `
+                SELECT ${t.idCol} AS id, ${t.column} AS img
+                FROM ${t.table}
+                WHERE ${t.column} IS NOT NULL
+                  AND ${t.column} LIKE 'data:image%'
+                LIMIT 200
+                `
+            );
+            if (!rows.rows.length) continue;
+
+            console.log(`[migrateBase64] ${t.table}: ${rows.rows.length} ta base64 topildi`);
+
+            for (const row of rows.rows) {
+                try {
+                    const url = await processProductImage(row.img, 'migrated');
+                    if (!url) continue;
+                    await pool.query(
+                        `UPDATE ${t.table} SET ${t.column} = $1 WHERE ${t.idCol} = $2`,
+                        [url, row.id]
+                    );
+                } catch (e) {
+                    console.error(`[migrateBase64] ${t.table} id=${row.id}:`, e.message);
+                    // Buzilgan base64 ni tozalash (DB ni shishirmaslik)
+                    try {
+                        await pool.query(
+                            `UPDATE ${t.table} SET ${t.column} = NULL WHERE ${t.idCol} = $1`,
+                            [row.id]
+                        );
+                    } catch (e2) { /* ignore */ }
+                }
+            }
+        } catch (err) {
+            console.error(`[migrateBase64] ${t.table} xato:`, err.message);
+        }
+    }
+};
+
 
 // ====================================================
 // SERVER ISHGA TUSHIRISH
