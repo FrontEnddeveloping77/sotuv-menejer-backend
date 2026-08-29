@@ -1521,25 +1521,31 @@ app.get('/', (req, res) => {
     );
 });
 
-app.get('/api/health', async (req, res) => {
-    try {
-        await pool.query('SELECT 1');
-        res.json({
-            success: true,
-            message:
-                'Backend Server muvaffaqiyatli ishlayapti!'
-        });
-    } catch (err) {
-        console.error(
-            'Health check xatosi:',
-            err
-        );
-        res.status(500).json({
-            success: false,
-            message:
-                'Database bilan ulanishda xatolik!'
-        });
+// Health check endpoint (DB Host va ulanish parametrlarini tekshirish uchun)
+app.get('/api/health', (req, res) => {
+  const dbHost = process.env.DB_HOST || '';
+  const databaseUrl = process.env.DATABASE_URL || '';
+
+  // Host qiymatining faqat boshi va oxirini ko'rsatuvchi niqob (masking)
+  let maskedDbHost = 'Biror narsa sozlangan emas (EMPTY)';
+  if (dbHost) {
+    maskedDbHost = dbHost.length > 12 
+      ? `${dbHost.substring(0, 8)}...${dbHost.substring(dbHost.length - 8)}`
+      : dbHost;
+  }
+
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    db_config: {
+      using_database_url: Boolean(databaseUrl),
+      db_host_preview: maskedDbHost,
+      db_port: process.env.DB_PORT || '5432 (default)',
+      db_name: process.env.DB_NAME || 'ko\'rsatilmadi',
+      db_user: process.env.DB_USER || 'ko\'rsatilmadi',
+      db_ssl: process.env.DB_SSL || 'false'
     }
+  });
 });
 
 // ====================================================
