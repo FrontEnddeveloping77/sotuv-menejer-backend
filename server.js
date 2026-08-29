@@ -2119,28 +2119,37 @@ app.post(
         }
 
         // ====================================================
-        // RASM — SUPABASE STORAGE
+        // RASM — SUPABASE STORAGE (soft-fail: env yo'q bo'lsa
+        // tovar baribir saqlanadi, rasm o'tkazib yuboriladi)
         // ====================================================
 
         let cleanImageUrl = null;
+        let imageWarning = null;
 
         if (
             typeof image_url === 'string' &&
             image_url.trim()
         ) {
             try {
-                cleanImageUrl =
-                    await processProductImage(
-                        image_url,
-                        String(name || 'product')
-                    );
-                cleanImageUrl = assertSafeImageUrl(cleanImageUrl);
-            } catch (imageError) {
-                console.error(
-                    'Rasmni saqlash xatosi:',
-                    imageError
+                cleanImageUrl = await processProductImage(
+                    image_url,
+                    String(name || 'product'),
+                    { strict: false }
                 );
-
+                if (cleanImageUrl) {
+                    cleanImageUrl = assertSafeImageUrl(cleanImageUrl);
+                } else if (
+                    isDataImageUrl(image_url) &&
+                    !isSupabaseStorageConfigured()
+                ) {
+                    imageWarning =
+                        'Rasm saqlanmadi: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY sozlanmagan. ' +
+                        'Tovar rasmsiz qo\'shildi. Env ni sozlab qayta yuklang.';
+                    console.warn('[POST /api/products]', imageWarning);
+                }
+            } catch (imageError) {
+                // Faqat haqiqiy xatolar (format, hajm va h.k.)
+                console.error('Rasmni saqlash xatosi:', imageError);
                 return res.status(400).json({
                     message:
                         'Rasmni saqlashda xatolik: ' +
@@ -2463,16 +2472,21 @@ app.post(
 
             await client.query('COMMIT');
 
+            const baseMsg = exactQuantities
+                ? `Tovar saqlandi! ${exactQuantities.length} ta razmer bo'yicha aniq taqsimlandi (ID: #${nextLocalId})`
+                : sizeList.length
+                    ? `Tovar saqlandi! ${sizeList.length} ta razmer bo'yicha taqsimlandi (ID: #${nextLocalId})`
+                    : `Tovar saqlandi! ID: #${nextLocalId}`;
+
             res.status(201).json({
-                message:
-                    exactQuantities
-                        ? `Tovar saqlandi! ${exactQuantities.length} ta razmer bo'yicha aniq taqsimlandi (ID: #${nextLocalId})`
-                        : sizeList.length
-                            ? `Tovar saqlandi! ${sizeList.length} ta razmer bo'yicha taqsimlandi (ID: #${nextLocalId})`
-                            : `Tovar saqlandi! ID: #${nextLocalId}`,
+                message: imageWarning
+                    ? `${baseMsg}. Diqqat: ${imageWarning}`
+                    : baseMsg,
                 product: insertedRows[0],
                 products: insertedRows,
-                local_id: nextLocalId
+                local_id: nextLocalId,
+                image_saved: !!cleanImageUrl,
+                ...(imageWarning ? { image_warning: imageWarning } : {})
             });
         } catch (err) {
             try {
@@ -3424,22 +3438,33 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
     }
 
     // ====================================================
-    // RASM — SUPABASE STORAGE
+    // RASM — SUPABASE STORAGE (soft-fail)
     // ====================================================
 
     let cleanImageUrl = null;
+    let imageWarning = null;
 
     if (
         typeof image_url === 'string' &&
         image_url.trim()
     ) {
         try {
-            cleanImageUrl =
-                await processProductImage(
-                    image_url,
-                    String(name || 'product')
-                );
-            cleanImageUrl = assertSafeImageUrl(cleanImageUrl);
+            cleanImageUrl = await processProductImage(
+                image_url,
+                String(name || 'product'),
+                { strict: false }
+            );
+            if (cleanImageUrl) {
+                cleanImageUrl = assertSafeImageUrl(cleanImageUrl);
+            } else if (
+                isDataImageUrl(image_url) &&
+                !isSupabaseStorageConfigured()
+            ) {
+                imageWarning =
+                    'Rasm saqlanmadi: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY sozlanmagan. ' +
+                    'Tovar rasmsiz tahrirlandi.';
+                console.warn('[PUT /api/products]', imageWarning);
+            }
         } catch (imageError) {
             console.error(
                 'Tahrirlashda rasmni saqlash xatosi:',
@@ -3611,10 +3636,14 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
         }
 
         return res.json({
-            message: "Tovar muvaffaqiyatli tahrirlandi!",
+            message: imageWarning
+                ? `Tovar muvaffaqiyatli tahrirlandi! Diqqat: ${imageWarning}`
+                : "Tovar muvaffaqiyatli tahrirlandi!",
             product: insertedRows[0] || null,
             products: insertedRows,
-            local_id: localId
+            local_id: localId,
+            image_saved: !!cleanImageUrl,
+            ...(imageWarning ? { image_warning: imageWarning } : {})
         });
     } catch (err) {
         try { await client.query('ROLLBACK'); } catch (e) { }
@@ -6640,14 +6669,21 @@ const compressProductImage = async (inputBuffer) => {
         .toBuffer();
 };
 
+/** Supabase Storage sozlanganmi? */
+const isSupabaseStorageConfigured = () =>
+    !!(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+
 /**
  * Supabase Storage'ga rasm yuklash.
  * Bir xil rasm (content-hash) qayta yuklansa — YANGI fayl ochilMAYDI (x-upsert + hash path).
  * DB ga faqat qisqa public URL qaytariladi.
  */
 const uploadProductImageToStorage = async (inputBuffer, fileName = 'product') => {
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-        throw new Error('SUPABASE_URL yoki SUPABASE_SERVICE_ROLE_KEY sozlanmagan!');
+    if (!isSupabaseStorageConfigured()) {
+        throw new Error(
+            'SUPABASE_URL yoki SUPABASE_SERVICE_ROLE_KEY sozlanmagan! ' +
+            'Vercel/hosting Environment Variables ga qo\'ying.'
+        );
     }
 
     const compressedBuffer = await compressProductImage(inputBuffer);
@@ -6686,11 +6722,19 @@ const uploadProductImageToStorage = async (inputBuffer, fileName = 'product') =>
 /**
  * Frontenddan kelgan image_url ni to'g'ri formatga o'tkazadi.
  * - http(s) URL → o'zini qaytaradi (qayta yuklamaydi)
- * - data:image base64 → compress → Storage (hash path) → public URL
- * - boshqa → xato
- * HECH QACHON base64 qaytarmaydi.
+ * - data:image base64 + Supabase sozlangan → compress → Storage → public URL
+ * - data:image base64 + Supabase YO'Q → null (tovar saqlanadi, rasm o'tkazib yuboriladi)
+ * - boshqa → null (xato o'rniga soft-fail)
+ * HECH QACHON base64 qaytarmaydi (DB shishmasin).
+ *
+ * @param {string} imageUrl
+ * @param {string} fileName
+ * @param {{ strict?: boolean }} options  strict=true → xatolarda throw (eski xatti-harakat)
+ * @returns {Promise<string|null>}
  */
-const processProductImage = async (imageUrl, fileName = 'product') => {
+const processProductImage = async (imageUrl, fileName = 'product', options = {}) => {
+    const strict = options.strict === true;
+
     if (typeof imageUrl !== 'string' || !imageUrl.trim()) {
         return null;
     }
@@ -6699,28 +6743,60 @@ const processProductImage = async (imageUrl, fileName = 'product') => {
 
     // Allaqachon URL — qayta yuklamaslik
     if (isHttpImageUrl(cleanImageUrl)) {
-        // Ba'zi frontendlar uzun query bilan yuborishi mumkin — faqat asosiy URL
         if (cleanImageUrl.length > 2048) {
-            throw new Error('Rasm URL juda uzun!');
+            if (strict) throw new Error('Rasm URL juda uzun!');
+            console.warn('[processProductImage] Rasm URL juda uzun — o\'tkazib yuborildi');
+            return null;
         }
         return cleanImageUrl;
     }
 
     // Base64 → Storage
     if (isDataImageUrl(cleanImageUrl)) {
+        // Supabase sozlanmagan — tovarni to'xtatmaslik uchun rasmni soft-skip
+        if (!isSupabaseStorageConfigured()) {
+            console.warn(
+                '[processProductImage] SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY yo\'q. ' +
+                'Base64 rasm saqlanmadi, tovar rasmsiz saqlanadi. ' +
+                'Rasm ishlashi uchun env ni sozlang.'
+            );
+            if (strict) {
+                throw new Error(
+                    'SUPABASE_URL yoki SUPABASE_SERVICE_ROLE_KEY sozlanmagan! ' +
+                    'Rasm yuklash uchun Vercel Environment Variables ga qo\'ying.'
+                );
+            }
+            return null;
+        }
+
         const imageBuffer = dataUrlToBuffer(cleanImageUrl);
         if (!imageBuffer) {
-            throw new Error('Base64 rasmni o‘qib bo‘lmadi!');
+            if (strict) throw new Error('Base64 rasmni o‘qib bo‘lmadi!');
+            console.warn('[processProductImage] Base64 o\'qib bo\'lmadi');
+            return null;
         }
-        // Juda katta base64 ni rad etish (masalan 8MB dan ortiq raw)
+        // Juda katta base64 ni rad etish
         if (imageBuffer.length > 3 * 1024 * 1024) {
-            throw new Error('Rasm hajmi 3MB dan katta!');
+            if (strict) throw new Error('Rasm hajmi 3MB dan katta!');
+            console.warn('[processProductImage] Rasm 3MB dan katta — o\'tkazib yuborildi');
+            return null;
         }
-        const publicUrl = await uploadProductImageToStorage(imageBuffer, fileName);
-        return assertSafeImageUrl(publicUrl);
+
+        try {
+            const publicUrl = await uploadProductImageToStorage(imageBuffer, fileName);
+            return assertSafeImageUrl(publicUrl);
+        } catch (err) {
+            console.error('[processProductImage] Storage yuklash xatosi:', err.message);
+            if (strict) throw err;
+            return null;
+        }
     }
 
-    throw new Error('Rasm formati noto‘g‘ri! Faqat http(s) URL yoki data:image qabul qilinadi.');
+    if (strict) {
+        throw new Error('Rasm formati noto‘g‘ri! Faqat http(s) URL yoki data:image qabul qilinadi.');
+    }
+    console.warn('[processProductImage] Nomalum rasm formati — o\'tkazib yuborildi');
+    return null;
 };
 
 /**
@@ -6956,6 +7032,17 @@ if (process.env.VERCEL) {
             console.log(
                 `Backend Server ${PORT}-portda ishga tushdi 🚀`
             );
+            if (!isSupabaseStorageConfigured()) {
+                console.warn(
+                    '⚠️  SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY sozlanmagan — ' +
+                    'mahsulot rasmlari saqlanMAYDI (tovar rasmsiz qo\'shiladi). ' +
+                    'Rasm ishlashi uchun env ni to\'ldiring.'
+                );
+            } else {
+                console.log(
+                    `✅ Supabase Storage tayyor (bucket: ${SUPABASE_STORAGE_BUCKET})`
+                );
+            }
         });
 
         server.on('error', (err) => {
