@@ -15,9 +15,19 @@ const app = express();
 // ====================================================
 
 app.use(cors());
-// Rasm (base64) uchun body limit oshirilgan
-app.use(express.json({ limit: '3mb' }));
-app.use(express.urlencoded({ extended: true, limit: '3mb' }));
+// Rasm (base64) uchun body limit oshirilgan — telefon kamerasi rasmlari sig'ishi uchun
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
+
+// Body juda katta bo'lsa (413) — tushunarli xabar qaytarish
+app.use((err, req, res, next) => {
+    if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+        return res.status(413).json({
+            message: "Rasm hajmi juda katta! Iltimos, kichikroq rasm tanlang (maksimal ~10MB)."
+        });
+    }
+    next(err);
+});
 
 // ====================================================
 // JADVALLARNI TAYYORLASH — "GATE" MIDDLEWARE
@@ -1914,9 +1924,16 @@ app.post(
             supplier,
             paid_amount,
             supplier_phone,
-            selling_price,
-            image_url
+            selling_price
         } = body;
+
+        // Frontend rasmni turli nom bilan yuborishi mumkin
+        const image_url =
+            body.image_url ??
+            body.imageUrl ??
+            body.photo ??
+            body.image ??
+            null;
 
         const nameRaw =
             body.name ??
@@ -3329,8 +3346,16 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
 
     const {
         category, name, color, cost_price, quantity, sizes,
-        selling_price, image_url
+        selling_price
     } = req.body || {};
+
+    // Frontend rasmni turli nom bilan yuborishi mumkin
+    const image_url =
+        req.body?.image_url ??
+        req.body?.imageUrl ??
+        req.body?.photo ??
+        req.body?.image ??
+        null;
 
     if (!name || !String(name).trim()) {
         return res.status(400).json({ message: "Tovar nomi kiritilishi shart!" });
@@ -3379,19 +3404,36 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
     }
 
     // ====================================================
+    // AVVAL TOVAR MAVJUDLIGINI VA MUDDATNI TEKSHIRAMIZ —
+    // shundan keyingina rasmni Storage'ga yuklaymiz
+    // (behuda yuklashning oldini olish uchun)
+    // ====================================================
+    const preCheck = await pool.query(
+        `SELECT created_at FROM public.products WHERE user_id = $1 AND local_id = $2 LIMIT 1`,
+        [userId, localId]
+    );
+
+    if (!preCheck.rows.length) {
+        return res.status(404).json({ message: "Tovar topilmadi!" });
+    }
+
+    if (daysSince(preCheck.rows[0].created_at) > PRODUCT_EDIT_WINDOW_DAYS) {
+        return res.status(403).json({
+            message: `Bu tovar qo'shilganiga ${PRODUCT_EDIT_WINDOW_DAYS} kundan ko'p vaqt o'tgan, tahrirlab bo'lmaydi!`
+        });
+    }
+
+    // ====================================================
     // RASM — SUPABASE STORAGE
     // ====================================================
 
     let cleanImageUrl = null;
-    let imageProvided = false;
 
     if (
         typeof image_url === 'string' &&
         image_url.trim()
     ) {
-        imageProvided = true;
         try {
-            // Agar frontend allaqachon saqlangan HTTP URL ni qayta yuborsa — qayta yuklamaymiz
             cleanImageUrl =
                 await processProductImage(
                     image_url,
@@ -6671,8 +6713,8 @@ const processProductImage = async (imageUrl, fileName = 'product') => {
             throw new Error('Base64 rasmni o‘qib bo‘lmadi!');
         }
         // Juda katta base64 ni rad etish (masalan 8MB dan ortiq raw)
-        if (imageBuffer.length > 8 * 1024 * 1024) {
-            throw new Error('Rasm hajmi 8MB dan katta!');
+        if (imageBuffer.length > 3 * 1024 * 1024) {
+            throw new Error('Rasm hajmi 3MB dan katta!');
         }
         const publicUrl = await uploadProductImageToStorage(imageBuffer, fileName);
         return assertSafeImageUrl(publicUrl);
