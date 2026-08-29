@@ -888,31 +888,41 @@ const queueTelegramNotification = async (
     }
 
     // Yuborish uchun rasm (HTTP yoki dataURL — Blob orqali)
+    // Helper funksiyalar fayl oxirida — shu yerda inline tekshiruv (xavfsiz)
     let sendPhoto = null;
     // notifications jadvaliga FAQAT qisqa HTTP URL (base64 yozilMAYDI)
     let dbPhotoUrl = null;
 
     if (photoUrl && String(photoUrl).trim()) {
         const raw = String(photoUrl).trim();
+        const isHttp = raw.startsWith('https://') || raw.startsWith('http://');
+        const isData = raw.startsWith('data:image');
         try {
-            if (isHttpImageUrl(raw)) {
+            if (isHttp) {
                 sendPhoto = raw;
                 dbPhotoUrl = raw.length <= 2048 ? raw : null;
-            } else if (isDataImageUrl(raw)) {
+            } else if (isData) {
                 // DataURL ni to'g'ridan-to'g'ri Telegramga yuboramiz (Blob)
-                // DB ga esa faqat Storage URL bo'lsa yozamiz
                 sendPhoto = raw;
-                if (isSupabaseStorageConfigured()) {
+                const hasSb =
+                    !!(
+                        String(process.env.SUPABASE_URL || '').trim() &&
+                        String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim()
+                    );
+                if (hasSb && typeof processProductImage === 'function') {
                     try {
                         const uploaded = await processProductImage(raw, 'telegram', {
                             strict: false
                         });
-                        if (uploaded && isHttpImageUrl(uploaded)) {
+                        if (
+                            uploaded &&
+                            (String(uploaded).startsWith('https://') ||
+                                String(uploaded).startsWith('http://'))
+                        ) {
                             sendPhoto = uploaded;
                             dbPhotoUrl = uploaded;
                         }
                     } catch (e) {
-                        // Storage ishlamasa ham dataURL bilan yuboramiz
                         console.warn('[Telegram queue] Storage upload skip:', e.message);
                     }
                 }
@@ -921,6 +931,7 @@ const queueTelegramNotification = async (
             }
         } catch (imgErr) {
             console.error('[Telegram queue] Rasmni qayta ishlash xatosi:', imgErr.message);
+            // Rasm ishlamasa ham matn yuboriladi
             sendPhoto = null;
             dbPhotoUrl = null;
         }
@@ -2471,12 +2482,12 @@ app.post(
                         userId
                     );
 
-                await queueTelegramNotification(
-                    client,
+                // Telegram COMMIT dan KEYIN yuboriladi (pastda)
+                var _pendingTg = {
                     siteLogin,
                     message,
-                    cleanImageUrl
-                );
+                    photo: cleanImageUrl
+                };
             }
 
             // Do'konga kirgan tovarlar hisobi (+ faqat qo'shishda; init yuqorida INSERT dan oldin qilingan)
@@ -2491,6 +2502,20 @@ app.post(
             }
 
             await client.query('COMMIT');
+
+            // Telegram — COMMIT dan KEYIN, pool orqali
+            if (typeof _pendingTg !== 'undefined' && _pendingTg && _pendingTg.siteLogin) {
+                try {
+                    await queueTelegramNotification(
+                        pool,
+                        _pendingTg.siteLogin,
+                        _pendingTg.message,
+                        _pendingTg.photo
+                    );
+                } catch (tgErr) {
+                    console.error('[Telegram] Yangi tovar xabari xatosi:', tgErr.message);
+                }
+            }
 
             const baseMsg = exactQuantities
                 ? `Tovar saqlandi! ${exactQuantities.length} ta razmer bo'yicha aniq taqsimlandi (ID: #${nextLocalId})`
@@ -4039,9 +4064,19 @@ VALUES
 
             sellMessage += await getTodayReport(client, userId);
 
-            await queueTelegramNotification(client, siteLogin, sellMessage, firstImageUrl);
-
+            // Avval COMMIT — Telegram tashqi HTTP, tranzaksiyani ushlab turmasin
             await client.query('COMMIT');
+
+            try {
+                await queueTelegramNotification(
+                    pool,
+                    siteLogin,
+                    sellMessage,
+                    firstImageUrl
+                );
+            } catch (tgErr) {
+                console.error('[Telegram] Sotuv xabari xatosi:', tgErr.message);
+            }
 
             return res.json({
                 message: "Tovar(lar) muvaffaqiyatli sotildi",
@@ -4327,9 +4362,18 @@ VALUES
 
             sellMessage += await getTodayReport(client, userId);
 
-            await queueTelegramNotification(client, siteLogin, sellMessage, firstImageUrl);
-
             await client.query('COMMIT');
+
+            try {
+                await queueTelegramNotification(
+                    pool,
+                    siteLogin,
+                    sellMessage,
+                    firstImageUrl
+                );
+            } catch (tgErr) {
+                console.error('[Telegram] Nasiya sotuv xabari xatosi:', tgErr.message);
+            }
 
             return res.json({
                 message: "Tovar nasiyaga muvaffaqiyatli sotildi!",
@@ -5211,9 +5255,18 @@ VALUES
 
             message += await getTodayReport(client, product.user_id);
 
-            await queueTelegramNotification(client, siteLogin, message, product.image_url || null);
-
             await client.query('COMMIT');
+
+            try {
+                await queueTelegramNotification(
+                    pool,
+                    siteLogin,
+                    message,
+                    product.image_url || null
+                );
+            } catch (tgErr) {
+                console.error('[Telegram] QR sotuv xabari xatosi:', tgErr.message);
+            }
 
             return res.json({
                 success: true,
@@ -5531,9 +5584,18 @@ app.post(
 
             message += await getTodayReport(client, product.user_id);
 
-            await queueTelegramNotification(client, siteLogin, message, product.image_url || null);
-
             await client.query('COMMIT');
+
+            try {
+                await queueTelegramNotification(
+                    pool,
+                    siteLogin,
+                    message,
+                    product.image_url || null
+                );
+            } catch (tgErr) {
+                console.error('[Telegram] QR nasiya sotuv xabari xatosi:', tgErr.message);
+            }
 
             return res.json({
                 success: true,
