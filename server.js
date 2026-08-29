@@ -2119,12 +2119,10 @@ app.post(
         }
 
         // ====================================================
-        // RASM — SUPABASE STORAGE (soft-fail: env yo'q bo'lsa
-        // tovar baribir saqlanadi, rasm o'tkazib yuboriladi)
+        // RASM — Supabase Storage yoki DB fallback (dataURL)
         // ====================================================
 
         let cleanImageUrl = null;
-        let imageWarning = null;
 
         if (
             typeof image_url === 'string' &&
@@ -2138,17 +2136,8 @@ app.post(
                 );
                 if (cleanImageUrl) {
                     cleanImageUrl = assertSafeImageUrl(cleanImageUrl);
-                } else if (
-                    isDataImageUrl(image_url) &&
-                    !isSupabaseStorageConfigured()
-                ) {
-                    imageWarning =
-                        'Rasm saqlanmadi: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY sozlanmagan. ' +
-                        'Tovar rasmsiz qo\'shildi. Env ni sozlab qayta yuklang.';
-                    console.warn('[POST /api/products]', imageWarning);
                 }
             } catch (imageError) {
-                // Faqat haqiqiy xatolar (format, hajm va h.k.)
                 console.error('Rasmni saqlash xatosi:', imageError);
                 return res.status(400).json({
                     message:
@@ -2479,14 +2468,11 @@ app.post(
                     : `Tovar saqlandi! ID: #${nextLocalId}`;
 
             res.status(201).json({
-                message: imageWarning
-                    ? `${baseMsg}. Diqqat: ${imageWarning}`
-                    : baseMsg,
+                message: baseMsg,
                 product: insertedRows[0],
                 products: insertedRows,
                 local_id: nextLocalId,
-                image_saved: !!cleanImageUrl,
-                ...(imageWarning ? { image_warning: imageWarning } : {})
+                image_saved: !!cleanImageUrl
             });
         } catch (err) {
             try {
@@ -3438,11 +3424,10 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
     }
 
     // ====================================================
-    // RASM — SUPABASE STORAGE (soft-fail)
+    // RASM — Supabase Storage yoki DB fallback (dataURL)
     // ====================================================
 
     let cleanImageUrl = null;
-    let imageWarning = null;
 
     if (
         typeof image_url === 'string' &&
@@ -3456,14 +3441,6 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
             );
             if (cleanImageUrl) {
                 cleanImageUrl = assertSafeImageUrl(cleanImageUrl);
-            } else if (
-                isDataImageUrl(image_url) &&
-                !isSupabaseStorageConfigured()
-            ) {
-                imageWarning =
-                    'Rasm saqlanmadi: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY sozlanmagan. ' +
-                    'Tovar rasmsiz tahrirlandi.';
-                console.warn('[PUT /api/products]', imageWarning);
             }
         } catch (imageError) {
             console.error(
@@ -3636,14 +3613,11 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
         }
 
         return res.json({
-            message: imageWarning
-                ? `Tovar muvaffaqiyatli tahrirlandi! Diqqat: ${imageWarning}`
-                : "Tovar muvaffaqiyatli tahrirlandi!",
+            message: "Tovar muvaffaqiyatli tahrirlandi!",
             product: insertedRows[0] || null,
             products: insertedRows,
             local_id: localId,
-            image_saved: !!cleanImageUrl,
-            ...(imageWarning ? { image_warning: imageWarning } : {})
+            image_saved: !!cleanImageUrl
         });
     } catch (err) {
         try { await client.query('ROLLBACK'); } catch (e) { }
@@ -6617,12 +6591,16 @@ const IMAGE_MAX_WIDTH = 1280;
 const IMAGE_MAX_HEIGHT = 1280;
 const IMAGE_JPEG_QUALITY = 75;
 
+// Supabase yo'q bo'lganda DB ga yoziladigan siqilgan rasm limitlari
+const FALLBACK_IMAGE_MAX_WIDTH = 800;
+const FALLBACK_IMAGE_MAX_HEIGHT = 800;
+const FALLBACK_IMAGE_JPEG_QUALITY = 62;
+/** data URL string uzunligi (taxminan ~350KB binary) */
+const FALLBACK_DATA_URL_MAX_CHARS = 500 * 1024;
+
 /**
- * Rasmni kichraytirish va JPEG formatiga
- * o'tkazish.
- *
- * Masalan:
- * 4MB PNG -> taxminan 100-300KB JPEG
+ * Rasmni kichraytirish va JPEG formatiga o'tkazish.
+ * Masalan: 4MB PNG -> taxminan 100-300KB JPEG
  */
 const isHttpImageUrl = (value) => {
     if (typeof value !== 'string') return false;
@@ -6635,34 +6613,51 @@ const isDataImageUrl = (value) => {
     return value.trim().startsWith('data:image');
 };
 
-/** DB ga faqat qisqa HTTP URL yoziladi — base64 taqiqlanadi */
+/**
+ * DB ga yozish xavfsizligi:
+ * - http(s) URL — har doim OK (qisqa)
+ * - data:image — faqat siqilgan va FALLBACK_DATA_URL_MAX_CHARS dan kichik bo'lsa
+ */
 const assertSafeImageUrl = (value) => {
     if (value == null || value === '') return null;
     const v = String(value).trim();
     if (!v) return null;
+
+    if (isHttpImageUrl(v)) {
+        if (v.length > 2048) {
+            throw new Error('image_url juda uzun — faqat qisqa Storage URL saqlanishi kerak!');
+        }
+        return v;
+    }
+
     if (isDataImageUrl(v)) {
-        throw new Error('Base64 rasmni DBga yozib bo‘lmaydi — avval Storage ga yuklang!');
+        if (v.length > FALLBACK_DATA_URL_MAX_CHARS) {
+            throw new Error(
+                `Rasm juda katta (${Math.round(v.length / 1024)}KB). ` +
+                `Maksimal ~${Math.round(FALLBACK_DATA_URL_MAX_CHARS / 1024)}KB.`
+            );
+        }
+        return v;
     }
-    if (v.length > 2048) {
-        throw new Error('image_url juda uzun — faqat Storage URL saqlanishi kerak!');
-    }
-    if (!isHttpImageUrl(v)) {
-        throw new Error('Rasm formati noto‘g‘ri! Faqat http(s) URL yoki data:image ruxsat etiladi.');
-    }
-    return v;
+
+    throw new Error('Rasm formati noto‘g‘ri! Faqat http(s) URL yoki data:image ruxsat etiladi.');
 };
 
-const compressProductImage = async (inputBuffer) => {
+const compressProductImage = async (inputBuffer, opts = {}) => {
+    const width = opts.width || IMAGE_MAX_WIDTH;
+    const height = opts.height || IMAGE_MAX_HEIGHT;
+    const quality = opts.quality != null ? opts.quality : IMAGE_JPEG_QUALITY;
+
     return await sharp(inputBuffer)
         .rotate()
         .resize({
-            width: IMAGE_MAX_WIDTH,
-            height: IMAGE_MAX_HEIGHT,
+            width,
+            height,
             fit: 'inside',
             withoutEnlargement: true
         })
         .jpeg({
-            quality: IMAGE_JPEG_QUALITY,
+            quality,
             progressive: true,
             mozjpeg: true
         })
@@ -6676,7 +6671,6 @@ const isSupabaseStorageConfigured = () =>
 /**
  * Supabase Storage'ga rasm yuklash.
  * Bir xil rasm (content-hash) qayta yuklansa — YANGI fayl ochilMAYDI (x-upsert + hash path).
- * DB ga faqat qisqa public URL qaytariladi.
  */
 const uploadProductImageToStorage = async (inputBuffer, fileName = 'product') => {
     if (!isSupabaseStorageConfigured()) {
@@ -6688,10 +6682,8 @@ const uploadProductImageToStorage = async (inputBuffer, fileName = 'product') =>
 
     const compressedBuffer = await compressProductImage(inputBuffer);
 
-    // Content-hash: bir xil rasm = bir xil path → storage ko'paymaydi
     const { createHash } = require('crypto');
     const contentHash = createHash('sha256').update(compressedBuffer).digest('hex').slice(0, 32);
-
     const storagePath = `products/${contentHash}.jpg`;
 
     const uploadUrl =
@@ -6720,16 +6712,49 @@ const uploadProductImageToStorage = async (inputBuffer, fileName = 'product') =>
 };
 
 /**
+ * Supabase yo'q bo'lganda: rasmni kuchli siqib data:image/jpeg;base64,... qilib qaytaradi.
+ * DB ga yoziladi — rasm ishlaydi (Storage kerak emas).
+ */
+const compressToDataUrlFallback = async (imageBuffer) => {
+    let quality = FALLBACK_IMAGE_JPEG_QUALITY;
+    let width = FALLBACK_IMAGE_MAX_WIDTH;
+    let height = FALLBACK_IMAGE_MAX_HEIGHT;
+
+    // Hajm katta bo'lsa — yanada kichraytirib qayta siqamiz
+    for (let attempt = 0; attempt < 4; attempt++) {
+        const compressed = await compressProductImage(imageBuffer, {
+            width,
+            height,
+            quality
+        });
+        const dataUrl =
+            'data:image/jpeg;base64,' + compressed.toString('base64');
+
+        if (dataUrl.length <= FALLBACK_DATA_URL_MAX_CHARS) {
+            console.log(
+                `[processProductImage] Fallback dataURL: ${Math.round(dataUrl.length / 1024)}KB ` +
+                `(q=${quality}, ${width}x${height})`
+            );
+            return dataUrl;
+        }
+
+        quality = Math.max(40, quality - 10);
+        width = Math.max(400, Math.round(width * 0.75));
+        height = Math.max(400, Math.round(height * 0.75));
+    }
+
+    // Oxirgi urinish ham katta — null
+    console.warn('[processProductImage] Fallback: rasmni yetarli siqib bo\'lmadi');
+    return null;
+};
+
+/**
  * Frontenddan kelgan image_url ni to'g'ri formatga o'tkazadi.
- * - http(s) URL → o'zini qaytaradi (qayta yuklamaydi)
- * - data:image base64 + Supabase sozlangan → compress → Storage → public URL
- * - data:image base64 + Supabase YO'Q → null (tovar saqlanadi, rasm o'tkazib yuboriladi)
- * - boshqa → null (xato o'rniga soft-fail)
- * HECH QACHON base64 qaytarmaydi (DB shishmasin).
+ * - http(s) URL → o'zini qaytaradi
+ * - data:image + Supabase bor → Storage public URL
+ * - data:image + Supabase YO'Q → siqilgan data:image (DB fallback) — RASM SAQLANADI
+ * - boshqa → null
  *
- * @param {string} imageUrl
- * @param {string} fileName
- * @param {{ strict?: boolean }} options  strict=true → xatolarda throw (eski xatti-harakat)
  * @returns {Promise<string|null>}
  */
 const processProductImage = async (imageUrl, fileName = 'product', options = {}) => {
@@ -6741,7 +6766,7 @@ const processProductImage = async (imageUrl, fileName = 'product', options = {})
 
     const cleanImageUrl = imageUrl.trim();
 
-    // Allaqachon URL — qayta yuklamaslik
+    // Allaqachon HTTP URL
     if (isHttpImageUrl(cleanImageUrl)) {
         if (cleanImageUrl.length > 2048) {
             if (strict) throw new Error('Rasm URL juda uzun!');
@@ -6751,45 +6776,57 @@ const processProductImage = async (imageUrl, fileName = 'product', options = {})
         return cleanImageUrl;
     }
 
-    // Base64 → Storage
-    if (isDataImageUrl(cleanImageUrl)) {
-        // Supabase sozlanmagan — tovarni to'xtatmaslik uchun rasmni soft-skip
-        if (!isSupabaseStorageConfigured()) {
-            console.warn(
-                '[processProductImage] SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY yo\'q. ' +
-                'Base64 rasm saqlanmadi, tovar rasmsiz saqlanadi. ' +
-                'Rasm ishlashi uchun env ni sozlang.'
-            );
-            if (strict) {
-                throw new Error(
-                    'SUPABASE_URL yoki SUPABASE_SERVICE_ROLE_KEY sozlanmagan! ' +
-                    'Rasm yuklash uchun Vercel Environment Variables ga qo\'ying.'
-                );
-            }
-            return null;
-        }
+    // Allaqachon siqilgan data URL (qayta tahrirlashda)
+    if (isDataImageUrl(cleanImageUrl) && cleanImageUrl.length <= FALLBACK_DATA_URL_MAX_CHARS) {
+        // Agar Supabase bor va bu yangi katta base64 emas, lekin hali data URL —
+        // Storage ga ko'chirishga harakat (ixtiyoriy). Hozir shunchaki qabul qilamiz.
+        // Yangi yuklashlar quyida compress + storage/fallback dan o'tadi.
+    }
 
+    // Base64 → Storage yoki Fallback
+    if (isDataImageUrl(cleanImageUrl)) {
         const imageBuffer = dataUrlToBuffer(cleanImageUrl);
         if (!imageBuffer) {
             if (strict) throw new Error('Base64 rasmni o‘qib bo‘lmadi!');
             console.warn('[processProductImage] Base64 o\'qib bo\'lmadi');
             return null;
         }
-        // Juda katta base64 ni rad etish
-        if (imageBuffer.length > 3 * 1024 * 1024) {
-            if (strict) throw new Error('Rasm hajmi 3MB dan katta!');
-            console.warn('[processProductImage] Rasm 3MB dan katta — o\'tkazib yuborildi');
+        if (imageBuffer.length > 5 * 1024 * 1024) {
+            if (strict) throw new Error('Rasm hajmi 5MB dan katta!');
+            console.warn('[processProductImage] Rasm 5MB dan katta — o\'tkazib yuborildi');
             return null;
         }
 
-        try {
-            const publicUrl = await uploadProductImageToStorage(imageBuffer, fileName);
-            return assertSafeImageUrl(publicUrl);
-        } catch (err) {
-            console.error('[processProductImage] Storage yuklash xatosi:', err.message);
-            if (strict) throw err;
-            return null;
+        // 1) Supabase sozlangan — Storage ga
+        if (isSupabaseStorageConfigured()) {
+            try {
+                const publicUrl = await uploadProductImageToStorage(imageBuffer, fileName);
+                return assertSafeImageUrl(publicUrl);
+            } catch (err) {
+                console.error(
+                    '[processProductImage] Storage xatosi, fallback dataURL ga o\'tamiz:',
+                    err.message
+                );
+                // Storage ishlamasa ham rasm saqlansin
+                const fallback = await compressToDataUrlFallback(imageBuffer);
+                if (fallback) return assertSafeImageUrl(fallback);
+                if (strict) throw err;
+                return null;
+            }
         }
+
+        // 2) Supabase YO'Q — siqilgan data URL ni DB ga yozamiz (rasm ishlaydi)
+        console.warn(
+            '[processProductImage] Supabase env yo\'q — rasm DB ga dataURL sifatida saqlanadi. ' +
+            'Keyinroq SUPABASE_URL + SERVICE_ROLE_KEY qo\'yib Storage ga o\'tkazishingiz mumkin.'
+        );
+        const fallback = await compressToDataUrlFallback(imageBuffer);
+        if (fallback) return assertSafeImageUrl(fallback);
+
+        if (strict) {
+            throw new Error('Rasmni siqib saqlab bo‘lmadi. Kichikroq rasm tanlang.');
+        }
+        return null;
     }
 
     if (strict) {
