@@ -803,66 +803,77 @@ const dataUrlToBuffer = (dataUrl) => {
     return Buffer.from(parts[1], 'base64');
 };
 
+/** Faqat matn yuborish (4096 dan uzun bo'lsa bo'lib) */
+const sendTelegramTextOnly = async (chatId, text) => {
+    const body = String(text || '');
+    if (body.length <= 4096) {
+        const form = new FormData();
+        form.append('chat_id', String(chatId));
+        form.append('text', body);
+        form.append('parse_mode', 'HTML');
+        await telegramApi('sendMessage', form);
+        return;
+    }
+    for (let i = 0; i < body.length; i += 4096) {
+        const form = new FormData();
+        form.append('chat_id', String(chatId));
+        form.append('text', body.slice(i, i + 4096));
+        form.append('parse_mode', 'HTML');
+        await telegramApi('sendMessage', form);
+    }
+};
+
+/**
+ * Telegramga yuborish.
+ * Rasm yuborib bo'lmasa HAM matn albatta yuboriladi (tahrirlash/sotuv xabari yo'qolmasin).
+ */
 const sendTelegramNow = async (chatId, message, photoUrl = null) => {
     if (!chatId) throw new Error('chat_id yo\'q');
     const text = String(message || '');
     const hasPhoto = !!(photoUrl && String(photoUrl).trim());
 
     if (hasPhoto) {
-        const form = new FormData();
-        form.append('chat_id', String(chatId));
-        form.append('parse_mode', 'HTML');
-
-        const buf = dataUrlToBuffer(photoUrl);
-        if (buf) {
-            // Node 18+ FormData + Blob
-            const blob = new Blob([buf], { type: 'image/jpeg' });
-            form.append('photo', blob, 'product.jpg');
-        } else if (String(photoUrl).startsWith('http')) {
-            form.append('photo', String(photoUrl));
-        } else {
-            // noma'lum format — faqat matn
-            const f2 = new FormData();
-            f2.append('chat_id', String(chatId));
-            f2.append('text', text);
-            f2.append('parse_mode', 'HTML');
-            await telegramApi('sendMessage', f2);
-            return;
-        }
-
-        // Caption max 1024
-        if (text.length <= 1024) {
-            form.append('caption', text);
-            await telegramApi('sendPhoto', form);
-        } else {
-            form.append('caption', text.slice(0, 1024));
-            await telegramApi('sendPhoto', form);
-            const f2 = new FormData();
-            f2.append('chat_id', String(chatId));
-            f2.append('text', text.slice(1024));
-            f2.append('parse_mode', 'HTML');
-            await telegramApi('sendMessage', f2);
-        }
-        return;
-    }
-
-    // Rasm yo'q — oddiy matn (4096 limit)
-    if (text.length <= 4096) {
-        const form = new FormData();
-        form.append('chat_id', String(chatId));
-        form.append('text', text);
-        form.append('parse_mode', 'HTML');
-        await telegramApi('sendMessage', form);
-    } else {
-        // bo'lib yuborish
-        for (let i = 0; i < text.length; i += 4096) {
+        try {
             const form = new FormData();
             form.append('chat_id', String(chatId));
-            form.append('text', text.slice(i, i + 4096));
             form.append('parse_mode', 'HTML');
-            await telegramApi('sendMessage', form);
+
+            const buf = dataUrlToBuffer(photoUrl);
+            if (buf) {
+                // Telegram photo tavsiya: 10MB gacha; bizda siqilgan JPEG
+                const blob = new Blob([buf], { type: 'image/jpeg' });
+                form.append('photo', blob, 'product.jpg');
+            } else if (String(photoUrl).startsWith('http')) {
+                form.append('photo', String(photoUrl));
+            } else {
+                // noma'lum format — faqat matn
+                await sendTelegramTextOnly(chatId, text);
+                return;
+            }
+
+            // Caption max 1024
+            if (text.length <= 1024) {
+                form.append('caption', text);
+                await telegramApi('sendPhoto', form);
+            } else {
+                form.append('caption', text.slice(0, 1024));
+                await telegramApi('sendPhoto', form);
+                await sendTelegramTextOnly(chatId, text.slice(1024));
+            }
+            return;
+        } catch (photoErr) {
+            // Rasm yuborilmadi — matnni baribir yuboramiz
+            console.warn(
+                '[Telegram] Rasm bilan yuborib bo\'lmadi, matn yuboriladi:',
+                photoErr.message
+            );
+            await sendTelegramTextOnly(chatId, text);
+            return;
         }
     }
+
+    // Rasm yo'q — oddiy matn
+    await sendTelegramTextOnly(chatId, text);
 };
 
 const queueTelegramNotification = async (
@@ -876,26 +887,48 @@ const queueTelegramNotification = async (
         return;
     }
 
-    // Rasm: base64 bo'lsa Storage ga yuklab URL olamiz; DBga faqat qisqa URL
-    let safePhotoUrl = null;
+    // Yuborish uchun rasm (HTTP yoki dataURL — Blob orqali)
+    let sendPhoto = null;
+    // notifications jadvaliga FAQAT qisqa HTTP URL (base64 yozilMAYDI)
+    let dbPhotoUrl = null;
+
     if (photoUrl && String(photoUrl).trim()) {
+        const raw = String(photoUrl).trim();
         try {
-            if (isDataImageUrl(photoUrl)) {
-                safePhotoUrl = await processProductImage(String(photoUrl), 'telegram');
-            } else if (isHttpImageUrl(photoUrl)) {
-                safePhotoUrl = String(photoUrl).trim();
+            if (isHttpImageUrl(raw)) {
+                sendPhoto = raw;
+                dbPhotoUrl = raw.length <= 2048 ? raw : null;
+            } else if (isDataImageUrl(raw)) {
+                // DataURL ni to'g'ridan-to'g'ri Telegramga yuboramiz (Blob)
+                // DB ga esa faqat Storage URL bo'lsa yozamiz
+                sendPhoto = raw;
+                if (isSupabaseStorageConfigured()) {
+                    try {
+                        const uploaded = await processProductImage(raw, 'telegram', {
+                            strict: false
+                        });
+                        if (uploaded && isHttpImageUrl(uploaded)) {
+                            sendPhoto = uploaded;
+                            dbPhotoUrl = uploaded;
+                        }
+                    } catch (e) {
+                        // Storage ishlamasa ham dataURL bilan yuboramiz
+                        console.warn('[Telegram queue] Storage upload skip:', e.message);
+                    }
+                }
             } else {
-                console.warn("[Telegram queue] Nomalum rasm formati — photo otkazib yuborildi");
+                console.warn('[Telegram queue] Nomalum rasm formati — photo o\'tkazib yuborildi');
             }
         } catch (imgErr) {
             console.error('[Telegram queue] Rasmni qayta ishlash xatosi:', imgErr.message);
-            safePhotoUrl = null;
+            sendPhoto = null;
+            dbPhotoUrl = null;
         }
     }
 
-    const hasPhoto = !!safePhotoUrl;
+    const hasPhoto = !!sendPhoto;
 
-    // 1) Navbatga yozish (backup) — FAQAT qisqa URL, base64 EMAS
+    // 1) Navbatga yozish (backup) — faqat qisqa URL yoki null
     let inserted = false;
     try {
         await clientOrPool.query(
@@ -910,11 +943,7 @@ const queueTelegramNotification = async (
             VALUES
             ($1, $2, false, $3)
             `,
-            [
-                siteLogin,
-                message,
-                safePhotoUrl
-            ]
+            [siteLogin, message, dbPhotoUrl]
         );
         inserted = true;
     } catch (err) {
@@ -925,19 +954,17 @@ const queueTelegramNotification = async (
         `[Telegram queue] site=${siteLogin} photo=${hasPhoto ? 'YES' : 'NO'}`
     );
 
-    // Telegramga yuborishda ham xavfsiz URL ishlatamiz
-    photoUrl = safePhotoUrl;
-
-    // 2) To'g'ridan-to'g'ri Telegramga yuborish (rasm ishlashi uchun)
+    // 2) To'g'ridan-to'g'ri Telegramga yuborish
     if (!TELEGRAM_BOT_TOKEN) {
-        console.warn('[Telegram] BOT_TOKEN yo\'q — faqat navbatga yozildi. Env: TELEGRAM_BOT_TOKEN yoki BOT_TOKEN');
+        console.warn(
+            '[Telegram] BOT_TOKEN yo\'q — faqat navbatga yozildi. Env: TELEGRAM_BOT_TOKEN yoki BOT_TOKEN'
+        );
         return;
     }
 
     try {
         const chatIds = new Set();
 
-        // 1) linked_groups jadvalidan (ko'p guruh)
         try {
             const lg = await clientOrPool.query(
                 `
@@ -955,7 +982,6 @@ const queueTelegramNotification = async (
             console.warn('[Telegram] linked_groups o\'qib bo\'lmadi:', lgErr.message);
         }
 
-        // 2) Eski ustun: users.linked_group_chat_id
         try {
             const u = await clientOrPool.query(
                 `
@@ -972,7 +998,6 @@ const queueTelegramNotification = async (
             console.warn('[Telegram] linked_group_chat_id o\'qib bo\'lmadi:', colErr.message);
         }
 
-        // 3) Env fallback
         if (chatIds.size === 0 && TELEGRAM_CHAT_ID) {
             chatIds.add(String(TELEGRAM_CHAT_ID));
         }
@@ -988,15 +1013,22 @@ const queueTelegramNotification = async (
         let anyOk = false;
         for (const chatId of chatIds) {
             try {
-                await sendTelegramNow(chatId, message, photoUrl);
+                await sendTelegramNow(chatId, message, sendPhoto);
                 console.log(`[Telegram] YUBORILDI chat=${chatId} photo=${hasPhoto}`);
                 anyOk = true;
             } catch (sendErr) {
                 console.error(`[Telegram] chat=${chatId} yuborish xatosi:`, sendErr.message);
+                // Oxirgi urinish: faqat matn
+                try {
+                    await sendTelegramTextOnly(chatId, message);
+                    console.log(`[Telegram] MATN YUBORILDI (fallback) chat=${chatId}`);
+                    anyOk = true;
+                } catch (textErr) {
+                    console.error(`[Telegram] matn ham yuborilmadi chat=${chatId}:`, textErr.message);
+                }
             }
         }
 
-        // Muvaffaqiyatli yuborilsa — is_sent = true
         if (anyOk && inserted) {
             try {
                 await clientOrPool.query(
@@ -1016,7 +1048,6 @@ const queueTelegramNotification = async (
         }
     } catch (err) {
         console.error('[Telegram] Yuborish xatosi:', err.message);
-        // Navbatda qoladi — bot keyin yuborishi mumkin
     }
 };
 
@@ -3535,7 +3566,10 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
                         oldFirst.paid_amount || 0,
                         oldFirst.supplier_phone || null,
                         parsedSellingPrice,
-                        (cleanImageUrl || (isDataImageUrl(oldImage) ? null : oldImage)),
+                        // Yangi rasm bo'lsa uni, yo'qsa eskisini (dataURL ham) saqlaymiz
+                        (cleanImageUrl != null && cleanImageUrl !== ''
+                            ? cleanImageUrl
+                            : oldImage),
                         oldFirst.created_at
                     ]
                 );
