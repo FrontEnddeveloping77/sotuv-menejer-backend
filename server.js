@@ -32,6 +32,7 @@ const ensureTablesOnce = () => {
                 await repairMissingReturnedStock();
                 await splitProductQuantitiesToOne();
                 await migrateBase64ImagesOnce();
+                await cleanupOrphanedProductImages();
             })
             .catch((err) => {
                 console.error(
@@ -6737,6 +6738,113 @@ const migrateBase64ImagesOnce = async () => {
     }
 };
 
+/**
+ * Storage'dagi hech qanday jadvalda ishlatilmayotgan (egasiz/orphan)
+ * rasm fayllarini topib o'chiradi.
+ * "Ishlatilayotgan" deb hisoblanadi: products yoki deleted_products
+ * jadvalidagi image_url. Boshqa hech qayerda bo'lmagan fayl — o'chiriladi.
+ */
+const cleanupOrphanedProductImages = async () => {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
+
+    try {
+        // 1) Hozir ishlatilayotgan barcha rasm URL'larini yig'amiz
+        const used = new Set();
+        const addUrls = (rows) => {
+            for (const r of rows) {
+                if (r.image_url && isHttpImageUrl(r.image_url)) {
+                    used.add(r.image_url.trim());
+                }
+            }
+        };
+
+        const p1 = await pool.query(
+            `SELECT image_url FROM public.products WHERE image_url IS NOT NULL`
+        );
+        addUrls(p1.rows);
+
+        const p2 = await pool.query(
+            `SELECT image_url FROM public.deleted_products WHERE image_url IS NOT NULL`
+        );
+        addUrls(p2.rows);
+
+        // ★★★ MUHIM: sotuvlar tarixida (frontend "Sotuvlar" bo'limi) rasm
+        // ko'rsatiladi — bu rasmlar hech qachon o'chirilmasligi kerak
+        const p3 = await pool.query(
+            `SELECT image_url FROM public.sales WHERE image_url IS NOT NULL`
+        );
+        addUrls(p3.rows);
+
+        // ★★★ MUHIM: hali Telegramga yuborilmagan (is_sent=false) xabarlar
+        // rasmini o'chirmaslik kerak — keyinroq qayta yuborilishi mumkin
+        const p4 = await pool.query(
+            `SELECT photo_url AS image_url FROM public.notifications
+             WHERE photo_url IS NOT NULL AND is_sent = false`
+        );
+        addUrls(p4.rows);
+
+        // 2) Storage'dagi "products/" papkasidagi fayllar ro'yxati
+        const listUrl = `${SUPABASE_URL}/storage/v1/object/list/${SUPABASE_STORAGE_BUCKET}`;
+        const listRes = await fetch(listUrl, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+                apikey: SUPABASE_SERVICE_ROLE_KEY,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                prefix: 'products',
+                limit: 1000,
+                sortBy: { column: 'name', order: 'asc' }
+            })
+        });
+
+        if (!listRes.ok) {
+            console.warn('[cleanupImages] Storage ro\'yxatini olishda xato:', listRes.status);
+            return;
+        }
+
+        const files = await listRes.json();
+        if (!Array.isArray(files)) return;
+
+        const orphanPaths = [];
+        for (const f of files) {
+            if (!f.name) continue;
+            const path = `products/${f.name}`;
+            const publicUrl =
+                `${SUPABASE_URL}/storage/v1/object/public/${SUPABASE_STORAGE_BUCKET}/${path}`;
+            if (!used.has(publicUrl)) {
+                orphanPaths.push(path);
+            }
+        }
+
+        if (orphanPaths.length === 0) {
+            console.log('[cleanupImages] Egasiz rasm topilmadi.');
+            return;
+        }
+
+        const delUrl = `${SUPABASE_URL}/storage/v1/object/${SUPABASE_STORAGE_BUCKET}`;
+        const delRes = await fetch(delUrl, {
+            method: 'DELETE',
+            headers: {
+                Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+                apikey: SUPABASE_SERVICE_ROLE_KEY,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ prefixes: orphanPaths })
+        });
+
+        if (!delRes.ok) {
+            const t = await delRes.text().catch(() => '');
+            console.warn('[cleanupImages] O\'chirishda xato:', delRes.status, t);
+            return;
+        }
+
+        console.log(`[cleanupImages] ${orphanPaths.length} ta egasiz rasm o'chirildi.`);
+    } catch (err) {
+        console.error('[cleanupImages] Umumiy xato:', err.message);
+    }
+};
 
 // ====================================================
 // SERVER ISHGA TUSHIRISH
@@ -6788,6 +6896,9 @@ if (process.env.VERCEL) {
     };
 
     setInterval(checkAndSendScheduledReports, 30 * 1000);
+
+    // Har 6 soatda egasiz (hech qayerda ishlatilmayotgan) rasmlarni Storage'dan tozalash
+    setInterval(cleanupOrphanedProductImages, 6 * 60 * 60 * 1000);
 
     const startServer = async () => {
         try {
