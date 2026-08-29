@@ -774,7 +774,7 @@ const TELEGRAM_BOT_TOKEN =
     process.env.TG_BOT_TOKEN ||
     '';
 
-// Bitta guruh uchun (ixtiyoriy) — users.linked_group_chat_id bo'lmasa ishlatiladi
+// Bitta guruh uchun (ixtiyoriy) — users.linked_group_chat_id / linked_groups bo'lmasa
 const TELEGRAM_CHAT_ID =
     process.env.TELEGRAM_CHAT_ID ||
     process.env.TG_CHAT_ID ||
@@ -786,10 +786,17 @@ const telegramApi = async (method, formData) => {
         throw new Error('TELEGRAM_BOT_TOKEN / BOT_TOKEN env topilmadi');
     }
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
-    const res = await fetch(url, { method: 'POST', body: formData });
+    let res;
+    try {
+        res = await fetch(url, { method: 'POST', body: formData });
+    } catch (netErr) {
+        throw new Error(`network: ${netErr.message || netErr}`);
+    }
     const data = await res.json().catch(() => ({}));
     if (!data.ok) {
-        throw new Error(data.description || `Telegram API xato: ${method}`);
+        const desc = data.description || res.statusText || 'unknown';
+        const code = data.error_code || res.status || '?';
+        throw new Error(`${code} - ${desc}`);
     }
     return data;
 };
@@ -825,7 +832,7 @@ const sendTelegramTextOnly = async (chatId, text) => {
 
 /**
  * Telegramga yuborish.
- * Rasm yuborib bo'lmasa HAM matn albatta yuboriladi (tahrirlash/sotuv xabari yo'qolmasin).
+ * Rasm yuborib bo'lmasa HAM matn albatta yuboriladi.
  */
 const sendTelegramNow = async (chatId, message, photoUrl = null) => {
     if (!chatId) throw new Error('chat_id yo\'q');
@@ -840,18 +847,15 @@ const sendTelegramNow = async (chatId, message, photoUrl = null) => {
 
             const buf = dataUrlToBuffer(photoUrl);
             if (buf) {
-                // Telegram photo tavsiya: 10MB gacha; bizda siqilgan JPEG
                 const blob = new Blob([buf], { type: 'image/jpeg' });
                 form.append('photo', blob, 'product.jpg');
             } else if (String(photoUrl).startsWith('http')) {
                 form.append('photo', String(photoUrl));
             } else {
-                // noma'lum format — faqat matn
                 await sendTelegramTextOnly(chatId, text);
                 return;
             }
 
-            // Caption max 1024
             if (text.length <= 1024) {
                 form.append('caption', text);
                 await telegramApi('sendPhoto', form);
@@ -862,7 +866,6 @@ const sendTelegramNow = async (chatId, message, photoUrl = null) => {
             }
             return;
         } catch (photoErr) {
-            // Rasm yuborilmadi — matnni baribir yuboramiz
             console.warn(
                 '[Telegram] Rasm bilan yuborib bo\'lmadi, matn yuboriladi:',
                 photoErr.message
@@ -872,8 +875,60 @@ const sendTelegramNow = async (chatId, message, photoUrl = null) => {
         }
     }
 
-    // Rasm yo'q — oddiy matn
     await sendTelegramTextOnly(chatId, text);
+};
+
+/**
+ * site_login bo'yicha guruh chat_id larini yig'ish:
+ * 1) public.linked_groups
+ * 2) users.linked_group_chat_id (legacy)
+ * 3) TELEGRAM_CHAT_ID env (fallback)
+ */
+const resolveTelegramChatIds = async (clientOrPool, siteLogin) => {
+    const chatIds = new Set();
+
+    try {
+        const lg = await clientOrPool.query(
+            `
+            SELECT lg.chat_id
+            FROM public.linked_groups lg
+            INNER JOIN public.users u ON u.id = lg.user_id
+            WHERE u.site_login = $1
+            `,
+            [siteLogin]
+        );
+        for (const row of lg.rows) {
+            if (row.chat_id != null && String(row.chat_id).trim() !== '') {
+                chatIds.add(String(row.chat_id).trim());
+            }
+        }
+    } catch (lgErr) {
+        console.warn('[Telegram] linked_groups o\'qib bo\'lmadi:', lgErr.message);
+    }
+
+    try {
+        const u = await clientOrPool.query(
+            `
+            SELECT linked_group_chat_id
+            FROM public.users
+            WHERE site_login = $1
+            LIMIT 1
+            `,
+            [siteLogin]
+        );
+        const legacy = u.rows[0]?.linked_group_chat_id;
+        if (legacy != null && String(legacy).trim() !== '') {
+            chatIds.add(String(legacy).trim());
+        }
+    } catch (colErr) {
+        console.warn('[Telegram] linked_group_chat_id o\'qib bo\'lmadi:', colErr.message);
+    }
+
+    if (chatIds.size === 0 && TELEGRAM_CHAT_ID) {
+        chatIds.add(String(TELEGRAM_CHAT_ID).trim());
+    }
+
+    return chatIds;
 };
 
 const queueTelegramNotification = async (
@@ -883,14 +938,11 @@ const queueTelegramNotification = async (
     photoUrl = null
 ) => {
     if (!siteLogin) {
-        console.warn('Telegram notification queue: site_login topilmadi.');
+        console.warn('[Telegram] queue: site_login topilmadi — o\'tkazib yuborildi');
         return;
     }
 
-    // Yuborish uchun rasm (HTTP yoki dataURL — Blob orqali)
-    // Helper funksiyalar fayl oxirida — shu yerda inline tekshiruv (xavfsiz)
     let sendPhoto = null;
-    // notifications jadvaliga FAQAT qisqa HTTP URL (base64 yozilMAYDI)
     let dbPhotoUrl = null;
 
     if (photoUrl && String(photoUrl).trim()) {
@@ -902,7 +954,6 @@ const queueTelegramNotification = async (
                 sendPhoto = raw;
                 dbPhotoUrl = raw.length <= 2048 ? raw : null;
             } else if (isData) {
-                // DataURL ni to'g'ridan-to'g'ri Telegramga yuboramiz (Blob)
                 sendPhoto = raw;
                 const hasSb =
                     !!(
@@ -931,7 +982,6 @@ const queueTelegramNotification = async (
             }
         } catch (imgErr) {
             console.error('[Telegram queue] Rasmni qayta ishlash xatosi:', imgErr.message);
-            // Rasm ishlamasa ham matn yuboriladi
             sendPhoto = null;
             dbPhotoUrl = null;
         }
@@ -939,10 +989,11 @@ const queueTelegramNotification = async (
 
     const hasPhoto = !!sendPhoto;
 
-    // 1) Navbatga yozish (backup) — faqat qisqa URL yoki null
+    // 1) Navbatga yozish (backup)
     let inserted = false;
+    let insertedId = null;
     try {
-        await clientOrPool.query(
+        const ins = await clientOrPool.query(
             `
             INSERT INTO public.notifications
             (
@@ -953,16 +1004,18 @@ const queueTelegramNotification = async (
             )
             VALUES
             ($1, $2, false, $3)
+            RETURNING id
             `,
             [siteLogin, message, dbPhotoUrl]
         );
         inserted = true;
+        insertedId = ins.rows[0]?.id ?? null;
     } catch (err) {
         console.error('[Telegram queue] INSERT xato:', err.message);
     }
 
     console.log(
-        `[Telegram queue] site=${siteLogin} photo=${hasPhoto ? 'YES' : 'NO'}`
+        `[Telegram queue] site=${siteLogin} photo=${hasPhoto ? 'YES' : 'NO'} notif_id=${insertedId ?? 'n/a'}`
     );
 
     // 2) To'g'ridan-to'g'ri Telegramga yuborish
@@ -974,49 +1027,13 @@ const queueTelegramNotification = async (
     }
 
     try {
-        const chatIds = new Set();
-
-        try {
-            const lg = await clientOrPool.query(
-                `
-                SELECT lg.chat_id
-                FROM public.linked_groups lg
-                INNER JOIN public.users u ON u.id = lg.user_id
-                WHERE u.site_login = $1
-                `,
-                [siteLogin]
-            );
-            for (const row of lg.rows) {
-                if (row.chat_id) chatIds.add(String(row.chat_id));
-            }
-        } catch (lgErr) {
-            console.warn('[Telegram] linked_groups o\'qib bo\'lmadi:', lgErr.message);
-        }
-
-        try {
-            const u = await clientOrPool.query(
-                `
-                SELECT linked_group_chat_id
-                FROM public.users
-                WHERE site_login = $1
-                LIMIT 1
-                `,
-                [siteLogin]
-            );
-            const legacy = u.rows[0]?.linked_group_chat_id;
-            if (legacy) chatIds.add(String(legacy));
-        } catch (colErr) {
-            console.warn('[Telegram] linked_group_chat_id o\'qib bo\'lmadi:', colErr.message);
-        }
-
-        if (chatIds.size === 0 && TELEGRAM_CHAT_ID) {
-            chatIds.add(String(TELEGRAM_CHAT_ID));
-        }
+        const chatIds = await resolveTelegramChatIds(clientOrPool, siteLogin);
 
         if (chatIds.size === 0) {
             console.warn(
                 `[Telegram] chat_id topilmadi (site=${siteLogin}). ` +
-                `Guruhni bot orqali bog'lang yoki TELEGRAM_CHAT_ID env qo'ying.`
+                `users.linked_group_chat_id yoki linked_groups ga guruh chat_id yozing ` +
+                `(masalan -100xxxxxxxxxx) yoki TELEGRAM_CHAT_ID env qo'ying.`
             );
             return;
         }
@@ -1024,41 +1041,129 @@ const queueTelegramNotification = async (
         let anyOk = false;
         for (const chatId of chatIds) {
             try {
+                console.log(`[Telegram] Sending notification to group: ${chatId}`);
                 await sendTelegramNow(chatId, message, sendPhoto);
                 console.log(`[Telegram] YUBORILDI chat=${chatId} photo=${hasPhoto}`);
                 anyOk = true;
             } catch (sendErr) {
-                console.error(`[Telegram] chat=${chatId} yuborish xatosi:`, sendErr.message);
-                // Oxirgi urinish: faqat matn
+                console.error(
+                    `[Telegram] Failed to send notification: ${sendErr.message} (chat=${chatId})`
+                );
                 try {
                     await sendTelegramTextOnly(chatId, message);
                     console.log(`[Telegram] MATN YUBORILDI (fallback) chat=${chatId}`);
                     anyOk = true;
                 } catch (textErr) {
-                    console.error(`[Telegram] matn ham yuborilmadi chat=${chatId}:`, textErr.message);
+                    console.error(
+                        `[Telegram] Failed to send notification: ${textErr.message} (chat=${chatId}, text-fallback)`
+                    );
                 }
             }
         }
 
         if (anyOk && inserted) {
             try {
-                await clientOrPool.query(
-                    `
-                    UPDATE public.notifications
-                    SET is_sent = true
-                    WHERE id = (
-                        SELECT id FROM public.notifications
-                        WHERE site_login = $1 AND is_sent = false
-                        ORDER BY id DESC
-                        LIMIT 1
-                    )
-                    `,
-                    [siteLogin]
-                );
-            } catch (e) { /* ignore */ }
+                if (insertedId != null) {
+                    await clientOrPool.query(
+                        `UPDATE public.notifications SET is_sent = true WHERE id = $1`,
+                        [insertedId]
+                    );
+                } else {
+                    await clientOrPool.query(
+                        `
+                        UPDATE public.notifications
+                        SET is_sent = true
+                        WHERE id = (
+                            SELECT id FROM public.notifications
+                            WHERE site_login = $1 AND is_sent = false
+                            ORDER BY id DESC
+                            LIMIT 1
+                        )
+                        `,
+                        [siteLogin]
+                    );
+                }
+            } catch (e) {
+                console.warn('[Telegram] is_sent yangilanmadi:', e.message);
+            }
         }
     } catch (err) {
         console.error('[Telegram] Yuborish xatosi:', err.message);
+    }
+};
+
+/**
+ * is_sent=false bo'lgan notificationlarni qayta yuborish (startup + interval).
+ * Transaction/API oqimini buzmaydi — faqat pool orqali.
+ */
+const processUnsentNotifications = async () => {
+    if (!TELEGRAM_BOT_TOKEN) return;
+
+    try {
+        const rows = await pool.query(
+            `
+            SELECT id, site_login, message, photo_url
+            FROM public.notifications
+            WHERE is_sent = false
+              AND created_at >= NOW() - INTERVAL '7 days'
+            ORDER BY id ASC
+            LIMIT 50
+            `
+        );
+
+        if (!rows.rows.length) return;
+
+        console.log(`[Telegram] Unsent qayta ishlanmoqda: ${rows.rows.length} ta`);
+
+        for (const row of rows.rows) {
+            const siteLogin = row.site_login;
+            if (!siteLogin) continue;
+
+            const chatIds = await resolveTelegramChatIds(pool, siteLogin);
+            if (chatIds.size === 0) {
+                console.warn(
+                    `[Telegram] Unsent skip id=${row.id}: chat_id yo'q (site=${siteLogin})`
+                );
+                continue;
+            }
+
+            let anyOk = false;
+            for (const chatId of chatIds) {
+                try {
+                    console.log(
+                        `[Telegram] Sending notification to group: ${chatId} (unsent id=${row.id})`
+                    );
+                    await sendTelegramNow(chatId, row.message, row.photo_url || null);
+                    anyOk = true;
+                } catch (sendErr) {
+                    console.error(
+                        `[Telegram] Failed to send notification: ${sendErr.message} (unsent id=${row.id}, chat=${chatId})`
+                    );
+                    try {
+                        await sendTelegramTextOnly(chatId, row.message);
+                        anyOk = true;
+                    } catch (textErr) {
+                        console.error(
+                            `[Telegram] Failed to send notification: ${textErr.message} (unsent id=${row.id}, text-fallback)`
+                        );
+                    }
+                }
+            }
+
+            if (anyOk) {
+                try {
+                    await pool.query(
+                        `UPDATE public.notifications SET is_sent = true WHERE id = $1`,
+                        [row.id]
+                    );
+                    console.log(`[Telegram] Unsent yuborildi id=${row.id}`);
+                } catch (e) {
+                    console.warn('[Telegram] Unsent is_sent yangilanmadi:', e.message);
+                }
+            }
+        }
+    } catch (err) {
+        console.error('[Telegram] processUnsentNotifications xato:', err.message);
     }
 };
 
@@ -7177,6 +7282,19 @@ if (process.env.VERCEL) {
                 );
             }
         });
+
+        // Unsent notificationlarni startupda va har 2 daqiqada qayta yuborish
+        setTimeout(() => {
+            processUnsentNotifications().catch((e) =>
+                console.error('[Telegram] startup unsent xato:', e.message)
+            );
+        }, 5000);
+
+        setInterval(() => {
+            processUnsentNotifications().catch((e) =>
+                console.error('[Telegram] interval unsent xato:', e.message)
+            );
+        }, 2 * 60 * 1000);
 
         server.on('error', (err) => {
             if (err.code === 'EADDRINUSE') {
