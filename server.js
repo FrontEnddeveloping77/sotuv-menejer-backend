@@ -833,37 +833,112 @@ const sendTelegramTextOnly = async (chatId, text) => {
 /**
  * Telegramga yuborish.
  * Rasm yuborib bo'lmasa HAM matn albatta yuboriladi.
+ * data:image va http(s) URL ishonchli ishlashi uchun:
+ *  - base64 → Buffer/Uint8Array + Blob
+ *  - http URL ishlamasa → server tomonida yuklab fayl sifatida yuborish
  */
 const sendTelegramNow = async (chatId, message, photoUrl = null) => {
     if (!chatId) throw new Error('chat_id yo\'q');
     const text = String(message || '');
-    const hasPhoto = !!(photoUrl && String(photoUrl).trim());
+    const rawPhoto = photoUrl && String(photoUrl).trim() ? String(photoUrl).trim() : '';
+    const hasPhoto = !!rawPhoto;
+
+    const appendCaptionAndSend = async (form) => {
+        if (text.length <= 1024) {
+            if (text) form.append('caption', text);
+            await telegramApi('sendPhoto', form);
+        } else {
+            form.append('caption', text.slice(0, 1024));
+            await telegramApi('sendPhoto', form);
+            await sendTelegramTextOnly(chatId, text.slice(1024));
+        }
+    };
+
+    const sendPhotoFromBuffer = async (buf) => {
+        const form = new FormData();
+        form.append('chat_id', String(chatId));
+        form.append('parse_mode', 'HTML');
+        // Node FormData + Blob: Buffer o'rniga Uint8Array ishlatish ishonchliroq
+        const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+        const blob = new Blob([bytes], { type: 'image/jpeg' });
+        form.append('photo', blob, 'product.jpg');
+        await appendCaptionAndSend(form);
+    };
+
+    const sendPhotoFromUrl = async (url) => {
+        const form = new FormData();
+        form.append('chat_id', String(chatId));
+        form.append('parse_mode', 'HTML');
+        form.append('photo', url);
+        await appendCaptionAndSend(form);
+    };
 
     if (hasPhoto) {
         try {
-            const form = new FormData();
-            form.append('chat_id', String(chatId));
-            form.append('parse_mode', 'HTML');
-
-            const buf = dataUrlToBuffer(photoUrl);
-            if (buf) {
-                const blob = new Blob([buf], { type: 'image/jpeg' });
-                form.append('photo', blob, 'product.jpg');
-            } else if (String(photoUrl).startsWith('http')) {
-                form.append('photo', String(photoUrl));
-            } else {
-                await sendTelegramTextOnly(chatId, text);
+            // 1) data:image → to'g'ridan-to'g'ri fayl
+            const buf = dataUrlToBuffer(rawPhoto);
+            if (buf && buf.length > 0) {
+                // Telegram rasm limiti ~10MB; juda katta bo'lsa siqib ko'ramiz
+                let sendBuf = buf;
+                if (buf.length > 9 * 1024 * 1024 && typeof compressProductImage === 'function') {
+                    try {
+                        sendBuf = await compressProductImage(buf, {
+                            width: 1280,
+                            height: 1280,
+                            quality: 70
+                        });
+                    } catch (e) {
+                        console.warn('[Telegram] Katta rasmni siqib bo\'lmadi:', e.message);
+                    }
+                }
+                await sendPhotoFromBuffer(sendBuf);
                 return;
             }
 
-            if (text.length <= 1024) {
-                form.append('caption', text);
-                await telegramApi('sendPhoto', form);
-            } else {
-                form.append('caption', text.slice(0, 1024));
-                await telegramApi('sendPhoto', form);
-                await sendTelegramTextOnly(chatId, text.slice(1024));
+            // 2) http(s) URL — avval URL sifatida
+            if (rawPhoto.startsWith('http://') || rawPhoto.startsWith('https://')) {
+                try {
+                    await sendPhotoFromUrl(rawPhoto);
+                    return;
+                } catch (urlErr) {
+                    console.warn(
+                        '[Telegram] URL orqali rasm yuborilmadi, yuklab qayta uriniladi:',
+                        urlErr.message
+                    );
+                    // Telegram server URL ni ololmasa — o'zimiz yuklab fayl qilib yuboramiz
+                    try {
+                        const resp = await fetch(rawPhoto, {
+                            method: 'GET',
+                            headers: { Accept: 'image/*' }
+                        });
+                        if (!resp.ok) {
+                            throw new Error(`download ${resp.status}`);
+                        }
+                        const ab = await resp.arrayBuffer();
+                        let dlBuf = Buffer.from(ab);
+                        if (dlBuf.length > 9 * 1024 * 1024 && typeof compressProductImage === 'function') {
+                            try {
+                                dlBuf = await compressProductImage(dlBuf, {
+                                    width: 1280,
+                                    height: 1280,
+                                    quality: 70
+                                });
+                            } catch (e) { /* keep original */ }
+                        }
+                        await sendPhotoFromBuffer(dlBuf);
+                        return;
+                    } catch (dlErr) {
+                        console.warn(
+                            '[Telegram] Rasmni yuklab yuborib bo\'lmadi:',
+                            dlErr.message
+                        );
+                        throw urlErr;
+                    }
+                }
             }
+
+            // Noma'lum format
+            await sendTelegramTextOnly(chatId, text);
             return;
         } catch (photoErr) {
             console.warn(
@@ -951,30 +1026,43 @@ const queueTelegramNotification = async (
         const isData = raw.startsWith('data:image');
         try {
             if (isHttp) {
+                // Allaqachon public URL — to'g'ridan yuboriladi va DB ga saqlanadi
                 sendPhoto = raw;
                 dbPhotoUrl = raw.length <= 2048 ? raw : null;
             } else if (isData) {
+                // ★★★ ASOSIY TUZATISH:
+                // data:image ni HAR DOIM processProductImage orqali o'tkazamiz
+                // (Supabase bor → Storage URL; yo'q → siqilgan dataURL).
+                // Avval faqat Supabase bor bo'lganda ishlatilardi — rasm Telegramga
+                // yetib bormas edi yoki juda katta base64 tufayli yuborilmas edi.
                 sendPhoto = raw;
-                const hasSb =
-                    !!(
-                        String(process.env.SUPABASE_URL || '').trim() &&
-                        String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim()
-                    );
-                if (hasSb && typeof processProductImage === 'function') {
+                if (typeof processProductImage === 'function') {
                     try {
-                        const uploaded = await processProductImage(raw, 'telegram', {
+                        const processed = await processProductImage(raw, 'telegram', {
                             strict: false
                         });
-                        if (
-                            uploaded &&
-                            (String(uploaded).startsWith('https://') ||
-                                String(uploaded).startsWith('http://'))
-                        ) {
-                            sendPhoto = uploaded;
-                            dbPhotoUrl = uploaded;
+                        if (processed && String(processed).trim()) {
+                            const p = String(processed).trim();
+                            sendPhoto = p;
+                            if (
+                                (p.startsWith('https://') || p.startsWith('http://')) &&
+                                p.length <= 2048
+                            ) {
+                                dbPhotoUrl = p;
+                            } else if (
+                                p.startsWith('data:image') &&
+                                p.length <= FALLBACK_DATA_URL_MAX_CHARS
+                            ) {
+                                // Bot watcher ham qayta yuborishi uchun siqilgan dataURL ni
+                                // DB ga yozamiz (limit ichida)
+                                dbPhotoUrl = p;
+                            }
                         }
                     } catch (e) {
-                        console.warn('[Telegram queue] Storage upload skip:', e.message);
+                        console.warn(
+                            '[Telegram queue] Rasmni qayta ishlash skip:',
+                            e.message
+                        );
                     }
                 }
             } else {
@@ -3547,7 +3635,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
 
         if (exactQuantities.length === 0) {
             return res.status(400).json({
-                message: "Kamida bitta razmer uchun son > 0 bo‘lishi kerak!"
+                message: "Kamida bitta razmer uchun son > 0 bo'lishi kerak!"
             });
         }
     }
@@ -3573,7 +3661,6 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
     // ====================================================
     // AVVAL TOVAR MAVJUDLIGINI VA MUDDATNI TEKSHIRAMIZ —
     // shundan keyingina rasmni Storage'ga yuklaymiz
-    // (behuda yuklashning oldini olish uchun)
     // ====================================================
     const preCheck = await pool.query(
         `SELECT created_at FROM public.products WHERE user_id = $1 AND local_id = $2 LIMIT 1`,
@@ -3596,6 +3683,13 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
 
     let cleanImageUrl = null;
 
+    // ★ DIAGNOSTIKA: frontend rasm yubordimi yoki yo'qmi
+    console.log(
+        '[EDIT-DEBUG] localId=', localId,
+        '| frontenddan image_url keldimi?', typeof image_url === 'string' && !!image_url.trim(),
+        '| uzunligi:', typeof image_url === 'string' ? image_url.length : 0
+    );
+
     if (
         typeof image_url === 'string' &&
         image_url.trim()
@@ -3609,6 +3703,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
             if (cleanImageUrl) {
                 cleanImageUrl = assertSafeImageUrl(cleanImageUrl);
             }
+            console.log('[EDIT-DEBUG] processProductImage natijasi bor?', !!cleanImageUrl);
         } catch (imageError) {
             console.error(
                 'Tahrirlashda rasmni saqlash xatosi:',
@@ -3650,6 +3745,13 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
         const oldSizes = oldRes.rows
             .map((r) => `${r.size || 'Standart'}:${r.quantity || 0}`)
             .join(', ');
+
+        // ★ DIAGNOSTIKA: eski qatorlarning har birida rasm bor-yo'qligini ko'ramiz
+        console.log(
+            '[EDIT-DEBUG] eski qatorlar image_url holati:',
+            oldRes.rows.map(r => ({ id: r.id, size: r.size, hasImage: !!r.image_url }))
+        );
+
         const oldImage = oldFirst.image_url || null;
 
         // Eski qatorlarni o'chirish
@@ -3756,6 +3858,16 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
                     .map(([sz, qty]) => `${sz}: ${qty}`)
                     .join(', ');
 
+                // ★ TUZATISH: 3 ta manbadan birontasi bo'lsa ham ishlatamiz
+                const finalPhoto = cleanImageUrl || newFirst.image_url || oldImage || null;
+
+                console.log(
+                    '[EDIT-DEBUG] yakuniy yuboriladigan rasm bor?', !!finalPhoto,
+                    '| manba:', cleanImageUrl ? 'yangi (cleanImageUrl)'
+                    : newFirst.image_url ? "bazadagi yangi qator (newFirst.image_url)"
+                        : oldImage ? 'eski (oldImage)' : "HECH BIRI YO'Q"
+                );
+
                 let message =
                     `✏️ <b>TOVAR TAHRIRLANDI (#${localId})</b>\n` +
                     `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -3775,7 +3887,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
                     pool,
                     siteLogin,
                     message,
-                    cleanImageUrl || oldImage
+                    finalPhoto
                 );
             }
         } catch (tgErr) {
