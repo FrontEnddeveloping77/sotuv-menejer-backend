@@ -108,10 +108,10 @@ const JWT_SECRET =
 // ====================================================
 
 // PRODUCT_EDIT_WINDOW_DAYS olib tashlandi — tovarni istalgan vaqtda tahrirlash mumkin
-const SALE_RETURN_WINDOW_DAYS = 7;
+const SALE_RETURN_WINDOW_DAYS = 30;
 const EXPENSE_EDIT_WINDOW_DAYS = 30;
 const DEBT_PAYMENT_UNDO_WINDOW_DAYS = 30;
-const DELETED_RESTORE_WINDOW_DAYS = 7;
+const DELETED_RESTORE_WINDOW_DAYS = 30;
 
 
 const daysSince = (dateValue) => {
