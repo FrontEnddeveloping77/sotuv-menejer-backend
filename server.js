@@ -107,7 +107,7 @@ const JWT_SECRET =
 // TAHRIRLASH / VOZVRAT UCHUN MUDDATLAR
 // ====================================================
 
-const PRODUCT_EDIT_WINDOW_DAYS = 7;
+// PRODUCT_EDIT_WINDOW_DAYS olib tashlandi — tovarni istalgan vaqtda tahrirlash mumkin
 const SALE_RETURN_WINDOW_DAYS = 7;
 const EXPENSE_EDIT_WINDOW_DAYS = 30;
 const DEBT_PAYMENT_UNDO_WINDOW_DAYS = 30;
@@ -3671,11 +3671,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
         return res.status(404).json({ message: "Tovar topilmadi!" });
     }
 
-    if (daysSince(preCheck.rows[0].created_at) > PRODUCT_EDIT_WINDOW_DAYS) {
-        return res.status(403).json({
-            message: `Bu tovar qo'shilganiga ${PRODUCT_EDIT_WINDOW_DAYS} kundan ko'p vaqt o'tgan, tahrirlab bo'lmaydi!`
-        });
-    }
+    // Tahrirlash muddati cheklovi olib tashlandi — istalgan vaqtda tahrirlash mumkin
 
     // ====================================================
     // RASM — Supabase Storage yoki DB fallback (dataURL)
@@ -3734,12 +3730,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
         }
 
         const oldFirst = oldRes.rows[0];
-        if (daysSince(oldFirst.created_at) > PRODUCT_EDIT_WINDOW_DAYS) {
-            await client.query('ROLLBACK');
-            return res.status(403).json({
-                message: `Bu tovar qo'shilganiga ${PRODUCT_EDIT_WINDOW_DAYS} kundan ko'p vaqt o'tgan, tahrirlab bo'lmaydi!`
-            });
-        }
+        // Tahrirlash muddati cheklovi olib tashlandi — istalgan vaqtda tahrirlash mumkin
 
         const oldTotalQty = oldRes.rows.reduce((s, r) => s + Number(r.quantity || 0), 0);
         const oldSizes = oldRes.rows
