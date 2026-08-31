@@ -8,6 +8,22 @@ const jwt = require('jwt-simple');
 const { randomUUID } = require('crypto');
 const sharp = require('sharp');
 
+// ★★★ TRAFIK OPTIMIZATSIYASI: gzip/br compression va rate-limit
+// `npm install compression express-rate-limit` qiling (pastdagi
+// "VERCEL'DA DEPLOY QILISH" bo'limiga qarang).
+let compression;
+try {
+    compression = require('compression');
+} catch (e) {
+    console.warn('⚠️  "compression" packagei topilmadi — `npm install compression` qiling. Hozircha compression o\'chirilgan holda ishlaydi.');
+}
+let rateLimit;
+try {
+    rateLimit = require('express-rate-limit');
+} catch (e) {
+    console.warn('⚠️  "express-rate-limit" packagei topilmadi — `npm install express-rate-limit` qiling. Hozircha rate-limit o\'chirilgan holda ishlaydi.');
+}
+
 const app = express();
 
 // ====================================================
@@ -15,9 +31,65 @@ const app = express();
 // ====================================================
 
 app.use(cors());
+
+// ★★★ Response'larni gzip/br bilan siqish — Vercel Fast Origin Transfer'ni
+// (ayniqsa JSON javoblarda) sezilarli kamaytiradi. Xavfsiz, hech narsani buzmaydi.
+if (compression) {
+    app.use(compression({
+        threshold: 512, // 512 baytdan kichik javoblarni siqishga urinmaymiz (foyda yo'q)
+        filter: (req, res) => {
+            // Streaming/binary rasm javoblarini o'zimiz alohida boshqaramiz,
+            // qolgan hamma narsa (JSON) siqiladi.
+            if (req.headers['x-no-compression']) return false;
+            return compression.filter(req, res);
+        }
+    }));
+}
+
 // Rasm (base64) uchun body limit oshirilgan — telefon kamerasi rasmlari sig'ishi uchun
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
+
+// ★★★ Development/debug rejimida har bir so'rov uchun response hajmi va
+// davomiylikni o'lchash (production'da OG'IR log yaratmaslik uchun o'chirilgan,
+// faqat DEBUG_TRAFFIC=true bo'lsa yoqiladi).
+if (String(process.env.DEBUG_TRAFFIC || '').toLowerCase() === 'true') {
+    app.use((req, res, next) => {
+        const start = process.hrtime.bigint();
+        const chunks = [];
+        const originalWrite = res.write;
+        const originalEnd = res.end;
+
+        res.write = function (chunk, ...args) {
+            if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            return originalWrite.apply(res, [chunk, ...args]);
+        };
+        res.end = function (chunk, ...args) {
+            if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            const bytes = Buffer.concat(chunks).length;
+            const durMs = Number(process.hrtime.bigint() - start) / 1e6;
+            console.log(
+                `[traffic] ${req.method} ${req.originalUrl} → ${bytes}B, ${durMs.toFixed(1)}ms, status=${res.statusCode}`
+            );
+            return originalEnd.apply(res, [chunk, ...args]);
+        };
+        next();
+    });
+}
+
+// ★★★ Public (auth talab qilmaydigan) /api/bot/* endpointlar uchun rate limit —
+// botlardan keladigan haddan tashqari trafikni cheklaydi, oddiy Telegram bot
+// so'rovlariga xalaqit bermaydi (1 daqiqada 60 so'rov — bot uchun juda yetarli).
+if (rateLimit) {
+    const botApiLimiter = rateLimit({
+        windowMs: 60 * 1000,
+        max: 60,
+        standardHeaders: true,
+        legacyHeaders: false,
+        message: { message: "Juda ko'p so'rov yuborildi, birozdan keyin qayta urinib ko'ring." }
+    });
+    app.use('/api/bot/', botApiLimiter);
+}
 
 // Body juda katta bo'lsa (413) — tushunarli xabar qaytarish
 app.use((err, req, res, next) => {
@@ -2763,8 +2835,26 @@ app.get(
     authenticateToken,
     async (req, res) => {
         try {
-            const result = await pool.query(
-                `
+            const userId = req.user.userId;
+
+            // ★★★ PAGINATION (backward-compatible):
+            // Agar ?page yoki ?limit berilmasa — ESKI xatti-harakat: BARCHA
+            // mahsulotlar bitta massivda qaytariladi (frontend eski holatda
+            // ham ishlashi uchun). Agar ?page berilsa — LIMIT/OFFSET bilan
+            // sahifalab qaytaramiz va qo'shimcha `pagination` obyektini
+            // response'ga qo'shamiz (eski frontend buni shunchaki e'tiborsiz
+            // qoldiradi, hech narsa buzilmaydi).
+            const hasPaginationParams =
+                req.query.page !== undefined || req.query.limit !== undefined;
+
+            let page = parseInt(req.query.page, 10);
+            let limit = parseInt(req.query.limit, 10);
+            if (!Number.isFinite(page) || page < 1) page = 1;
+            if (!Number.isFinite(limit) || limit < 1) limit = 50;
+            if (limit > 100) limit = 100;
+            const offset = (page - 1) * limit;
+
+            const baseQuery = `
                 SELECT
                     id,
                     user_id,
@@ -2796,13 +2886,62 @@ app.get(
                     END ASC NULLS LAST,
                     size ASC NULLS LAST,
                     id ASC
-                `,
-                [req.user.userId]
-            );
+            `;
 
-            res.json({
-                products: result.rows
-            });
+            let rows;
+            let pagination = null;
+
+            if (hasPaginationParams) {
+                const result = await pool.query(
+                    `${baseQuery} LIMIT $2 OFFSET $3`,
+                    [userId, limit, offset]
+                );
+                rows = result.rows;
+
+                const countResult = await pool.query(
+                    `
+                    SELECT COUNT(*)::int AS total
+                    FROM public.products
+                    WHERE user_id = $1
+                      AND COALESCE(quantity, 0) > 0
+                    `,
+                    [userId]
+                );
+                const total = countResult.rows[0]?.total || 0;
+
+                pagination = {
+                    page,
+                    limit,
+                    total,
+                    totalPages: Math.max(1, Math.ceil(total / limit))
+                };
+            } else {
+                // Eski (pagination'siz) xatti-harakat — barcha mahsulotlar
+                const result = await pool.query(baseQuery, [userId]);
+                rows = result.rows;
+            }
+
+            // ★★★ Og'ir base64 rasmlarni har GET so'rovida to'liq yubormaymiz.
+            // - http(s) Storage URL bo'lsa — o'zgarishsiz qoldiramiz (yengil,
+            //   rasm bayti Vercel orqali emas, to'g'ridan-to'g'ri Supabase'dan
+            //   yuklanadi — Fast Origin Transfer'ga umuman ta'sir qilmaydi).
+            // - data:image bazaviy64 bo'lsa (Storage sozlanmagan/hali migratsiya
+            //   qilinmagan eski yozuv) — o'rniga yengil `/api/products/image/:id`
+            //   havolasini qaytaramiz; frontend uni oddiy <img src> sifatida
+            //   ishlata oladi (token query orqali autentifikatsiya qilinadi,
+            //   pastga qarang).
+            const products = rows.map((p) => ({
+                ...p,
+                image_url: toLightweightImageUrl(p.image_url, p.id, req)
+            }));
+
+            const responseBody = { products };
+            if (pagination) responseBody.pagination = pagination;
+
+            // Foydalanuvchiga xos (private) ma'lumot — faqat brauzerning shaxsiy
+            // keshida, qisqa muddat saqlanishi mumkin. Umumiy/CDN keshiga chiqmaydi.
+            res.set('Cache-Control', 'private, max-age=15, must-revalidate');
+            res.json(responseBody);
         } catch (err) {
             console.error(
                 'Tovarlarni olish xatosi:',
@@ -2812,6 +2951,96 @@ app.get(
                 message:
                     'Serverda xatolik yuz berdi!'
             });
+        }
+    }
+);
+
+// ====================================================
+// RASMNI KEYINROQ (LAZY) OLIB KELISH — data:base64 bo'lsa shu orqali
+// ====================================================
+// Ro'yxat/list endpointlarida katta base64'ni inline yubormaslik uchun
+// ishlatiladi. <img> tegi Authorization header yubora olmagani uchun,
+// token query parametr orqali ham qabul qilinadi (?token=...).
+const authenticateFromHeaderOrQuery = async (req, res, next) => {
+    if (!req.headers.authorization && req.query.token) {
+        req.headers.authorization = `Bearer ${req.query.token}`;
+    }
+    return authenticateToken(req, res, next);
+};
+
+/**
+ * DB'dagi image_url'ni javobga qo'yishdan oldin "yengillashtiradi":
+ * - bo'sh bo'lsa → null
+ * - http(s) URL (Supabase Storage va h.k.) → o'zgarishsiz
+ * - data:image (base64) → o'rniga shu productning lazy-image endpointi
+ */
+const toLightweightImageUrl = (imageUrl, productId, req, source = 'products') => {
+    if (!imageUrl) return null;
+    if (isHttpImageUrl(imageUrl)) return imageUrl;
+    if (isDataImageUrl(imageUrl)) {
+        const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+        const host = req.get('host');
+        return `${proto}://${host}/api/products/image/${productId}?src=${source}`;
+    }
+    return imageUrl;
+};
+
+// Ruxsat etilgan jadval manbalari (SQL injection'dan himoya — faqat shu ikkitasi)
+const IMAGE_SOURCE_TABLES = {
+    products: 'public.products',
+    deleted: 'public.deleted_products'
+};
+
+app.get(
+    '/api/products/image/:id',
+    authenticateFromHeaderOrQuery,
+    async (req, res) => {
+        try {
+            const id = Number(req.params.id);
+            if (!Number.isInteger(id) || id <= 0) {
+                return res.status(400).end();
+            }
+
+            const requestedSrc = IMAGE_SOURCE_TABLES[req.query.src] ? req.query.src : 'products';
+            // Avval so'ralgan manbadan, topilmasa — ikkinchisidan qidiramiz
+            // (masalan mahsulot o'chirilgan/qaytarilgan bo'lishi mumkin).
+            const orderedSources = requestedSrc === 'deleted'
+                ? ['deleted', 'products']
+                : ['products', 'deleted'];
+
+            let imageUrl = null;
+            for (const src of orderedSources) {
+                const table = IMAGE_SOURCE_TABLES[src];
+                const r = await pool.query(
+                    `SELECT image_url FROM ${table} WHERE id = $1 AND user_id = $2 LIMIT 1`,
+                    [id, req.user.userId]
+                );
+                if (r.rows.length && r.rows[0].image_url) {
+                    imageUrl = r.rows[0].image_url;
+                    break;
+                }
+            }
+
+            if (!imageUrl) return res.status(404).end();
+
+            if (isHttpImageUrl(imageUrl)) {
+                // Storage'da bo'lsa — brauzerni to'g'ridan-to'g'ri o'sha yerga
+                // yo'naltiramiz, Vercel orqali qayta yubormaymiz.
+                return res.redirect(302, imageUrl);
+            }
+
+            if (isDataImageUrl(imageUrl)) {
+                const buffer = dataUrlToBuffer(imageUrl);
+                if (!buffer) return res.status(404).end();
+                res.set('Content-Type', 'image/jpeg');
+                res.set('Cache-Control', 'private, max-age=604800, immutable');
+                return res.send(buffer);
+            }
+
+            return res.status(404).end();
+        } catch (err) {
+            console.error('/api/products/image xatosi:', err);
+            return res.status(500).end();
         }
     }
 );
@@ -2937,6 +3166,7 @@ app.get('/api/products/entered', authenticateToken, async (req, res) => {
         );
         const u = userStats.rows[0] || {};
 
+        res.set('Cache-Control', 'private, max-age=15, must-revalidate');
         return res.json({
             products,
             summary: {
@@ -6099,17 +6329,84 @@ app.post('/api/customer-debts/pay', authenticateToken, async (req, res) => {
 app.get('/api/products/deleted', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId;
-        const result = await pool.query(
-            `
-            SELECT *
-            FROM public.deleted_products
-            WHERE user_id = $1
-              AND deleted_at >= NOW() - ($2 || ' days')::interval
-            ORDER BY deleted_at DESC
-            `,
-            [userId, String(DELETED_RESTORE_WINDOW_DAYS)]
-        );
-        res.json({ products: result.rows });
+
+        // ★★★ SELECT * o'rniga faqat frontendga kerak bo'lgan columnlar.
+        // (deleted_products'da hozircha shu columnlardan boshqasi yo'q,
+        // lekin kelajakda jadvalga yangi column qo'shilsa ham response
+        // hajmi shishmasin deb aniq ro'yxat qilamiz.)
+        const columns = `
+            id, original_id, local_id, category, name, cost_price, color, size,
+            quantity, payment_type, supplier, paid_amount, supplier_phone,
+            selling_price, qr_token, image_url, deleted_at
+        `;
+
+        const hasPaginationParams =
+            req.query.page !== undefined || req.query.limit !== undefined;
+
+        let page = parseInt(req.query.page, 10);
+        let limit = parseInt(req.query.limit, 10);
+        if (!Number.isFinite(page) || page < 1) page = 1;
+        if (!Number.isFinite(limit) || limit < 1) limit = 50;
+        if (limit > 100) limit = 100;
+        const offset = (page - 1) * limit;
+
+        let rows;
+        let pagination = null;
+
+        if (hasPaginationParams) {
+            const result = await pool.query(
+                `
+                SELECT ${columns}
+                FROM public.deleted_products
+                WHERE user_id = $1
+                  AND deleted_at >= NOW() - ($2 || ' days')::interval
+                ORDER BY deleted_at DESC
+                LIMIT $3 OFFSET $4
+                `,
+                [userId, String(DELETED_RESTORE_WINDOW_DAYS), limit, offset]
+            );
+            rows = result.rows;
+
+            const countResult = await pool.query(
+                `
+                SELECT COUNT(*)::int AS total
+                FROM public.deleted_products
+                WHERE user_id = $1
+                  AND deleted_at >= NOW() - ($2 || ' days')::interval
+                `,
+                [userId, String(DELETED_RESTORE_WINDOW_DAYS)]
+            );
+            const total = countResult.rows[0]?.total || 0;
+            pagination = {
+                page,
+                limit,
+                total,
+                totalPages: Math.max(1, Math.ceil(total / limit))
+            };
+        } else {
+            const result = await pool.query(
+                `
+                SELECT ${columns}
+                FROM public.deleted_products
+                WHERE user_id = $1
+                  AND deleted_at >= NOW() - ($2 || ' days')::interval
+                ORDER BY deleted_at DESC
+                `,
+                [userId, String(DELETED_RESTORE_WINDOW_DAYS)]
+            );
+            rows = result.rows;
+        }
+
+        const products = rows.map((p) => ({
+            ...p,
+            image_url: toLightweightImageUrl(p.image_url, p.id, req, 'deleted')
+        }));
+
+        const responseBody = { products };
+        if (pagination) responseBody.pagination = pagination;
+
+        res.set('Cache-Control', 'private, max-age=15, must-revalidate');
+        res.json(responseBody);
     } catch (err) {
         console.error("O'chirilgan tovarlarni olish xatosi:", err);
         res.status(500).json({ message: 'Serverda xatolik yuz berdi!' });
@@ -7310,6 +7607,116 @@ const cleanupOrphanedProductImages = async () => {
         console.error('[cleanupImages] Umumiy xato:', err.message);
     }
 };
+
+// ====================================================
+// ★★★ VERCEL CRON UCHUN HISOBOT ENDPOINTI ★★★
+// ====================================================
+// MUHIM: Vercel serverless funksiyalar orasida process xotirasi (shu jumladan
+// setInterval) SAQLANMAYDI — har bir chaqiruv yangi/qayta ishlatiluvchi
+// instance bo'lishi mumkin. Shu sabab pastdagi `else` blokidagi
+// `setInterval(checkAndSendScheduledReports, ...)` Vercel'da UMUMAN
+// ishlamaydi (chunki u shart bo'yicha faqat `else` — ya'ni Vercel bo'lmagan
+// muhitda — ishga tushadi). Bu degani hozircha Vercel'da kunlik/oylik
+// hisobotlar avtomatik yuborilmayapti.
+//
+// YECHIM: Vercel Cron Jobs (vercel.json) shu endpointni kuniga bir necha
+// marta chaqiradi; biz DB'dagi `report_log` jadvali orqali "shu kun/oy uchun
+// allaqachon yuborilganmi" tekshirib, DUBLIKAT xabar yubormaymiz.
+//
+// vercel.json'ga qo'shing:
+// {
+//   "crons": [{ "path": "/api/cron/reports", "schedule": "*/15 * * * *" }]
+// }
+// (Har 15 daqiqada tekshiradi, lekin haqiqiy hisobot faqat kerakli vaqtda —
+// kun/oy oxirida — va faqat BIR MARTA yuboriladi.)
+//
+// Xavfsizlik: CRON_SECRET env qo'yilsa, faqat shu secret bilan kelgan
+// so'rovlar qabul qilinadi (Vercel Cron so'rovlariga avtomatik
+// Authorization: Bearer <CRON_SECRET> header qo'shiladi).
+const ensureReportLogTable = async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS public.report_log (
+                id SERIAL PRIMARY KEY,
+                report_type TEXT NOT NULL,
+                period_key TEXT NOT NULL,
+                sent_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                UNIQUE(report_type, period_key)
+            );
+        `);
+    } catch (err) {
+        console.error('report_log jadvalini yaratishda xato:', err.message);
+    }
+};
+
+const runScheduledReportsOnce = async () => {
+    await ensureReportLogTable();
+
+    const now = new Date();
+    const tashkentOffset = 5 * 60;
+    const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+    const tashkent = new Date(utc + (tashkentOffset * 60000));
+
+    const hours = tashkent.getHours();
+    const dateStr = tashkent.toISOString().slice(0, 10);
+    const monthStr = dateStr.slice(0, 7);
+    const sentTypes = [];
+
+    // Kunlik hisobot — kunning oxirgi soatida (23:00 dan keyin), kuniga 1 marta
+    if (hours === 23) {
+        const inserted = await pool.query(
+            `INSERT INTO public.report_log (report_type, period_key)
+             VALUES ('daily', $1)
+             ON CONFLICT (report_type, period_key) DO NOTHING
+             RETURNING id`,
+            [dateStr]
+        );
+        if (inserted.rows.length > 0) {
+            console.log('[CRON] Kunlik hisobot yuborilmoqda...', dateStr);
+            await sendReportToAllUsers('daily');
+            sentTypes.push('daily');
+        }
+    }
+
+    // Oylik hisobot — oyning oxirgi kuni, 23:00 dan keyin, oyiga 1 marta
+    const tomorrow = new Date(tashkent);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const isLastDayOfMonth = tomorrow.getDate() === 1;
+
+    if (isLastDayOfMonth && hours === 23) {
+        const inserted = await pool.query(
+            `INSERT INTO public.report_log (report_type, period_key)
+             VALUES ('monthly', $1)
+             ON CONFLICT (report_type, period_key) DO NOTHING
+             RETURNING id`,
+            [monthStr]
+        );
+        if (inserted.rows.length > 0) {
+            console.log('[CRON] Oylik hisobot yuborilmoqda...', monthStr);
+            await sendReportToAllUsers('monthly');
+            sentTypes.push('monthly');
+        }
+    }
+
+    return sentTypes;
+};
+
+app.get('/api/cron/reports', async (req, res) => {
+    const cronSecret = process.env.CRON_SECRET;
+    if (cronSecret) {
+        const authHeader = req.headers.authorization || '';
+        if (authHeader !== `Bearer ${cronSecret}`) {
+            return res.status(401).json({ message: 'Unauthorized' });
+        }
+    }
+    try {
+        const sent = await runScheduledReportsOnce();
+        res.json({ ok: true, sent });
+    } catch (err) {
+        console.error('[CRON] /api/cron/reports xatosi:', err);
+        res.status(500).json({ ok: false, message: 'Serverda xatolik yuz berdi!' });
+    }
+});
 
 // ====================================================
 // SERVER ISHGA TUSHIRISH
