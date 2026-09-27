@@ -3631,21 +3631,64 @@ app.post(
             const groupsResult = await client.query(
                 `
                 SELECT
-                    local_id,
-                    MAX(name) AS name,
-                    SUM(cost_price * quantity) AS total_cost,
-                    MAX(COALESCE(paid_amount, 0)) AS total_paid,
+                    p.local_id,
+                    MAX(p.name) AS name,
+                    (
+                        COALESCE((
+                            SELECT SUM(p2.quantity * p2.cost_price)
+                            FROM public.products p2
+                            WHERE p2.user_id = p.user_id AND p2.local_id = p.local_id
+                        ), 0)
+                        +
+                        COALESCE((
+                            SELECT SUM(s.quantity * s.cost_price)
+                            FROM public.sales s
+                            WHERE s.user_id = p.user_id
+                              AND s.local_id = p.local_id
+                              AND COALESCE(s.returned, false) = false
+                        ), 0)
+                    ) AS total_cost,
+                    MAX(COALESCE(p.paid_amount, 0)) AS total_paid,
                     GREATEST(
-                        SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
+                        (
+                            COALESCE((
+                                SELECT SUM(p2.quantity * p2.cost_price)
+                                FROM public.products p2
+                                WHERE p2.user_id = p.user_id AND p2.local_id = p.local_id
+                            ), 0)
+                            +
+                            COALESCE((
+                                SELECT SUM(s.quantity * s.cost_price)
+                                FROM public.sales s
+                                WHERE s.user_id = p.user_id
+                                  AND s.local_id = p.local_id
+                                  AND COALESCE(s.returned, false) = false
+                            ), 0)
+                        ) - MAX(COALESCE(p.paid_amount, 0)),
                         0
                     ) AS debt
-                FROM public.products
-                WHERE user_id = $1
-                  AND payment_type = 'credit'
-                  AND supplier = $2
-                GROUP BY local_id
-                HAVING SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)) > 0
-                ORDER BY local_id ASC
+                FROM public.products p
+                WHERE p.user_id = $1
+                  AND p.payment_type = 'credit'
+                  AND p.supplier = $2
+                GROUP BY p.user_id, p.local_id
+                HAVING
+                    (
+                        COALESCE((
+                            SELECT SUM(p2.quantity * p2.cost_price)
+                            FROM public.products p2
+                            WHERE p2.user_id = p.user_id AND p2.local_id = p.local_id
+                        ), 0)
+                        +
+                        COALESCE((
+                            SELECT SUM(s.quantity * s.cost_price)
+                            FROM public.sales s
+                            WHERE s.user_id = p.user_id
+                              AND s.local_id = p.local_id
+                              AND COALESCE(s.returned, false) = false
+                        ), 0)
+                    ) - MAX(COALESCE(p.paid_amount, 0)) > 0
+                ORDER BY p.local_id ASC
                 `,
                 [userId, cleanSupplier]
             );
@@ -3702,18 +3745,33 @@ app.post(
 
             const remainingDebtResult = await client.query(
                 `
-                SELECT COALESCE(SUM(debt), 0) AS remaining
+                SELECT COALESCE(SUM(local_debt), 0) AS remaining
                 FROM (
                     SELECT
+                        p.local_id,
                         GREATEST(
-                            SUM(cost_price * quantity) - MAX(COALESCE(paid_amount, 0)),
+                            (
+                                COALESCE((
+                                    SELECT SUM(p2.quantity * p2.cost_price)
+                                    FROM public.products p2
+                                    WHERE p2.user_id = p.user_id AND p2.local_id = p.local_id
+                                ), 0)
+                                +
+                                COALESCE((
+                                    SELECT SUM(s.quantity * s.cost_price)
+                                    FROM public.sales s
+                                    WHERE s.user_id = p.user_id
+                                      AND s.local_id = p.local_id
+                                      AND COALESCE(s.returned, false) = false
+                                ), 0)
+                            ) - MAX(COALESCE(p.paid_amount, 0)),
                             0
-                        ) AS debt
-                    FROM public.products
-                    WHERE user_id = $1
-                      AND payment_type = 'credit'
-                      AND supplier = $2
-                    GROUP BY local_id
+                        ) AS local_debt
+                    FROM public.products p
+                    WHERE p.user_id = $1
+                      AND p.payment_type = 'credit'
+                      AND p.supplier = $2
+                    GROUP BY p.user_id, p.local_id
                 ) t
                 `,
                 [userId, cleanSupplier]
@@ -5501,15 +5559,48 @@ app.delete(
 app.get(
     '/api/qr/:token',
     async (req, res) => {
-        const token = typeof req.params.token === 'string'
+        const qrToken = typeof req.params.token === 'string'
             ? req.params.token.trim()
             : '';
 
-        if (!token) {
+        if (!qrToken) {
             return res.status(400).json({
                 message: "QR token kiritilmagan!"
             });
         }
+
+        // ===== JWT TEKSHIRUVI =====
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({
+                message: "QR kodni ko'rish uchun tizimga kirishingiz kerak!",
+                requireLogin: true
+            });
+        }
+        let jwtUserId;
+        try {
+            const jwtToken = authHeader.split(' ')[1];
+            const decoded = jwt.decode(jwtToken, JWT_SECRET);
+            if (!decoded || !decoded.userId) {
+                return res.status(401).json({
+                    message: "Yaroqsiz token! Qayta tizimga kiring.",
+                    requireLogin: true
+                });
+            }
+            if (decoded.exp && decoded.exp < Math.floor(Date.now() / 1000)) {
+                return res.status(401).json({
+                    message: "Sessiya muddati tugagan! Qayta tizimga kiring.",
+                    requireLogin: true
+                });
+            }
+            jwtUserId = decoded.userId;
+        } catch (jwtErr) {
+            return res.status(401).json({
+                message: "Yaroqsiz token! Qayta tizimga kiring.",
+                requireLogin: true
+            });
+        }
+        // ==========================
 
         try {
             const result = await pool.query(
@@ -5522,7 +5613,7 @@ app.get(
                 WHERE qr_token = $1
                 LIMIT 1
                 `,
-                [token]
+                [qrToken]
             );
 
             if (!result.rows.length) {
@@ -5532,6 +5623,16 @@ app.get(
             }
 
             const product = result.rows[0];
+
+            // ===== OWNER TEKSHIRUVI =====
+            if (String(product.user_id) !== String(jwtUserId)) {
+                return res.status(403).json({
+                    message: "Bu QR kod sizga tegishli emas! Faqat o'z loginингиз bilan kirishingiz mumkin.",
+                    wrongUser: true
+                });
+            }
+            // ============================
+
             const quantity = Number(product.quantity) || 0;
 
             if (quantity <= 0) {
@@ -5569,6 +5670,30 @@ app.post(
             });
         }
 
+        // ===== JWT TEKSHIRUVI =====
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({
+                message: "Sotish uchun tizimga kirishingiz kerak!",
+                requireLogin: true
+            });
+        }
+        let jwtUserId;
+        try {
+            const jwtToken = authHeader.split(' ')[1];
+            const decoded = jwt.decode(jwtToken, JWT_SECRET);
+            if (!decoded || !decoded.userId) {
+                return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
+            }
+            if (decoded.exp && decoded.exp < Math.floor(Date.now() / 1000)) {
+                return res.status(401).json({ message: "Sessiya muddati tugagan!", requireLogin: true });
+            }
+            jwtUserId = decoded.userId;
+        } catch (e) {
+            return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
+        }
+        // ==========================
+
         const sellingPrice = Number(req.body?.selling_price);
         const bodyColor = typeof req.body?.color === 'string' ? req.body.color.trim() : '';
 
@@ -5602,6 +5727,17 @@ app.post(
             }
 
             const product = result.rows[0];
+
+            // ===== OWNER TEKSHIRUVI =====
+            if (String(product.user_id) !== String(jwtUserId)) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({
+                    message: "Bu QR kod sizga tegishli emas!",
+                    wrongUser: true
+                });
+            }
+            // ============================
+
             const quantity = Number(product.quantity) || 0;
 
             if (quantity <= 0) {
@@ -5760,6 +5896,30 @@ app.post(
             });
         }
 
+        // ===== JWT TEKSHIRUVI =====
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({
+                message: "O'chirish uchun tizimga kirishingiz kerak!",
+                requireLogin: true
+            });
+        }
+        let jwtUserId;
+        try {
+            const jwtToken = authHeader.split(' ')[1];
+            const decoded = jwt.decode(jwtToken, JWT_SECRET);
+            if (!decoded || !decoded.userId) {
+                return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
+            }
+            if (decoded.exp && decoded.exp < Math.floor(Date.now() / 1000)) {
+                return res.status(401).json({ message: "Sessiya muddati tugagan!", requireLogin: true });
+            }
+            jwtUserId = decoded.userId;
+        } catch (e) {
+            return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
+        }
+        // ==========================
+
         const client = await pool.connect();
 
         try {
@@ -5784,6 +5944,16 @@ app.post(
             }
 
             const product = result.rows[0];
+
+            // ===== OWNER TEKSHIRUVI =====
+            if (String(product.user_id) !== String(jwtUserId)) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({
+                    message: "Bu QR kod sizga tegishli emas!",
+                    wrongUser: true
+                });
+            }
+            // ============================
 
             // Init alohida connection orqali (client transaction abort bo'lmasin)
             try {
@@ -5915,6 +6085,30 @@ app.post(
             });
         }
 
+        // ===== JWT TEKSHIRUVI =====
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({
+                message: "Nasiyaga sotish uchun tizimga kirishingiz kerak!",
+                requireLogin: true
+            });
+        }
+        let jwtUserId;
+        try {
+            const jwtToken = authHeader.split(' ')[1];
+            const decoded = jwt.decode(jwtToken, JWT_SECRET);
+            if (!decoded || !decoded.userId) {
+                return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
+            }
+            if (decoded.exp && decoded.exp < Math.floor(Date.now() / 1000)) {
+                return res.status(401).json({ message: "Sessiya muddati tugagan!", requireLogin: true });
+            }
+            jwtUserId = decoded.userId;
+        } catch (e) {
+            return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
+        }
+        // ==========================
+
         const client = await pool.connect();
 
         try {
@@ -5939,6 +6133,17 @@ app.post(
             }
 
             const product = result.rows[0];
+
+            // ===== OWNER TEKSHIRUVI =====
+            if (String(product.user_id) !== String(jwtUserId)) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({
+                    message: "Bu QR kod sizga tegishli emas!",
+                    wrongUser: true
+                });
+            }
+            // ============================
+
             const quantity = Number(product.quantity) || 0;
 
             if (quantity <= 0) {
