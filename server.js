@@ -5578,6 +5578,7 @@ app.get(
             });
         }
         let jwtUserId;
+        let jwtTelegramId;
         try {
             const jwtToken = authHeader.split(' ')[1];
             const decoded = jwt.decode(jwtToken, JWT_SECRET);
@@ -5594,6 +5595,7 @@ app.get(
                 });
             }
             jwtUserId = decoded.userId;
+            jwtTelegramId = decoded.telegramId;
         } catch (jwtErr) {
             return res.status(401).json({
                 message: "Yaroqsiz token! Qayta tizimga kiring.",
@@ -5610,7 +5612,7 @@ app.get(
                     cost_price, quantity, qr_token, qr_created_at, created_at,
                     image_url, selling_price, supplier, supplier_phone
                 FROM public.products
-                WHERE qr_token = $1
+                WHERE qr_token::text = $1
                 LIMIT 1
                 `,
                 [qrToken]
@@ -5625,9 +5627,13 @@ app.get(
             const product = result.rows[0];
 
             // ===== OWNER TEKSHIRUVI =====
-            if (String(product.user_id) !== String(jwtUserId)) {
+            const isOwner =
+                String(product.user_id) === String(jwtUserId) ||
+                (jwtTelegramId && String(product.user_id) === String(jwtTelegramId));
+
+            if (!isOwner) {
                 return res.status(403).json({
-                    message: "Bu QR kod sizga tegishli emas! Faqat o'z loginингиз bilan kirishingiz mumkin.",
+                    message: "Bu QR kod sizga tegishli emas! Faqat o'z loginingiz bilan kirishingiz mumkin.",
                     wrongUser: true
                 });
             }
@@ -5679,6 +5685,7 @@ app.post(
             });
         }
         let jwtUserId;
+        let jwtTelegramId;
         try {
             const jwtToken = authHeader.split(' ')[1];
             const decoded = jwt.decode(jwtToken, JWT_SECRET);
@@ -5689,6 +5696,7 @@ app.post(
                 return res.status(401).json({ message: "Sessiya muddati tugagan!", requireLogin: true });
             }
             jwtUserId = decoded.userId;
+            jwtTelegramId = decoded.telegramId;
         } catch (e) {
             return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
         }
@@ -5712,7 +5720,7 @@ app.post(
                 `
                 SELECT *
                 FROM public.products
-                WHERE qr_token = $1
+                WHERE qr_token::text = $1
                 LIMIT 1
                 FOR UPDATE
                 `,
@@ -5729,7 +5737,11 @@ app.post(
             const product = result.rows[0];
 
             // ===== OWNER TEKSHIRUVI =====
-            if (String(product.user_id) !== String(jwtUserId)) {
+            const isOwner =
+                String(product.user_id) === String(jwtUserId) ||
+                (jwtTelegramId && String(product.user_id) === String(jwtTelegramId));
+
+            if (!isOwner) {
                 await client.query('ROLLBACK');
                 return res.status(403).json({
                     message: "Bu QR kod sizga tegishli emas!",
@@ -5905,6 +5917,7 @@ app.post(
             });
         }
         let jwtUserId;
+        let jwtTelegramId;
         try {
             const jwtToken = authHeader.split(' ')[1];
             const decoded = jwt.decode(jwtToken, JWT_SECRET);
@@ -5915,6 +5928,7 @@ app.post(
                 return res.status(401).json({ message: "Sessiya muddati tugagan!", requireLogin: true });
             }
             jwtUserId = decoded.userId;
+            jwtTelegramId = decoded.telegramId;
         } catch (e) {
             return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
         }
@@ -5929,7 +5943,7 @@ app.post(
                 `
                 SELECT *
                 FROM public.products
-                WHERE qr_token = $1
+                WHERE qr_token::text = $1
                 LIMIT 1
                 FOR UPDATE
                 `,
@@ -5946,7 +5960,11 @@ app.post(
             const product = result.rows[0];
 
             // ===== OWNER TEKSHIRUVI =====
-            if (String(product.user_id) !== String(jwtUserId)) {
+            const isOwner =
+                String(product.user_id) === String(jwtUserId) ||
+                (jwtTelegramId && String(product.user_id) === String(jwtTelegramId));
+
+            if (!isOwner) {
                 await client.query('ROLLBACK');
                 return res.status(403).json({
                     message: "Bu QR kod sizga tegishli emas!",
@@ -6094,6 +6112,7 @@ app.post(
             });
         }
         let jwtUserId;
+        let jwtTelegramId;
         try {
             const jwtToken = authHeader.split(' ')[1];
             const decoded = jwt.decode(jwtToken, JWT_SECRET);
@@ -6104,6 +6123,7 @@ app.post(
                 return res.status(401).json({ message: "Sessiya muddati tugagan!", requireLogin: true });
             }
             jwtUserId = decoded.userId;
+            jwtTelegramId = decoded.telegramId;
         } catch (e) {
             return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
         }
@@ -6118,7 +6138,7 @@ app.post(
                 `
                 SELECT *
                 FROM public.products
-                WHERE qr_token = $1
+                WHERE qr_token::text = $1
                 LIMIT 1
                 FOR UPDATE
                 `,
@@ -6135,7 +6155,11 @@ app.post(
             const product = result.rows[0];
 
             // ===== OWNER TEKSHIRUVI =====
-            if (String(product.user_id) !== String(jwtUserId)) {
+            const isOwner =
+                String(product.user_id) === String(jwtUserId) ||
+                (jwtTelegramId && String(product.user_id) === String(jwtTelegramId));
+
+            if (!isOwner) {
                 await client.query('ROLLBACK');
                 return res.status(403).json({
                     message: "Bu QR kod sizga tegishli emas!",
