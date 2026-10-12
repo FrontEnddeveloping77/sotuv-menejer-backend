@@ -5817,6 +5817,16 @@ VALUES
                 );
             }
 
+            // Ushbu local_id bo'yicha barcha qatorlarning jami qoldig'ini hisoblash
+            const totalRemainingResult = await client.query(
+                `SELECT COALESCE(SUM(quantity), 0) AS total_remaining
+                 FROM public.products
+                 WHERE user_id = $1
+                   AND local_id = $2`,
+                [product.user_id, product.local_id]
+            );
+            const totalRemaining = Number(totalRemainingResult.rows[0]?.total_remaining) || 0;
+
             const userResult = await client.query(
                 `SELECT site_login FROM public.users WHERE id = $1`,
                 [product.user_id]
@@ -5826,14 +5836,16 @@ VALUES
             let message =
                 `💰 <b>QR ORQALI SOTUV</b>\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
+                `🆔 <b>Tovar ID:</b> ${telegramEscape(product.local_id)}\n` +
                 `📦 <b>Tovar:</b> ${telegramEscape(product.name)}\n` +
+                `🗂 <b>Kategoriya:</b> ${telegramEscape(product.category || "Ko'rsatilmagan")}\n` +
                 `📏 <b>Razmer:</b> ${telegramEscape(product.size || 'Standart')}\n` +
                 (saleColor ? `🎨 <b>Rang:</b> ${telegramEscape(saleColor)}\n` : '') +
                 `🔢 <b>Soni:</b> 1 dona\n` +
                 `💵 <b>Sotuv:</b> ${formatSum(sellingPrice)} so'm\n` +
                 `💳 <b>Tannarx:</b> ${formatSum(cost)} so'm\n` +
                 `${profit >= 0 ? '📈' : '📉'} <b>${profit >= 0 ? 'Foyda' : 'Ziyon'}:</b> ${formatSum(Math.abs(profit))} so'm\n` +
-                `📦 <b>Qoldiq:</b> ${newQty} dona\n` +
+                `📦 <b>Qoldiq:</b> ${totalRemaining} dona\n` +
                 (product.supplier
                     ? `👤 <b>Kimdan olingan:</b> ${telegramEscape(String(product.supplier).trim())}\n`
                     : '') +
@@ -5843,6 +5855,9 @@ VALUES
 
             if (newQty === 0) {
                 message += `\n🗑 <b>Bu razmer ombordan tugadi.</b>`;
+            }
+            if (totalRemaining === 0 && newQty > 0) {
+                message += `\n🗑 <b>Bu tovar ombordan tugadi.</b>`;
             }
 
             message += await getTodayReport(client, product.user_id);
@@ -5862,6 +5877,8 @@ VALUES
 
             return res.json({
                 success: true,
+                product_id: product.id,
+                category: product.category,
                 product: {
                     id: product.id,
                     local_id: product.local_id,
@@ -6229,6 +6246,16 @@ app.post(
                 );
             }
 
+            // Ushbu local_id bo'yicha barcha qatorlarning jami qoldig'ini hisoblash
+            const totalRemainingResultN = await client.query(
+                `SELECT COALESCE(SUM(quantity), 0) AS total_remaining
+                 FROM public.products
+                 WHERE user_id = $1
+                   AND local_id = $2`,
+                [product.user_id, product.local_id]
+            );
+            const totalRemainingN = Number(totalRemainingResultN.rows[0]?.total_remaining) || 0;
+
             const userResult = await client.query(
                 `SELECT site_login FROM public.users WHERE id = $1`,
                 [product.user_id]
@@ -6238,7 +6265,9 @@ app.post(
             let message =
                 `🛒 <b>QR ORQALI NASIYAGA SOTILDI</b>\n` +
                 `━━━━━━━━━━━━━━━━━━━━\n` +
+                `🆔 <b>Tovar ID:</b> ${telegramEscape(product.local_id)}\n` +
                 `📦 <b>Tovar:</b> ${telegramEscape(product.name)}\n` +
+                `🗂 <b>Kategoriya:</b> ${telegramEscape(product.category || "Ko'rsatilmagan")}\n` +
                 `📏 <b>Razmer:</b> ${telegramEscape(product.size || 'Standart')}\n` +
                 (saleColor ? `🎨 <b>Rang:</b> ${telegramEscape(saleColor)}\n` : '') +
                 `👤 <b>Mijoz:</b> ${telegramEscape(cleanCustomerName)}\n` +
@@ -6249,10 +6278,13 @@ app.post(
                 `📉 <b>Qolgan qarz (mijoz):</b> ${formatSum(remainingDebt)} so'm\n` +
                 `💳 <b>Tannarx:</b> ${formatSum(cost)} so'm\n` +
                 `${profit >= 0 ? '📈' : '📉'} <b>${profit >= 0 ? 'Foyda' : 'Ziyon'}:</b> ${formatSum(Math.abs(profit))} so'm\n` +
-                `📦 <b>Qoldiq:</b> ${newQty} dona`;
+                `📦 <b>Qoldiq:</b> ${totalRemainingN} dona`;
 
             if (newQty === 0) {
                 message += `\n🗑 <b>Bu razmer ombordan tugadi.</b>`;
+            }
+            if (totalRemainingN === 0 && newQty > 0) {
+                message += `\n🗑 <b>Bu tovar ombordan tugadi.</b>`;
             }
 
             message += await getTodayReport(client, product.user_id);
@@ -6272,6 +6304,8 @@ app.post(
 
             return res.json({
                 success: true,
+                product_id: product.id,
+                category: product.category,
                 product: {
                     id: product.id,
                     local_id: product.local_id,
