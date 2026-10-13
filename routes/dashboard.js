@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const axios = require('axios');
+const { formatDateTimeInTimeZone } = require('../lib/time');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
@@ -16,7 +17,7 @@ const sendTelegramNotification = async (chatId, saleData) => {
 💰 **Sotuv narxi:** ${Number(saleData.sale_price).toLocaleString('uz-UZ')} so'm
 💵 **Jami summa:** ${Number(saleData.total_amount).toLocaleString('uz-UZ')} so'm
 📈 **Foyda:** ${Number(saleData.profit).toLocaleString('uz-UZ')} so'm
-⏰ **Vaqt:** ${new Date().toLocaleString('uz-UZ')}`;
+⏰ **Vaqt:** ${formatDateTimeInTimeZone(new Date())}`;
 
     try {
         await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {

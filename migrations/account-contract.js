@@ -49,6 +49,11 @@ const migrateAccountContract = async (pool) => {
         `);
 
         await client.query(`
+            ALTER TABLE public.sales
+                ADD COLUMN IF NOT EXISTS returned_at TIMESTAMPTZ
+        `);
+
+        await client.query(`
             CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_event_id_unique
             ON public.notifications(event_id)
             WHERE event_id IS NOT NULL

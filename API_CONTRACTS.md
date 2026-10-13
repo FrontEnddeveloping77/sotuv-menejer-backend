@@ -75,6 +75,10 @@ Content-Type: application/json
 
 The backend transaction removes rows with the account's `user_id` from public user-owned tables, deletes login-linked notifications/payment requests when present, then deletes the user. Repeating the call succeeds. The endpoint does not make the bot's separate database part of this transaction; the bot must finish its own cleanup independently.
 
+## Timestamps
+
+The backend DB connection timezone is UTC. Existing PostgreSQL `TIMESTAMP WITHOUT TIME ZONE` values are treated as UTC instants when parsed; frontend displays use the device's local timezone. The frontend sends its IANA zone in `X-Time-Zone`; return and expense Telegram timestamps use that zone when provided. New return events store a timezone-aware `sales.returned_at`, returned by `POST /api/sales/:saleId/return` and `GET /api/sales`.
+
 ## Authentication and deployment
 
 Set a long random `BOT_API_TOKEN` in both the backend environment and the bot's HTTP client configuration before calling the new pricing, activation, or deletion endpoints. Missing backend configuration returns `503`; invalid credentials return `401`. Existing `/api/bot/*` read endpoints predate this token and currently rely only on rate limiting, so adding the header to them is a separate bot integration/security migration. No website/APK URL should be added to Telegram notification text or buttons.

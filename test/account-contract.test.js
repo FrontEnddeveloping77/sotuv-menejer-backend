@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const bcrypt = require('bcryptjs');
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
 const {
     calculateProductPrice,
     calculateProfitPrice,
@@ -10,6 +10,10 @@ const {
     parseTimezoneAwareDate,
     verifyBcryptPassword
 } = require('../lib/account-contract');
+const {
+    formatDateTimeInTimeZone,
+    parseUtcTimestamp
+} = require('../lib/time');
 
 test('active account accepts its bcrypt password', async () => {
     const passwordHash = await bcrypt.hash('secure password', 4);
@@ -55,6 +59,27 @@ test('a saved sale row always maps to the same notification event ID', () => {
     assert.equal(createSaleEventId(42), 'sale:42');
     assert.equal(createSaleEventId('42'), createSaleEventId(42));
     assert.throws(() => createSaleEventId(0), TypeError);
+});
+
+test('UTC and PostgreSQL timestamps render consistently in a selected timezone', () => {
+    const utc = '2026-10-13T10:00:00Z';
+    const postgresTimestamp = '2026-10-13 10:00:00';
+    assert.equal(
+        formatDateTimeInTimeZone(utc, 'America/Los_Angeles'),
+        formatDateTimeInTimeZone(postgresTimestamp, 'America/Los_Angeles')
+    );
+    assert.match(formatDateTimeInTimeZone(utc, 'America/Los_Angeles'), /03:00:00/);
+    assert.equal(parseUtcTimestamp('invalid'), null);
+});
+
+test('PostgreSQL timestamps without timezone stay raw until UTC normalization', () => {
+    types.setTypeParser(1114, (value) => value);
+    const raw = types.getTypeParser(1114)('2026-10-13 10:00:00');
+    assert.equal(raw, '2026-10-13 10:00:00');
+    assert.equal(
+        formatDateTimeInTimeZone(raw, 'America/Los_Angeles'),
+        formatDateTimeInTimeZone('2026-10-13T10:00:00Z', 'America/Los_Angeles')
+    );
 });
 
 test(

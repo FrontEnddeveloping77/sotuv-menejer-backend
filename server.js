@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
 const jwt = require('jwt-simple');
 const { randomUUID, timingSafeEqual } = require('crypto');
 const sharp = require('sharp');
@@ -15,6 +15,13 @@ const {
     parseTimezoneAwareDate,
     verifyBcryptPassword
 } = require('./lib/account-contract');
+const {
+    formatDateInTimeZone,
+    formatDateTimeInTimeZone,
+    parseUtcTimestamp
+} = require('./lib/time');
+
+types.setTypeParser(1114, (value) => value);
 
 // ★★★ TRAFIK OPTIMIZATSIYASI: gzip/br compression va rate-limit
 // `npm install compression express-rate-limit` qiling (pastdagi
@@ -153,6 +160,7 @@ const databaseUrl = process.env.DATABASE_URL;
 const poolConfig = databaseUrl
     ? {
         connectionString: databaseUrl,
+        options: '-c timezone=UTC',
         ssl:
             process.env.DATABASE_SSL === 'false'
                 ? false
@@ -161,6 +169,7 @@ const poolConfig = databaseUrl
                 }
     }
     : {
+        options: '-c timezone=UTC',
         host: process.env.DB_HOST || 'localhost',
         port: Number(process.env.DB_PORT || 5432),
         database: process.env.DB_NAME || 'shop_manager',
@@ -208,6 +217,18 @@ const requireBotApiToken = (req, res, next) => {
     next();
 };
 
+const getRequestTimeZone = (req) => {
+    const timeZone = req.get('X-Time-Zone');
+    if (!timeZone) return 'UTC';
+
+    try {
+        new Intl.DateTimeFormat('en-US', { timeZone });
+        return timeZone;
+    } catch (err) {
+        throw new Error(`Invalid X-Time-Zone header: ${timeZone}`, { cause: err });
+    }
+};
+
 // ====================================================
 // TAHRIRLASH / VOZVRAT UCHUN MUDDATLAR
 // ====================================================
@@ -221,8 +242,8 @@ const DELETED_RESTORE_WINDOW_DAYS = 7;
 
 const daysSince = (dateValue) => {
     if (!dateValue) return Infinity;
-    const then = new Date(dateValue).getTime();
-    if (Number.isNaN(then)) return Infinity;
+    const then = parseUtcTimestamp(dateValue)?.getTime();
+    if (!Number.isFinite(then)) return Infinity;
     return (Date.now() - then) / (1000 * 60 * 60 * 24);
 };
 
@@ -810,7 +831,10 @@ const getMonthReport = async (clientOrPool, userId) => {
     const totalStock = Number(stockResult.rows[0].total_stock || 0);
 
     const now = new Date();
-    const monthName = now.toLocaleString('uz-UZ', { month: 'long', year: 'numeric' });
+    const monthName = new Intl.DateTimeFormat('uz-UZ', {
+        month: 'long',
+        year: 'numeric'
+    }).format(now);
 
     return (
         `📅 <b>OYLIK HISOBOT</b>\n` +
@@ -3390,7 +3414,11 @@ app.get(
                     debt: debt
                 });
 
-                if (row.last_created && (!grouped[key].last_created || new Date(row.last_created) > new Date(grouped[key].last_created))) {
+                if (
+                    row.last_created &&
+                    (!grouped[key].last_created ||
+                        parseUtcTimestamp(row.last_created) > parseUtcTimestamp(grouped[key].last_created))
+                ) {
                     grouped[key].last_created = row.last_created;
                 }
             }
@@ -4277,10 +4305,11 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
         }
 
         // Sotuvni qaytarilgan deb belgilash
-        await client.query(
-            `UPDATE public.sales SET returned = true WHERE id = $1`,
+        const returnedAtResult = await client.query(
+            `UPDATE public.sales SET returned = true, returned_at = NOW() WHERE id = $1 RETURNING returned_at`,
             [saleId]
         );
+        const returnedAt = returnedAtResult.rows[0]?.returned_at;
 
         // HAR DOIM yangi product qatori (shu razmer, shu son, yangi QR)
         const newToken = randomUUID();
@@ -4340,6 +4369,7 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
                     `📏 <b>Razmer:</b> ${telegramEscape(sale.size || 'Standart')}\n` +
                     `🔢 <b>Soni:</b> ${qtyToReturn} dona\n` +
                     `💰 <b>Qaytarilgan summa:</b> ${formatSum(qtyToReturn * Number(sale.selling_price || 0))} so'm\n` +
+                    `🕒 <b>Vaqt:</b> ${telegramEscape(formatDateTimeInTimeZone(returnedAt, getRequestTimeZone(req)))}\n` +
                     `━━━━━━━━━━━━━━━━━━━━`;
                 await queueTelegramNotification(pool, siteLogin, msg, restoredImageUrl || null);
             }
@@ -4351,7 +4381,8 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
             message: "Tovar muvaffaqiyatli qaytarildi",
             product_id: restoredProductId,
             size: sale.size || null,
-            quantity: qtyToReturn
+            quantity: qtyToReturn,
+            returned_at: returnedAt
         });
     } catch (err) {
         try { await client.query('ROLLBACK'); } catch (e) { }
@@ -5021,6 +5052,7 @@ app.get(
                     color,
                     size,
                     returned,
+                    returned_at,
                     sold_at,
                     customer_name,
                     customer_phone,
@@ -5385,9 +5417,10 @@ app.post(
             );
             const siteLogin = userResult.rows[0]?.site_login || null;
 
-            const expenseDate = expense.created_at
-                ? new Date(expense.created_at).toLocaleDateString('uz-UZ')
-                : new Date().toLocaleDateString('uz-UZ');
+            const expenseDate = formatDateInTimeZone(
+                expense.created_at || new Date(),
+                getRequestTimeZone(req)
+            );
 
             let expenseMessage =
                 `💸 <b>YANGI RASXOD QO'SHILDI</b>\n` +
