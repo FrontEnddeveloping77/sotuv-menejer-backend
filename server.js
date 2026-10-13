@@ -3,10 +3,18 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
-const bcrypt = require('bcryptjs');
 const jwt = require('jwt-simple');
-const { randomUUID } = require('crypto');
+const { randomUUID, timingSafeEqual } = require('crypto');
 const sharp = require('sharp');
+const migrateAccountContract = require('./migrations/account-contract');
+const {
+    calculateProductPrice,
+    calculateProfitPrice,
+    createSaleEventId,
+    isAccountActive,
+    parseTimezoneAwareDate,
+    verifyBcryptPassword
+} = require('./lib/account-contract');
 
 // ★★★ TRAFIK OPTIMIZATSIYASI: gzip/br compression va rate-limit
 // `npm install compression express-rate-limit` qiling (pastdagi
@@ -174,6 +182,31 @@ pool.on('error', (err) => {
 
 const JWT_SECRET =
     process.env.JWT_SECRET || 'super_secret_jwt_key_123';
+
+const requireBotApiToken = (req, res, next) => {
+    const configuredToken = process.env.BOT_API_TOKEN;
+    if (!configuredToken) {
+        console.error('[Bot API] BOT_API_TOKEN sozlanmagan.');
+        return res.status(503).json({ message: 'Bot API autentifikatsiyasi sozlanmagan.' });
+    }
+
+    const authorization = req.headers.authorization || '';
+    const suppliedToken = authorization.startsWith('Bearer ')
+        ? authorization.slice(7)
+        : '';
+    const expected = Buffer.from(configuredToken);
+    const supplied = Buffer.from(suppliedToken);
+
+    if (
+        !supplied.length ||
+        expected.length !== supplied.length ||
+        !timingSafeEqual(expected, supplied)
+    ) {
+        return res.status(401).json({ message: 'Bot API tokeni yaroqsiz.' });
+    }
+
+    next();
+};
 
 // ====================================================
 // TAHRIRLASH / VOZVRAT UCHUN MUDDATLAR
@@ -1082,7 +1115,8 @@ const queueTelegramNotification = async (
     clientOrPool,
     siteLogin,
     message,
-    photoUrl = null
+    photoUrl = null,
+    event = {}
 ) => {
     if (!siteLogin) {
         console.warn('[Telegram] queue: site_login topilmadi — o\'tkazib yuborildi');
@@ -1152,6 +1186,7 @@ const queueTelegramNotification = async (
     // 1) Navbatga yozish (backup)
     let inserted = false;
     let insertedId = null;
+    let insertError = null;
     try {
         const ins = await clientOrPool.query(
             `
@@ -1160,23 +1195,63 @@ const queueTelegramNotification = async (
                 site_login,
                 message,
                 is_sent,
-                photo_url
+                photo_url,
+                event_id,
+                product_id,
+                product_category
             )
             VALUES
-            ($1, $2, false, $3)
+            ($1, $2, false, $3, $4, $5, $6)
+            ON CONFLICT (event_id)
+            WHERE event_id IS NOT NULL
+            DO NOTHING
             RETURNING id
             `,
-            [siteLogin, message, dbPhotoUrl]
+            [
+                siteLogin,
+                message,
+                dbPhotoUrl,
+                event.eventId || null,
+                event.productId || null,
+                event.productCategory || null
+            ]
         );
-        inserted = true;
+        inserted = ins.rows.length > 0;
         insertedId = ins.rows[0]?.id ?? null;
     } catch (err) {
+        insertError = err;
         console.error('[Telegram queue] INSERT xato:', err.message);
+    }
+
+    let shouldSend = inserted;
+    if (event.eventId && !inserted) {
+        try {
+            const existing = await clientOrPool.query(
+                `SELECT id, is_sent FROM public.notifications WHERE event_id = $1 LIMIT 1`,
+                [event.eventId]
+            );
+            if (!existing.rows.length) {
+                if (event.deferSend) {
+                    throw insertError || new Error('Sale notification navbatga yozilmadi.');
+                }
+                return;
+            }
+            insertedId = existing.rows[0].id;
+            if (existing.rows[0].is_sent) return { id: insertedId, inserted: false };
+            shouldSend = true;
+        } catch (err) {
+            if (event.deferSend) throw err;
+            console.error('[Telegram queue] Event holatini tekshirish xatosi:', err.message);
+            return;
+        }
     }
 
     console.log(
         `[Telegram queue] site=${siteLogin} photo=${hasPhoto ? 'YES' : 'NO'} notif_id=${insertedId ?? 'n/a'}`
     );
+
+    if (event.deferSend) return { id: insertedId, inserted };
+    if (event.eventId && !shouldSend) return;
 
     // 2) To'g'ridan-to'g'ri Telegramga yuborish
     if (!TELEGRAM_BOT_TOKEN) {
@@ -1666,6 +1741,8 @@ const ensureTables = async () => {
         );
     }
 
+    await migrateAccountContract(pool);
+
     console.log(
         '✅ Jadvallar tekshirildi/tayyorlandi (products, sales, expenses, notifications, deleted_products).'
     );
@@ -1727,7 +1804,7 @@ app.post('/api/login', async (req, res) => {
 
     try {
         const cleanLogin = String(login).trim();
-        const cleanPassword = String(password).trim();
+        const cleanPassword = String(password);
 
         const result = await pool.query(
             `
@@ -1755,47 +1832,22 @@ app.post('/api/login', async (req, res) => {
             });
         }
 
-        if (
-            user.expires_at &&
-            new Date(user.expires_at) < new Date()
-        ) {
+        if (!isAccountActive(user.is_paid, user.expires_at)) {
             return res.status(403).json({
                 message:
                     "To'lov muddati tugagan! Iltimos, obunani yangilang."
             });
         }
 
-        const dbPassword =
-            user.site_password_hash ||
-            user.site_password ||
-            user.password;
-
         let isPasswordValid = false;
-
-        if (dbPassword) {
-            const passwordString = String(dbPassword);
-
-            if (
-                passwordString.startsWith('$2a$') ||
-                passwordString.startsWith('$2b$') ||
-                passwordString.startsWith('$2y$')
-            ) {
-                try {
-                    isPasswordValid = await bcrypt.compare(
-                        cleanPassword,
-                        passwordString
-                    );
-                } catch (passwordError) {
-                    console.error(
-                        'Bcrypt tekshirish xatosi:',
-                        passwordError
-                    );
-                    isPasswordValid = false;
-                }
-            } else {
-                isPasswordValid =
-                    cleanPassword ===
-                    passwordString.trim();
+        if (user.site_password_hash) {
+            try {
+                isPasswordValid = await verifyBcryptPassword(
+                    cleanPassword,
+                    user.site_password_hash
+                );
+            } catch (passwordError) {
+                console.error('Bcrypt tekshirish xatosi:', passwordError);
             }
         }
 
@@ -1930,17 +1982,7 @@ const authenticateToken = async (
 
         const user = result.rows[0];
 
-        if (!user.is_paid) {
-            return res.status(403).json({
-                message:
-                    "To'lov muddati tugagan!"
-            });
-        }
-
-        if (
-            user.expires_at &&
-            new Date(user.expires_at) < new Date()
-        ) {
+        if (!isAccountActive(user.is_paid, user.expires_at)) {
             return res.status(403).json({
                 message:
                     "To'lov muddati tugagan!"
@@ -4188,7 +4230,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
             error: err.message || String(err)
         });
     } finally {
-        client.release();
+        if (client) client.release();
     }
 });
 
@@ -4344,10 +4386,13 @@ app.post(
             await client.query('BEGIN');
 
             const normalizedItems = [];
+            let saleEventId = null;
             let totalQty = 0;
             let totalRevenue = 0;
             let totalProfit = 0;
             let firstProductName = null;
+            let firstProductId = null;
+            let firstProductCategory = null;
             let firstLocalId = null;
             let firstImageUrl = null;
             let firstSupplier = null;
@@ -4424,7 +4469,7 @@ app.post(
                 const saleColor = itemColor || product.color || null;
 
                 // Sales insert
-                await client.query(
+                const saleInsert = await client.query(
                     `
 INSERT INTO public.sales
 (
@@ -4445,6 +4490,7 @@ VALUES
 (
     $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
 )
+RETURNING id
                     `,
                     [
                         userId,
@@ -4461,6 +4507,9 @@ VALUES
                         product.image_url || null
                     ]
                 );
+                if (saleEventId === null) {
+                    saleEventId = createSaleEventId(saleInsert.rows[0].id);
+                }
 
                 // ★★★ TUZATILGAN: quantity === 0 bo'lsa HAR DOIM aniq product.id bo'yicha DELETE
                 // payment_type ga qarab quantity=0 qoldirish YO'Q
@@ -4484,6 +4533,8 @@ VALUES
 
                 if (!firstProductName) {
                     firstProductName = product.name;
+                    firstProductId = product.id;
+                    firstProductCategory = product.category;
                     firstLocalId = product.local_id;
                     firstImageUrl = product.image_url || null;
                     firstSupplier = product.supplier || null;
@@ -4500,7 +4551,9 @@ VALUES
                     product_id: product.id,
                     qty,
                     price,
-                    color: saleColor
+                    color: saleColor,
+                    category: product.category,
+                    category: product.category
                 });
             }
 
@@ -4566,6 +4619,19 @@ VALUES
 
             sellMessage += await getTodayReport(client, userId);
 
+            await queueTelegramNotification(
+                client,
+                siteLogin,
+                sellMessage,
+                firstImageUrl,
+                {
+                    eventId: saleEventId,
+                    productId: firstProductId,
+                    productCategory: firstProductCategory,
+                    deferSend: true
+                }
+            );
+
             // Avval COMMIT — Telegram tashqi HTTP, tranzaksiyani ushlab turmasin
             await client.query('COMMIT');
 
@@ -4574,7 +4640,12 @@ VALUES
                     pool,
                     siteLogin,
                     sellMessage,
-                    firstImageUrl
+                    firstImageUrl,
+                    {
+                        eventId: saleEventId,
+                        productId: firstProductId,
+                        productCategory: firstProductCategory
+                    }
                 );
             } catch (tgErr) {
                 console.error('[Telegram] Sotuv xabari xatosi:', tgErr.message);
@@ -4644,10 +4715,13 @@ app.post(
         try {
             await client.query('BEGIN');
 
+            let saleEventId = null;
             let totalQty = 0;
             let totalRevenue = 0;
             let totalProfit = 0;
             let firstProductName = null;
+            let firstProductId = null;
+            let firstProductCategory = null;
             let firstLocalId = null;
             let firstImageUrl = null;
             let firstSupplier = null;
@@ -4722,7 +4796,7 @@ app.post(
                 const saleColor = itemColor || product.color || null;
 
                 // Sales insert — nasiya belgisi bilan
-                await client.query(
+                const saleInsert = await client.query(
                     `
 INSERT INTO public.sales
 (
@@ -4747,6 +4821,7 @@ VALUES
 (
     $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,true,$15
 )
+RETURNING id
                     `,
                     [
                         userId,
@@ -4766,6 +4841,9 @@ VALUES
                         parsedPaidNow
                     ]
                 );
+                if (saleEventId === null) {
+                    saleEventId = createSaleEventId(saleInsert.rows[0].id);
+                }
 
                 // ★★★ TUZATILGAN: quantity === 0 bo'lsa HAR DOIM aniq product.id bo'yicha DELETE
                 if (newQty === 0) {
@@ -4788,6 +4866,8 @@ VALUES
 
                 if (!firstProductName) {
                     firstProductName = product.name;
+                    firstProductId = product.id;
+                    firstProductCategory = product.category;
                     firstLocalId = product.local_id;
                     firstImageUrl = product.image_url || null;
                     firstSupplier = product.supplier || null;
@@ -4864,6 +4944,19 @@ VALUES
 
             sellMessage += await getTodayReport(client, userId);
 
+            await queueTelegramNotification(
+                client,
+                siteLogin,
+                sellMessage,
+                firstImageUrl,
+                {
+                    eventId: saleEventId,
+                    productId: firstProductId,
+                    productCategory: firstProductCategory,
+                    deferSend: true
+                }
+            );
+
             await client.query('COMMIT');
 
             try {
@@ -4871,7 +4964,12 @@ VALUES
                     pool,
                     siteLogin,
                     sellMessage,
-                    firstImageUrl
+                    firstImageUrl,
+                    {
+                        eventId: saleEventId,
+                        productId: firstProductId,
+                        productCategory: firstProductCategory
+                    }
                 );
             } catch (tgErr) {
                 console.error('[Telegram] Nasiya sotuv xabari xatosi:', tgErr.message);
@@ -5766,7 +5864,7 @@ app.post(
             const newQty = quantity - qty;
             const saleColor = bodyColor || product.color || null;
 
-            await client.query(
+            const saleInsert = await client.query(
                 `
 INSERT INTO public.sales
 (
@@ -5787,6 +5885,7 @@ VALUES
 (
     $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
 )
+RETURNING id
                 `,
                 [
                     product.user_id,
@@ -5803,6 +5902,7 @@ VALUES
                     product.image_url || null
                 ]
             );
+            const saleEventId = createSaleEventId(saleInsert.rows[0].id);
 
             // ★★★ TUZATILGAN: quantity === 0 bo'lsa HAR DOIM aniq product.id bo'yicha DELETE
             if (newQty === 0) {
@@ -5862,6 +5962,19 @@ VALUES
 
             message += await getTodayReport(client, product.user_id);
 
+            await queueTelegramNotification(
+                client,
+                siteLogin,
+                message,
+                product.image_url || null,
+                {
+                    eventId: saleEventId,
+                    productId: product.id,
+                    productCategory: product.category,
+                    deferSend: true
+                }
+            );
+
             await client.query('COMMIT');
 
             try {
@@ -5869,7 +5982,12 @@ VALUES
                     pool,
                     siteLogin,
                     message,
-                    product.image_url || null
+                    product.image_url || null,
+                    {
+                        eventId: saleEventId,
+                        productId: product.id,
+                        productCategory: product.category
+                    }
                 );
             } catch (tgErr) {
                 console.error('[Telegram] QR sotuv xabari xatosi:', tgErr.message);
@@ -6203,7 +6321,7 @@ app.post(
             const saleColor = bodyColor || product.color || null;
 
             // Sales — nasiya belgisi bilan
-            await client.query(
+            const saleInsert = await client.query(
                 `
                 INSERT INTO public.sales
                 (
@@ -6213,6 +6331,7 @@ app.post(
                 )
                 VALUES
                 ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,true,$15)
+                RETURNING id
                 `,
                 [
                     product.user_id,
@@ -6232,6 +6351,7 @@ app.post(
                     parsedPaidNow
                 ]
             );
+            const saleEventId = createSaleEventId(saleInsert.rows[0].id);
 
             // ★★★ TUZATILGAN: quantity === 0 bo'lsa HAR DOIM aniq product.id bo'yicha DELETE
             if (newQty === 0) {
@@ -6289,6 +6409,19 @@ app.post(
 
             message += await getTodayReport(client, product.user_id);
 
+            await queueTelegramNotification(
+                client,
+                siteLogin,
+                message,
+                product.image_url || null,
+                {
+                    eventId: saleEventId,
+                    productId: product.id,
+                    productCategory: product.category,
+                    deferSend: true
+                }
+            );
+
             await client.query('COMMIT');
 
             try {
@@ -6296,7 +6429,12 @@ app.post(
                     pool,
                     siteLogin,
                     message,
-                    product.image_url || null
+                    product.image_url || null,
+                    {
+                        eventId: saleEventId,
+                        productId: product.id,
+                        productCategory: product.category
+                    }
                 );
             } catch (tgErr) {
                 console.error('[Telegram] QR nasiya sotuv xabari xatosi:', tgErr.message);
@@ -6388,9 +6526,18 @@ app.get(
                     [userId]
                 );
 
+                if (
+                    !sales.rows.length ||
+                    sales.rows[0].gross_profit == null ||
+                    !expenses.rows.length ||
+                    expenses.rows[0].expense == null
+                ) {
+                    throw new Error('Hisobot foyda yoki xarajat summasini qaytarmadi.');
+                }
+
                 return (
-                    Number(sales.rows[0].gross_profit || 0) -
-                    Number(expenses.rows[0].expense || 0)
+                    Number(sales.rows[0].gross_profit) -
+                    Number(expenses.rows[0].expense)
                 );
             };
 
@@ -6414,6 +6561,10 @@ app.get(
                 `date_trunc('year', created_at) = date_trunc('year', CURRENT_DATE)`
             );
 
+            if (![dailyProfit, weeklyProfit, monthlyProfit, yearlyProfit].every(Number.isFinite)) {
+                throw new Error('Hisobotda foyda summasi raqam emas.');
+            }
+
             return res.json({
                 success: true,
                 site_login: siteLogin,
@@ -6430,6 +6581,303 @@ app.get(
         }
     }
 );
+
+app.get('/api/bot/pricing', requireBotApiToken, async (req, res) => {
+    const siteLogin = typeof req.query.login === 'string' ? req.query.login.trim() : '';
+    if (!siteLogin) {
+        return res.status(400).json({ message: 'login kiritilmagan!' });
+    }
+
+    try {
+        const userResult = await pool.query(
+            `
+            SELECT id, pricing_model, product_count
+            FROM public.users
+            WHERE site_login = $1
+            LIMIT 1
+            `,
+            [siteLogin]
+        );
+        if (!userResult.rows.length) {
+            return res.status(404).json({ message: 'Foydalanuvchi topilmadi!' });
+        }
+
+        const user = userResult.rows[0];
+        if (!['profit', 'products'].includes(user.pricing_model)) {
+            return res.status(422).json({ message: 'pricing_model noto‘g‘ri yoki belgilanmagan!' });
+        }
+
+        const productCountResult = await pool.query(
+            `
+            SELECT COUNT(DISTINCT id)::integer AS distinct_product_id_count
+            FROM public.products
+            WHERE user_id = $1
+            `,
+            [user.id]
+        );
+        const distinctProductIdCount = Number(
+            productCountResult.rows[0]?.distinct_product_id_count
+        );
+        if (!Number.isSafeInteger(distinctProductIdCount) || distinctProductIdCount < 0) {
+            throw new Error('Backenddagi turli product ID soni yaroqsiz.');
+        }
+
+        let netProfit = null;
+        let expectedAmount;
+        if (user.pricing_model === 'products') {
+            expectedAmount = calculateProductPrice(distinctProductIdCount);
+        } else {
+            const reportResult = await pool.query(
+                `
+                SELECT
+                    COALESCE((
+                        SELECT SUM(profit)
+                        FROM public.sales
+                        WHERE user_id = $1
+                          AND returned = false
+                          AND date_trunc('month', sold_at) = date_trunc('month', CURRENT_DATE)
+                    ), 0)
+                    -
+                    COALESCE((
+                        SELECT SUM(amount)
+                        FROM public.expenses
+                        WHERE user_id = $1
+                          AND date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)
+                    ), 0) AS net_profit
+                `,
+                [user.id]
+            );
+            netProfit = Number(reportResult.rows[0]?.net_profit);
+            if (!Number.isFinite(netProfit)) {
+                throw new Error('Oylik hisobotda net_profit yo‘q yoki u raqam emas.');
+            }
+            expectedAmount = calculateProfitPrice(netProfit);
+        }
+
+        if (!Number.isSafeInteger(expectedAmount)) {
+            throw new Error('Hisoblangan to‘lov summasi integer UZS emas.');
+        }
+
+        const reportedProductCount = user.product_count == null
+            ? null
+            : Number(user.product_count);
+        if (
+            reportedProductCount !== null &&
+            (!Number.isSafeInteger(reportedProductCount) || reportedProductCount < 0)
+        ) {
+            throw new Error('users.product_count manfiy yoki butun son emas.');
+        }
+
+        return res.json({
+            pricing_model: user.pricing_model,
+            currency: 'UZS',
+            distinct_product_id_count: distinctProductIdCount,
+            reported_product_count: reportedProductCount,
+            product_count_mismatch:
+                reportedProductCount !== null &&
+                reportedProductCount !== distinctProductIdCount,
+            net_profit: netProfit,
+            expected_amount: expectedAmount
+        });
+    } catch (err) {
+        console.error('Bot pricing xatosi:', err);
+        return res.status(500).json({ message: 'Tarif summasini hisoblab bo‘lmadi.' });
+    }
+});
+
+app.post('/api/bot/account/activate', requireBotApiToken, async (req, res) => {
+    const { login, expires_at, payment_method, expected_amount, paid_amount } = req.body || {};
+    const siteLogin = typeof login === 'string' ? login.trim() : '';
+    const expiry = parseTimezoneAwareDate(expires_at);
+
+    if (!siteLogin || !expiry || expiry.getTime() <= Date.now()) {
+        return res.status(400).json({
+            message: 'login va kelajakdagi timezone-aware expires_at talab qilinadi.'
+        });
+    }
+    if (
+        typeof payment_method !== 'string' ||
+        !payment_method.trim() ||
+        payment_method.trim().length > 50
+    ) {
+        return res.status(400).json({ message: 'payment_method noto‘g‘ri.' });
+    }
+    if (
+        !Number.isSafeInteger(expected_amount) ||
+        expected_amount < 0 ||
+        !Number.isSafeInteger(paid_amount) ||
+        paid_amount !== expected_amount
+    ) {
+        return res.status(400).json({
+            message: 'paid_amount expected_amount bilan teng integer UZS bo‘lishi kerak.'
+        });
+    }
+    if (payment_method.trim().toLowerCase() === 'trial' && expected_amount !== 0) {
+        return res.status(400).json({ message: 'trial akkaunt uchun summa 0 UZS bo‘lishi kerak.' });
+    }
+
+    try {
+        const result = await pool.query(
+            `
+            UPDATE public.users
+            SET is_paid = true,
+                expires_at = $2::timestamptz,
+                payment_method = $3,
+                last_reminder_at = NULL,
+                deletion_warning_count = 0,
+                last_deletion_warning_at = NULL
+            WHERE site_login = $1
+            RETURNING site_login, is_paid, expires_at
+            `,
+            [siteLogin, expiry.toISOString(), payment_method.trim()]
+        );
+        if (!result.rows.length) {
+            return res.status(404).json({ message: 'Mavjud site_login topilmadi.' });
+        }
+
+        return res.json({
+            success: true,
+            user: result.rows[0]
+        });
+    } catch (err) {
+        console.error('Bot account activation xatosi:', err);
+        return res.status(500).json({ message: 'Akkaunt muddatini yangilab bo‘lmadi.' });
+    }
+});
+
+app.post('/api/bot/account/delete', requireBotApiToken, async (req, res) => {
+    const siteLogin = typeof req.body?.login === 'string' ? req.body.login.trim() : '';
+    if (!siteLogin) {
+        return res.status(400).json({ message: 'login talab qilinadi.' });
+    }
+
+    let client;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+        const userResult = await client.query(
+            `SELECT id FROM public.users WHERE site_login = $1 FOR UPDATE`,
+            [siteLogin]
+        );
+        const userId = userResult.rows[0]?.id;
+
+        if (userId != null) {
+            const tablesResult = await client.query(`
+                SELECT table_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND column_name = 'user_id'
+                  AND table_name <> 'users'
+                  AND table_name IN (
+                      SELECT table_name
+                      FROM information_schema.tables
+                      WHERE table_schema = 'public'
+                        AND table_type = 'BASE TABLE'
+                  )
+            `);
+            const userTables = new Set(tablesResult.rows.map((row) => row.table_name));
+            const foreignKeysResult = await client.query(`
+                SELECT child.table_name AS child_table, parent.table_name AS parent_table
+                FROM information_schema.table_constraints constraint_info
+                JOIN information_schema.key_column_usage child
+                  ON child.constraint_name = constraint_info.constraint_name
+                 AND child.constraint_schema = constraint_info.constraint_schema
+                 AND child.table_name = constraint_info.table_name
+                JOIN information_schema.constraint_column_usage parent
+                  ON parent.constraint_name = constraint_info.constraint_name
+                 AND parent.constraint_schema = constraint_info.constraint_schema
+                WHERE constraint_info.constraint_type = 'FOREIGN KEY'
+                  AND constraint_info.constraint_schema = 'public'
+                  AND child.table_schema = 'public'
+                  AND parent.table_schema = 'public'
+            `);
+            const childrenByParent = new Map();
+            for (const tableName of userTables) childrenByParent.set(tableName, []);
+            for (const row of foreignKeysResult.rows) {
+                if (userTables.has(row.child_table) && userTables.has(row.parent_table)) {
+                    childrenByParent.get(row.parent_table).push(row.child_table);
+                }
+            }
+
+            const orderedTables = [];
+            const visitedTables = new Set();
+            const visitingTables = new Set();
+            const visitTable = (tableName) => {
+                if (visitedTables.has(tableName)) return;
+                if (visitingTables.has(tableName)) {
+                    throw new Error(`Foreign key cycle detected while deleting ${tableName}.`);
+                }
+                visitingTables.add(tableName);
+                for (const childTable of childrenByParent.get(tableName) || []) {
+                    visitTable(childTable);
+                }
+                visitingTables.delete(tableName);
+                visitedTables.add(tableName);
+                orderedTables.push(tableName);
+            };
+            for (const tableName of userTables) visitTable(tableName);
+
+            for (const tableName of orderedTables) {
+                const quotedTable = `"${tableName.replace(/"/g, '""')}"`;
+                await client.query(
+                    `DELETE FROM public.${quotedTable} WHERE user_id::text = $1::text`,
+                    [String(userId)]
+                );
+            }
+        }
+
+        for (const tableName of ['notifications', 'payment_requests']) {
+            const tableExists = await client.query(
+                `
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = $1
+                  AND table_type = 'BASE TABLE'
+                `,
+                [tableName]
+            );
+            if (!tableExists.rows.length) continue;
+
+            const columns = await client.query(
+                `
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = $1
+                `,
+                [tableName]
+            );
+            const loginColumn = columns.rows.some((row) => row.column_name === 'site_login')
+                ? 'site_login'
+                : columns.rows.some((row) => row.column_name === 'login')
+                    ? 'login'
+                    : null;
+            if (loginColumn) {
+                await client.query(
+                    `DELETE FROM public."${tableName}" WHERE "${loginColumn}" = $1`,
+                    [siteLogin]
+                );
+            }
+        }
+
+        if (userId != null) {
+            await client.query(`DELETE FROM public.users WHERE id = $1`, [userId]);
+        }
+
+        await client.query('COMMIT');
+        return res.json({ success: true, deleted: true });
+    } catch (err) {
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackError) {
+            console.error('Account deletion rollback xatosi:', rollbackError);
+        }
+        console.error('Bot account deletion xatosi:', err);
+        return res.status(500).json({ message: 'Akkaunt ma’lumotlarini tozalab bo‘lmadi.' });
+    } finally {
+        if (client) client.release();
+    }
+});
 
 // ====================================================
 // MIJOZ QARZLARI RO'YXATI
@@ -7178,13 +7626,31 @@ app.get('/api/bot/report', async (req, res) => {
             [userId]
         );
 
-        const revenue = Number(sales.rows[0].revenue || 0);
-        const profit = Number(sales.rows[0].profit || 0);
-        const sold = Number(sales.rows[0].sold || 0);
-        const expense = Number(expenses.rows[0].expense || 0);
+        if (
+            !sales.rows.length ||
+            sales.rows[0].revenue == null ||
+            sales.rows[0].profit == null ||
+            sales.rows[0].sold == null ||
+            !expenses.rows.length ||
+            expenses.rows[0].expense == null ||
+            !stock.rows.length ||
+            stock.rows[0].total_products == null ||
+            stock.rows[0].total_stock == null
+        ) {
+            throw new Error('Hisobot zarur maydonlarni qaytarmadi.');
+        }
+
+        const revenue = Number(sales.rows[0].revenue);
+        const profit = Number(sales.rows[0].profit);
+        const sold = Number(sales.rows[0].sold);
+        const expense = Number(expenses.rows[0].expense);
         const net_profit = profit - expense;
-        const total_products = Number(stock.rows[0].total_products || 0);
-        const total_stock = Number(stock.rows[0].total_stock || 0);
+        const total_products = Number(stock.rows[0].total_products);
+        const total_stock = Number(stock.rows[0].total_stock);
+
+        if (![revenue, profit, expense, net_profit, sold, total_products, total_stock].every(Number.isFinite)) {
+            throw new Error('Hisobot maydonlaridan biri raqam emas.');
+        }
 
         return res.json({
             revenue,
