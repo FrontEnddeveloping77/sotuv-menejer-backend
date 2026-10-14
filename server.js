@@ -162,7 +162,9 @@ const poolConfig = databaseUrl
         connectionString: databaseUrl,
         options: '-c timezone=UTC',
         ssl:
-            process.env.DATABASE_SSL === 'false'
+            process.env.DATABASE_SSL === 'false' ||
+            databaseUrl.includes('127.0.0.1') ||
+            databaseUrl.includes('localhost')
                 ? false
                 : {
                     rejectUnauthorized: false
