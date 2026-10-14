@@ -1091,6 +1091,7 @@ const sendTelegramNow = async (chatId, message, photoUrl = null) => {
 const resolveTelegramChatIds = async (clientOrPool, siteLogin) => {
     const chatIds = new Set();
 
+    // 1) Yangi asosiy manba: linked_groups jadvali
     try {
         const lg = await clientOrPool.query(
             `
@@ -1110,30 +1111,36 @@ const resolveTelegramChatIds = async (clientOrPool, siteLogin) => {
         console.warn('[Telegram] linked_groups o\'qib bo\'lmadi:', lgErr.message);
     }
 
-    try {
-        const u = await clientOrPool.query(
-            `
-            SELECT linked_group_chat_id
-            FROM public.users
-            WHERE site_login = $1
-            LIMIT 1
-            `,
-            [siteLogin]
-        );
-        const legacy = u.rows[0]?.linked_group_chat_id;
-        if (legacy != null && String(legacy).trim() !== '') {
-            chatIds.add(String(legacy).trim());
+    // 2) Legacy fallback: faqat linked_groups bo'sh bo'lganda tekshiriladi
+    //    (linked_groups da yozuv bor bo'lsa, legacy ID ortiqcha yuborilishini oldini oladi)
+    if (chatIds.size === 0) {
+        try {
+            const u = await clientOrPool.query(
+                `
+                SELECT linked_group_chat_id
+                FROM public.users
+                WHERE site_login = $1
+                LIMIT 1
+                `,
+                [siteLogin]
+            );
+            const legacy = u.rows[0]?.linked_group_chat_id;
+            if (legacy != null && String(legacy).trim() !== '') {
+                chatIds.add(String(legacy).trim());
+            }
+        } catch (colErr) {
+            console.warn('[Telegram] linked_group_chat_id o\'qib bo\'lmadi:', colErr.message);
         }
-    } catch (colErr) {
-        console.warn('[Telegram] linked_group_chat_id o\'qib bo\'lmadi:', colErr.message);
     }
 
+    // 3) TELEGRAM_CHAT_ID env — oxirgi fallback (linked_groups ham legacy ham yo'q bo'lsa)
     if (chatIds.size === 0 && TELEGRAM_CHAT_ID) {
         chatIds.add(String(TELEGRAM_CHAT_ID).trim());
     }
 
     return chatIds;
 };
+
 
 const queueTelegramNotification = async (
     clientOrPool,
@@ -1320,7 +1327,7 @@ const queueTelegramNotification = async (
             }
         }
 
-        if (anyOk && inserted) {
+        if (anyOk && insertedId != null) {
             try {
                 if (insertedId != null) {
                     await clientOrPool.query(
@@ -1708,10 +1715,40 @@ const ensureTables = async () => {
             ADD COLUMN IF NOT EXISTS photo_url TEXT;
         `);
 
+        // event_id — sotuvni bir marta jo'natish uchun deduplication kalit
+        await pool.query(`
+            ALTER TABLE public.notifications
+            ADD COLUMN IF NOT EXISTS event_id TEXT;
+        `);
+
+        await pool.query(`
+            ALTER TABLE public.notifications
+            ADD COLUMN IF NOT EXISTS product_id INTEGER;
+        `);
+
+        await pool.query(`
+            ALTER TABLE public.notifications
+            ADD COLUMN IF NOT EXISTS product_category TEXT;
+        `);
+
+        // UNIQUE constraint: bir event_id uchun faqat bitta yozuv
+        await pool.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_notifications_event_id
+            ON public.notifications(event_id)
+            WHERE event_id IS NOT NULL;
+        `);
+
         await pool.query(`
             CREATE INDEX IF NOT EXISTS
             idx_notifications_unsent
             ON public.notifications(is_sent, created_at);
+        `);
+
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_notifications_site_login
+            ON public.notifications(site_login);
         `);
     } catch (err) {
         console.error(
@@ -3641,10 +3678,20 @@ app.post(
 
                 message += await getTodayReport(client, userId);
 
-                await queueTelegramNotification(client, siteLogin, message);
+                // Telegram COMMIT dan keyin yuboriladi (tashqi HTTP tranzaksiyani bloklaMASIN)
+                var _pendingTgDebt = { siteLogin, message };
             }
 
             await client.query('COMMIT');
+
+            // Telegram — COMMIT dan keyin
+            if (typeof _pendingTgDebt !== 'undefined' && _pendingTgDebt?.siteLogin) {
+                try {
+                    await queueTelegramNotification(pool, _pendingTgDebt.siteLogin, _pendingTgDebt.message);
+                } catch (tgErr) {
+                    console.error('[Telegram] Qarz undo/edit xabari xatosi:', tgErr.message);
+                }
+            }
 
             res.json({
                 message: actionMode === 'undo'
@@ -3874,10 +3921,20 @@ app.post(
 
                 message += await getTodayReport(client, userId);
 
-                await queueTelegramNotification(client, siteLogin, message);
+                // Telegram COMMIT dan keyin yuboriladi
+                var _pendingTgPay = { siteLogin, message };
             }
 
             await client.query('COMMIT');
+
+            // Telegram — COMMIT dan keyin
+            if (typeof _pendingTgPay !== 'undefined' && _pendingTgPay?.siteLogin) {
+                try {
+                    await queueTelegramNotification(pool, _pendingTgPay.siteLogin, _pendingTgPay.message);
+                } catch (tgErr) {
+                    console.error('[Telegram] Qarz to\'lash xabari xatosi:', tgErr.message);
+                }
+            }
 
             res.json({
                 message: `${formatSum(totalPaidNow)} so'm qarz muvaffaqiyatli to'landi! Qolgan qarz: ${formatSum(remainingDebt)} so'm`,
@@ -5310,7 +5367,8 @@ app.post(
 
             deleteMessage += await getTodayReport(client, userId);
 
-            await queueTelegramNotification(client, siteLogin, deleteMessage, firstImageUrl);
+            // Telegram — COMMIT dan keyin yuboriladi
+            const _pendingDeleteMsg = { siteLogin, message: deleteMessage, photo: firstImageUrl };
 
             // Do'konga kirgan hisobdan ayirish (faqat o'chirishda)
             // types -1 faqat: omborda ham, qaytarilmagan sotuvda ham shu local_id qolmaganda
@@ -5343,6 +5401,15 @@ app.post(
             }
 
             await client.query('COMMIT');
+
+            // Telegram — COMMIT dan keyin
+            if (typeof _pendingDeleteMsg !== 'undefined' && _pendingDeleteMsg?.siteLogin) {
+                try {
+                    await queueTelegramNotification(pool, _pendingDeleteMsg.siteLogin, _pendingDeleteMsg.message, _pendingDeleteMsg.photo);
+                } catch (tgErr) {
+                    console.error('[Telegram] O\'chirish xabari xatosi:', tgErr.message);
+                }
+            }
 
             return res.json({
                 message: "Amal(lar) muvaffaqiyatli bajarildi",
@@ -5433,9 +5500,18 @@ app.post(
 
             expenseMessage += await getTodayReport(client, userId);
 
-            await queueTelegramNotification(client, siteLogin, expenseMessage);
+            const _pendingExpenseMsg = { siteLogin, message: expenseMessage };
 
             await client.query('COMMIT');
+
+            // Telegram — COMMIT dan keyin
+            if (_pendingExpenseMsg.siteLogin) {
+                try {
+                    await queueTelegramNotification(pool, _pendingExpenseMsg.siteLogin, _pendingExpenseMsg.message);
+                } catch (tgErr) {
+                    console.error('[Telegram] Rasxod xabari xatosi:', tgErr.message);
+                }
+            }
 
             return res.status(201).json({
                 message: "Rasxod muvaffaqiyatli qo'shildi",
@@ -5577,9 +5653,18 @@ app.put(
 
             message += await getTodayReport(client, userId);
 
-            await queueTelegramNotification(client, siteLogin, message);
+            const _pendingEditExpMsg = { siteLogin, message };
 
             await client.query('COMMIT');
+
+            // Telegram — COMMIT dan keyin
+            if (_pendingEditExpMsg.siteLogin) {
+                try {
+                    await queueTelegramNotification(pool, _pendingEditExpMsg.siteLogin, _pendingEditExpMsg.message);
+                } catch (tgErr) {
+                    console.error('[Telegram] Rasxod tahrirlash xabari xatosi:', tgErr.message);
+                }
+            }
 
             return res.json({
                 message: "Rasxod muvaffaqiyatli tahrirlandi!",
@@ -5662,9 +5747,18 @@ app.delete(
 
             message += await getTodayReport(client, userId);
 
-            await queueTelegramNotification(client, siteLogin, message);
+            const _pendingDelExpMsg = { siteLogin, message };
 
             await client.query('COMMIT');
+
+            // Telegram — COMMIT dan keyin
+            if (_pendingDelExpMsg.siteLogin) {
+                try {
+                    await queueTelegramNotification(pool, _pendingDelExpMsg.siteLogin, _pendingDelExpMsg.message);
+                } catch (tgErr) {
+                    console.error('[Telegram] Rasxod o\'chirish xabari xatosi:', tgErr.message);
+                }
+            }
 
             return res.json({
                 message: "Rasxod muvaffaqiyatli o'chirildi!"
@@ -6206,9 +6300,18 @@ app.post(
 
             const message = messageBase + await getTodayReport(client, product.user_id);
 
-            await queueTelegramNotification(client, siteLogin, message, product.image_url || null);
+            const _pendingQrDeleteMsg = { siteLogin, message, photo: product.image_url || null };
 
             await client.query('COMMIT');
+
+            // Telegram — COMMIT dan keyin
+            if (_pendingQrDeleteMsg.siteLogin) {
+                try {
+                    await queueTelegramNotification(pool, _pendingQrDeleteMsg.siteLogin, _pendingQrDeleteMsg.message, _pendingQrDeleteMsg.photo);
+                } catch (tgErr) {
+                    console.error('[Telegram] QR o\'chirish xabari xatosi:', tgErr.message);
+                }
+            }
 
             return res.json({
                 success: true,
@@ -7048,10 +7151,20 @@ app.post('/api/customer-debts/pay', authenticateToken, async (req, res) => {
                 `━━━━━━━━━━━━━━━━━━━━`;
 
             msg += await getTodayReport(client, userId);
-            await queueTelegramNotification(client, siteLogin, msg);
+            // Telegram COMMIT dan keyin yuboriladi
+            var _pendingCreditPayMsg = { siteLogin, msg };
         }
 
         await client.query('COMMIT');
+
+        // Telegram — COMMIT dan keyin
+        if (typeof _pendingCreditPayMsg !== 'undefined' && _pendingCreditPayMsg?.siteLogin) {
+            try {
+                await queueTelegramNotification(pool, _pendingCreditPayMsg.siteLogin, _pendingCreditPayMsg.msg);
+            } catch (tgErr) {
+                console.error('[Telegram] Mijoz qarzi to\'lash xabari xatosi:', tgErr.message);
+            }
+        }
 
         res.json({
             message: `${formatSum(totalPaidNow)} so'm muvaffaqiyatli qabul qilindi! Qolgan qarz: ${formatSum(remainingDebt)} so'm`,
@@ -7280,10 +7393,20 @@ app.post('/api/products/restore', authenticateToken, async (req, res) => {
                 `🔢 <b>Soni:</b> ${row.quantity} dona\n` +
                 `━━━━━━━━━━━━━━━━━━━━`;
             msg += await getTodayReport(client, userId);
-            await queueTelegramNotification(client, siteLogin, msg, row.image_url || null);
+            // Telegram COMMIT dan keyin yuboriladi
+            var _pendingRestoreMsg = { siteLogin, msg, photo: row.image_url || null };
         }
 
         await client.query('COMMIT');
+
+        // Telegram — COMMIT dan keyin
+        if (typeof _pendingRestoreMsg !== 'undefined' && _pendingRestoreMsg?.siteLogin) {
+            try {
+                await queueTelegramNotification(pool, _pendingRestoreMsg.siteLogin, _pendingRestoreMsg.msg, _pendingRestoreMsg.photo);
+            } catch (tgErr) {
+                console.error('[Telegram] Tovar qaytarish xabari xatosi:', tgErr.message);
+            }
+        }
 
         res.json({
             message: "Tovar muvaffaqiyatli omborga qaytarildi!",
