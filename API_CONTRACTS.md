@@ -21,21 +21,31 @@ GET /api/bot/pricing?login=<login>
 Authorization: Bearer <BOT_API_TOKEN>
 ```
 
-Example `products` response:
+Example response:
 
 ```json
 {
-  "pricing_model": "products",
+  "pricing_model": "fixed_subscription",
   "currency": "UZS",
-  "distinct_product_id_count": 101,
-  "reported_product_count": 100,
-  "product_count_mismatch": true,
-  "net_profit": null,
-  "expected_amount": 100000
+  "tariff_price": 299000,
+  "expected_amount": 299000,
+  "max_products": 1000,
+  "max_groups": 1,
+  "current_products": 450,
+  "distinct_product_id_count": 450,
+  "is_paid": true,
+  "expires_at": "2026-11-20T18:00:00Z"
 }
 ```
 
-`distinct_product_id_count`, calculated from the backend's `products.id`, is authoritative for billing. `users.product_count` is treated only as the bot-reported count and is returned for mismatch diagnostics. The bot must use the returned integer `expected_amount` for `payment_requests.expected_amount`; product pricing is `ceil(distinct_product_id_count / 100) * 50000` UZS. Profit pricing uses 15% of monthly net profit, rounded to the nearest integer UZS and never below zero. A missing or invalid pricing model/report is an error, not a zero quote.
+The legacy "15% of net profit" and "per 100 products" fee models are deprecated and replaced by fixed monthly subscriptions. The bot uses `tariff_price` (`expected_amount`) for subscription renewal.
+
+## Product limits
+
+The backend enforces user limits based on `users.max_products`:
+- When adding a product (`POST /api/products`), the system checks `COUNT(*) >= max_products`. If reached, it returns HTTP 403 Forbidden with `{ "error": "PRODUCT_LIMIT_REACHED", ... }`.
+- In bulk imports (`POST /api/products/import` / `POST /api/products/bulk`), if `current_count + incoming_count > max_products`, the request is rejected with 403.
+- User profile endpoint `GET /api/user/me` (and `GET /api/profile`, `GET /api/me`) returns `subscription` containing `max_products`, `current_products`, `remaining_products`, `max_groups`, `tariff_price`.
 
 ## Payment approval / renewal
 
@@ -52,12 +62,15 @@ Content-Type: application/json
   "login": "existing-site-login",
   "expires_at": "2026-11-13T12:00:00Z",
   "payment_method": "transfer",
-  "expected_amount": 50000,
-  "paid_amount": 50000
+  "expected_amount": 299000,
+  "paid_amount": 299000,
+  "max_products": 1000,
+  "max_groups": 1,
+  "tariff_price": 299000
 }
 ```
 
-The backend rejects unequal/non-integer amounts and non-timezoned or expired dates. It updates only the existing login's `is_paid`, `expires_at`, and `payment_method`, resets expiry reminders, and never generates or replaces the login or password hash. A trial can be synced with `payment_method: "trial"` and equal zero amounts, using an expiry exactly three days after trial creation.
+The backend rejects unequal/non-integer amounts and non-timezoned or expired dates. It updates the existing login's `is_paid`, `expires_at`, `payment_method`, and sets `max_products`, `max_groups`, `tariff_price` when provided, resets expiry reminders, and never generates or replaces the login or password hash. A trial can be synced with `payment_method: "trial"` and equal zero amounts, using an expiry exactly three days after trial creation.
 
 ## Expired-account deletion
 

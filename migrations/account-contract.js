@@ -7,6 +7,10 @@ const migrateAccountContract = async (pool) => {
         await client.query(`
             ALTER TABLE public.users
                 ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS is_paid BOOLEAN NOT NULL DEFAULT false,
+                ADD COLUMN IF NOT EXISTS max_products INTEGER,
+                ADD COLUMN IF NOT EXISTS max_groups INTEGER,
+                ADD COLUMN IF NOT EXISTS tariff_price INTEGER,
                 ADD COLUMN IF NOT EXISTS pricing_model TEXT,
                 ADD COLUMN IF NOT EXISTS product_count INTEGER NOT NULL DEFAULT 0,
                 ADD COLUMN IF NOT EXISTS payment_method TEXT,

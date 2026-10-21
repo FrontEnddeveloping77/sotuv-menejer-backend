@@ -8,8 +8,6 @@ const { randomUUID, timingSafeEqual } = require('crypto');
 const sharp = require('sharp');
 const migrateAccountContract = require('./migrations/account-contract');
 const {
-    calculateProductPrice,
-    calculateProfitPrice,
     createSaleEventId,
     isAccountActive,
     parseTimezoneAwareDate,
@@ -1466,6 +1464,12 @@ const ensureTables = async () => {
             ALTER TABLE public.users
             ADD COLUMN IF NOT EXISTS entered_stats_initialized BOOLEAN NOT NULL DEFAULT false;
         `);
+        await pool.query(`
+            ALTER TABLE public.users
+            ADD COLUMN IF NOT EXISTS max_products INTEGER,
+            ADD COLUMN IF NOT EXISTS max_groups INTEGER,
+            ADD COLUMN IF NOT EXISTS tariff_price INTEGER;
+        `);
 
         await pool.query(`
             CREATE INDEX IF NOT EXISTS
@@ -2067,53 +2071,177 @@ const authenticateToken = async (
 };
 
 // ====================================================
-// ME
+// PRODUCT LIMIT TEKSHIRISH FUNKSIYASI
 // ====================================================
 
-app.get(
-    '/api/me',
-    authenticateToken,
-    async (req, res) => {
-        try {
-            const result = await pool.query(
-                `
-                SELECT
-                    id,
-                    telegram_id,
-                    full_name,
-                    username,
-                    site_login,
-                    is_paid,
-                    expires_at
-                FROM public.users
-                WHERE id = $1
-                LIMIT 1
-                `,
-                [req.user.userId]
-            );
+const checkProductLimit = async (userId, incomingCount = 1) => {
+    try {
+        const userRes = await pool.query(
+            `
+            SELECT id, max_products
+            FROM public.users
+            WHERE id = $1
+            LIMIT 1
+            `,
+            [userId]
+        );
 
-            if (result.rows.length === 0) {
-                return res.status(404).json({
-                    message:
-                        'Foydalanuvchi topilmadi!'
-                });
-            }
+        if (!userRes.rows.length) {
+            return { allowed: true };
+        }
 
-            res.json({
-                user: result.rows[0]
-            });
-        } catch (err) {
-            console.error(
-                '/api/me xatosi:',
-                err
-            );
-            res.status(500).json({
-                message:
-                    'Serverda xatolik yuz berdi!'
+        const rawMax = userRes.rows[0].max_products;
+        const maxProducts = rawMax != null && Number.isFinite(Number(rawMax))
+            ? Number(rawMax)
+            : null;
+
+        if (maxProducts === null) {
+            return { allowed: true, maxProducts: null };
+        }
+
+        const countRes = await pool.query(
+            `
+            SELECT COUNT(*)::integer AS current_count
+            FROM public.products
+            WHERE user_id = $1
+            `,
+            [userId]
+        );
+        const currentCount = Number(countRes.rows[0]?.current_count || 0);
+
+        if (currentCount >= maxProducts) {
+            return {
+                allowed: false,
+                status: 403,
+                error: "PRODUCT_LIMIT_REACHED",
+                message: `Tarifingiz bo'yicha tovar limiti to'lgan (Maksimal: ${maxProducts} ta). Tarifni oshirish uchun Telegram bot yoki @ABDULAZIZ_AVAZOV ga murojaat qiling.`,
+                max_products: maxProducts,
+                current_count: currentCount
+            };
+        }
+
+        if (currentCount + incomingCount > maxProducts) {
+            return {
+                allowed: false,
+                status: 403,
+                error: "PRODUCT_LIMIT_REACHED",
+                message: `Tarifingiz bo'yicha tovar limiti to'lgan (Maksimal: ${maxProducts} ta). Yangi tovarlar (${incomingCount} ta) bilan jami son (${currentCount + incomingCount} ta) limitdan oshib ketadi. Tarifni oshirish uchun Telegram bot yoki @ABDULAZIZ_AVAZOV ga murojaat qiling.`,
+                max_products: maxProducts,
+                current_count: currentCount,
+                incoming_count: incomingCount
+            };
+        }
+
+        return {
+            allowed: true,
+            maxProducts,
+            currentCount,
+            remainingProducts: Math.max(0, maxProducts - currentCount)
+        };
+    } catch (err) {
+        console.error('checkProductLimit xatosi:', err.message);
+        return { allowed: true };
+    }
+};
+
+// ====================================================
+// ME / USER PROFILE (/api/me, /api/user/me, /api/profile)
+// ====================================================
+
+const handleUserProfile = async (req, res) => {
+    try {
+        const result = await pool.query(
+            `
+            SELECT
+                id,
+                telegram_id,
+                full_name,
+                username,
+                site_login,
+                is_paid,
+                expires_at,
+                max_products,
+                max_groups,
+                tariff_price
+            FROM public.users
+            WHERE id = $1
+            LIMIT 1
+            `,
+            [req.user.userId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Foydalanuvchi topilmadi!'
             });
         }
+
+        const user = result.rows[0];
+
+        // Tovarlar sonini hisoblaymiz
+        const countRes = await pool.query(
+            `
+            SELECT COUNT(*)::integer AS current_count
+            FROM public.products
+            WHERE user_id = $1
+            `,
+            [user.id]
+        );
+        const currentProducts = Number(countRes.rows[0]?.current_count || 0);
+
+        const maxProducts = user.max_products != null && Number.isFinite(Number(user.max_products))
+            ? Number(user.max_products)
+            : null;
+
+        const remainingProducts = maxProducts !== null
+            ? Math.max(0, maxProducts - currentProducts)
+            : null;
+
+        const maxGroups = user.max_groups != null && Number.isFinite(Number(user.max_groups))
+            ? Number(user.max_groups)
+            : null;
+
+        const tariffPrice = user.tariff_price != null && Number.isFinite(Number(user.tariff_price))
+            ? Number(user.tariff_price)
+            : null;
+
+        const subscription = {
+            max_products: maxProducts,
+            current_products: currentProducts,
+            remaining_products: remainingProducts,
+            max_groups: maxGroups,
+            tariff_price: tariffPrice
+        };
+
+        const responsePayload = {
+            id: user.id,
+            site_login: user.site_login,
+            full_name: user.full_name,
+            username: user.username,
+            telegram_id: user.telegram_id,
+            is_paid: Boolean(user.is_paid),
+            expires_at: user.expires_at,
+            subscription,
+            user: {
+                ...user,
+                subscription
+            }
+        };
+
+        return res.json(responsePayload);
+    } catch (err) {
+        console.error('handleUserProfile xatosi:', err);
+        return res.status(500).json({
+            success: false,
+            message: 'Serverda xatolik yuz berdi!'
+        });
     }
-);
+};
+
+app.get('/api/me', authenticateToken, handleUserProfile);
+app.get('/api/user/me', authenticateToken, handleUserProfile);
+app.get('/api/profile', authenticateToken, handleUserProfile);
 
 // ====================================================
 // DASHBOARD STATS  ★★★ ASOSIY TUZATISH SHU YERDA ★★★
@@ -2330,6 +2458,14 @@ app.post(
     '/api/products',
     authenticateToken,
     async (req, res) => {
+        const userId = req.user.userId;
+
+        // ===== TOVAR LIMITINI TEKSHIRISH =====
+        const limitCheck = await checkProductLimit(userId, 1);
+        if (!limitCheck.allowed) {
+            return res.status(limitCheck.status || 403).json(limitCheck);
+        }
+
         const body = req.body || {};
 
         // Turli nomdagi maydonlarni ham qabul qilamiz (frontend farqlari uchun)
@@ -2565,7 +2701,7 @@ app.post(
             }
         }
 
-        const userId = req.user.userId;
+        // userId yuqorida e'lon qilingan
 
         // ===== YANGI: size_quantities (frontenddan aniq taqsimot) =====
         let exactQuantities = null;
@@ -2930,6 +3066,123 @@ app.post(
         }
     }
 );
+
+// ====================================================
+// OMMAVIY TOVAR IMPORTI (EXCEL / CSV / MASS IMPORT)
+// ====================================================
+
+const handleBulkImport = async (req, res) => {
+    const userId = req.user.userId;
+    const rawItems = Array.isArray(req.body)
+        ? req.body
+        : (Array.isArray(req.body?.items)
+            ? req.body.items
+            : (Array.isArray(req.body?.products) ? req.body.products : []));
+
+    if (!rawItems.length) {
+        return res.status(400).json({
+            success: false,
+            message: "Import qilinadigan tovarlar ro'yxati topilmadi yoki bo'sh!"
+        });
+    }
+
+    const incomingCount = rawItems.length;
+
+    // Limitni tekshirish
+    const limitCheck = await checkProductLimit(userId, incomingCount);
+    if (!limitCheck.allowed) {
+        return res.status(limitCheck.status || 403).json(limitCheck);
+    }
+
+    // Tovar import jarayoni
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const last = await client.query(
+            `
+            SELECT local_id
+            FROM public.products
+            WHERE user_id = $1
+            ORDER BY local_id DESC, id DESC
+            LIMIT 1
+            `,
+            [userId]
+        );
+
+        let nextLocalId = last.rows.length ? Number(last.rows[0].local_id) + 1 : 1;
+        const inserted = [];
+
+        for (const item of rawItems) {
+            const name = String(item.name || item.title || item.product_name || '').trim();
+            if (!name) continue;
+
+            const category = String(item.category || 'Boshqa').trim();
+            const costPrice = Math.max(0, Number(item.cost_price || item.kelgan_narx || item.price || 0));
+            const sellingPrice = item.selling_price ? Number(item.selling_price) : null;
+            const quantity = Math.max(1, parseInt(item.quantity, 10) || 1);
+            const color = item.color ? String(item.color).trim() : null;
+            const size = item.size ? String(item.size).trim() : null;
+            const supplier = item.supplier ? String(item.supplier).trim() : '';
+
+            // Har bir dona uchun qator
+            for (let q = 0; q < quantity; q++) {
+                const r = await client.query(
+                    `
+                    INSERT INTO public.products
+                    (
+                        user_id, local_id, category, name, cost_price, color, size, quantity,
+                        qr_token, qr_created_at, payment_type, supplier, paid_amount,
+                        selling_price, image_url
+                    )
+                    VALUES
+                    (
+                        $1, $2, $3, $4, $5, $6, $7, 1,
+                        $8, NOW(), 'cash', $9, 0,
+                        $10, $11
+                    )
+                    RETURNING id, local_id, name, qr_token
+                    `,
+                    [
+                        userId,
+                        nextLocalId,
+                        category,
+                        name,
+                        costPrice,
+                        color,
+                        size,
+                        randomUUID(),
+                        supplier,
+                        sellingPrice,
+                        item.image_url || null
+                    ]
+                );
+                inserted.push(r.rows[0]);
+            }
+            nextLocalId++;
+        }
+
+        await client.query('COMMIT');
+
+        return res.json({
+            success: true,
+            message: `${inserted.length} ta tovar muvaffaqiyatli import qilindi.`,
+            imported_count: inserted.length
+        });
+    } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (e) {}
+        console.error('Ommaviy import xatosi:', err);
+        return res.status(500).json({
+            success: false,
+            message: "Ommaviy import qilishda xatolik yuz berdi!"
+        });
+    } finally {
+        client.release();
+    }
+};
+
+app.post('/api/products/import', authenticateToken, handleBulkImport);
+app.post('/api/products/bulk', authenticateToken, handleBulkImport);
 
 // ====================================================
 // TOVARLAR
@@ -6729,7 +6982,7 @@ app.get('/api/bot/pricing', requireBotApiToken, async (req, res) => {
     try {
         const userResult = await pool.query(
             `
-            SELECT id, pricing_model, product_count
+            SELECT id, site_login, tariff_price, max_products, max_groups, is_paid, expires_at
             FROM public.users
             WHERE site_login = $1
             LIMIT 1
@@ -6741,81 +6994,34 @@ app.get('/api/bot/pricing', requireBotApiToken, async (req, res) => {
         }
 
         const user = userResult.rows[0];
-        if (!['profit', 'products'].includes(user.pricing_model)) {
-            return res.status(422).json({ message: 'pricing_model noto‘g‘ri yoki belgilanmagan!' });
-        }
 
         const productCountResult = await pool.query(
             `
-            SELECT COUNT(DISTINCT id)::integer AS distinct_product_id_count
+            SELECT COUNT(*)::integer AS distinct_product_id_count
             FROM public.products
             WHERE user_id = $1
             `,
             [user.id]
         );
         const distinctProductIdCount = Number(
-            productCountResult.rows[0]?.distinct_product_id_count
+            productCountResult.rows[0]?.distinct_product_id_count || 0
         );
-        if (!Number.isSafeInteger(distinctProductIdCount) || distinctProductIdCount < 0) {
-            throw new Error('Backenddagi turli product ID soni yaroqsiz.');
-        }
 
-        let netProfit = null;
-        let expectedAmount;
-        if (user.pricing_model === 'products') {
-            expectedAmount = calculateProductPrice(distinctProductIdCount);
-        } else {
-            const reportResult = await pool.query(
-                `
-                SELECT
-                    COALESCE((
-                        SELECT SUM(profit)
-                        FROM public.sales
-                        WHERE user_id = $1
-                          AND returned = false
-                          AND date_trunc('month', sold_at) = date_trunc('month', CURRENT_DATE)
-                    ), 0)
-                    -
-                    COALESCE((
-                        SELECT SUM(amount)
-                        FROM public.expenses
-                        WHERE user_id = $1
-                          AND date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)
-                    ), 0) AS net_profit
-                `,
-                [user.id]
-            );
-            netProfit = Number(reportResult.rows[0]?.net_profit);
-            if (!Number.isFinite(netProfit)) {
-                throw new Error('Oylik hisobotda net_profit yo‘q yoki u raqam emas.');
-            }
-            expectedAmount = calculateProfitPrice(netProfit);
-        }
-
-        if (!Number.isSafeInteger(expectedAmount)) {
-            throw new Error('Hisoblangan to‘lov summasi integer UZS emas.');
-        }
-
-        const reportedProductCount = user.product_count == null
-            ? null
-            : Number(user.product_count);
-        if (
-            reportedProductCount !== null &&
-            (!Number.isSafeInteger(reportedProductCount) || reportedProductCount < 0)
-        ) {
-            throw new Error('users.product_count manfiy yoki butun son emas.');
-        }
+        const tariffPrice = user.tariff_price != null && Number.isSafeInteger(Number(user.tariff_price))
+            ? Number(user.tariff_price)
+            : 0;
 
         return res.json({
-            pricing_model: user.pricing_model,
+            pricing_model: 'fixed_subscription',
             currency: 'UZS',
+            tariff_price: tariffPrice,
+            expected_amount: tariffPrice,
+            max_products: user.max_products != null ? Number(user.max_products) : null,
+            max_groups: user.max_groups != null ? Number(user.max_groups) : null,
+            current_products: distinctProductIdCount,
             distinct_product_id_count: distinctProductIdCount,
-            reported_product_count: reportedProductCount,
-            product_count_mismatch:
-                reportedProductCount !== null &&
-                reportedProductCount !== distinctProductIdCount,
-            net_profit: netProfit,
-            expected_amount: expectedAmount
+            is_paid: Boolean(user.is_paid),
+            expires_at: user.expires_at
         });
     } catch (err) {
         console.error('Bot pricing xatosi:', err);
@@ -6824,7 +7030,16 @@ app.get('/api/bot/pricing', requireBotApiToken, async (req, res) => {
 });
 
 app.post('/api/bot/account/activate', requireBotApiToken, async (req, res) => {
-    const { login, expires_at, payment_method, expected_amount, paid_amount } = req.body || {};
+    const {
+        login,
+        expires_at,
+        payment_method,
+        expected_amount,
+        paid_amount,
+        max_products,
+        max_groups,
+        tariff_price
+    } = req.body || {};
     const siteLogin = typeof login === 'string' ? login.trim() : '';
     const expiry = parseTimezoneAwareDate(expires_at);
 
@@ -6854,6 +7069,16 @@ app.post('/api/bot/account/activate', requireBotApiToken, async (req, res) => {
         return res.status(400).json({ message: 'trial akkaunt uchun summa 0 UZS bo‘lishi kerak.' });
     }
 
+    const parsedMaxProducts = max_products != null && Number.isSafeInteger(Number(max_products))
+        ? Number(max_products)
+        : null;
+    const parsedMaxGroups = max_groups != null && Number.isSafeInteger(Number(max_groups))
+        ? Number(max_groups)
+        : null;
+    const parsedTariffPrice = tariff_price != null && Number.isSafeInteger(Number(tariff_price))
+        ? Number(tariff_price)
+        : (Number.isSafeInteger(expected_amount) ? expected_amount : null);
+
     try {
         const result = await pool.query(
             `
@@ -6861,13 +7086,16 @@ app.post('/api/bot/account/activate', requireBotApiToken, async (req, res) => {
             SET is_paid = true,
                 expires_at = $2::timestamptz,
                 payment_method = $3,
+                max_products = COALESCE($4, max_products),
+                max_groups = COALESCE($5, max_groups),
+                tariff_price = COALESCE($6, tariff_price),
                 last_reminder_at = NULL,
                 deletion_warning_count = 0,
                 last_deletion_warning_at = NULL
             WHERE site_login = $1
-            RETURNING site_login, is_paid, expires_at
+            RETURNING site_login, is_paid, expires_at, max_products, max_groups, tariff_price
             `,
-            [siteLogin, expiry.toISOString(), payment_method.trim()]
+            [siteLogin, expiry.toISOString(), payment_method.trim(), parsedMaxProducts, parsedMaxGroups, parsedTariffPrice]
         );
         if (!result.rows.length) {
             return res.status(404).json({ message: 'Mavjud site_login topilmadi.' });
@@ -7281,6 +7509,11 @@ app.post('/api/products/restore', authenticateToken, async (req, res) => {
 
     if (!Number.isInteger(deletedId) || deletedId <= 0) {
         return res.status(400).json({ message: "ID noto'g'ri!" });
+    }
+
+    const limitCheck = await checkProductLimit(userId, 1);
+    if (!limitCheck.allowed) {
+        return res.status(limitCheck.status || 403).json(limitCheck);
     }
 
     const client = await pool.connect();

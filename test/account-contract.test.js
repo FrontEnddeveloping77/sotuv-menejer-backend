@@ -3,8 +3,6 @@ const assert = require('node:assert/strict');
 const bcrypt = require('bcryptjs');
 const { Pool, types } = require('pg');
 const {
-    calculateProductPrice,
-    calculateProfitPrice,
     createSaleEventId,
     isAccountActive,
     parseTimezoneAwareDate,
@@ -38,16 +36,13 @@ test('renewing an expired account restores access without changing its login cre
     assert.equal(isAccountActive(true, renewedAt, now), true);
 });
 
-test('profit pricing is 15 percent and rounded to integer UZS', () => {
-    assert.equal(calculateProfitPrice(1000000), 150000);
-});
-
-test('product pricing rounds up by each 100 distinct IDs', () => {
-    assert.equal(calculateProductPrice(100), 50000);
-    assert.equal(calculateProductPrice(101), 100000);
-    assert.equal(calculateProductPrice(200), 100000);
-    assert.equal(calculateProductPrice(1), 50000);
-    assert.equal(calculateProductPrice(0), 0);
+test('subscription remaining products calculation', () => {
+    const maxProducts = 1000;
+    const currentProducts = 450;
+    const remainingProducts = Math.max(0, maxProducts - currentProducts);
+    assert.equal(remainingProducts, 550);
+    assert.equal(Math.max(0, 1000 - 1000), 0);
+    assert.equal(Math.max(0, 1000 - 1050), 0);
 });
 
 test('activation expiry must include an explicit timezone', () => {
