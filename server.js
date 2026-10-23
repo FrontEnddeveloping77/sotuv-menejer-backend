@@ -4415,6 +4415,15 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
 
         const oldImage = oldFirst.image_url || null;
 
+        // ★★★ QR TOKENLARNI SAQLASH: eski qatorlarning QR tokenlarini yig'ib olamiz
+        // Tovar tahrirlanganda ham eski chiqarilgan QR kodlar 30 kun ishlaydi
+        const oldQrTokens = oldRes.rows
+            .filter(r => r.qr_token)
+            .map(r => ({ qr_token: r.qr_token, qr_created_at: r.qr_created_at }));
+
+        // QR tokenlarni qayta ishlatish uchun indeks
+        let qrReuseIndex = 0;
+
         // Eski qatorlarni o'chirish
         await client.query(
             `DELETE FROM public.products WHERE user_id = $1 AND local_id = $2`,
@@ -4435,10 +4444,22 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
 
         const insertedRows = [];
 
-        // Har bir dona = 1 qator + yangi QR
+        // Har bir dona = 1 qator + ESKI QR tokenni qayta ishlatish (yangi yaratilmaydi)
+        // Agar eski QR tokenlar tugasa, faqat shu holda yangi QR yaratiladi
         const insertOne = async (sizeVal, qtyVal) => {
             const q = Math.max(0, parseInt(qtyVal, 10) || 0);
             for (let u = 0; u < q; u++) {
+                // ★★★ Eski QR tokenni qayta ishlatish — chiqarilgan QR kod o'chib ketmaydi
+                let reuseToken, reuseCreatedAt;
+                if (qrReuseIndex < oldQrTokens.length) {
+                    reuseToken = oldQrTokens[qrReuseIndex].qr_token;
+                    reuseCreatedAt = oldQrTokens[qrReuseIndex].qr_created_at || null;
+                    qrReuseIndex++;
+                } else {
+                    reuseToken = randomUUID();
+                    reuseCreatedAt = null; // NOW() ishlatiladi
+                }
+
                 const result = await client.query(
                     `
                     INSERT INTO public.products
@@ -4448,7 +4469,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
                         supplier_phone, selling_price, image_url, created_at
                     )
                     VALUES
-                    ($1,$2,$3,$4,$5,$6,$7,1,$8,NOW(),$9,$10,$11,$12,$13,$14,$15)
+                    ($1,$2,$3,$4,$5,$6,$7,1,$8,COALESCE($15::timestamp, NOW()),$9,$10,$11,$12,$13,$14,$16)
                     RETURNING *
                     `,
                     [
@@ -4459,7 +4480,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
                         parsedCostPrice,
                         color || null,
                         sizeVal || null,
-                        randomUUID(),
+                        reuseToken,
                         oldFirst.payment_type || 'cash',
                         oldFirst.supplier || null,
                         oldFirst.paid_amount || 0,
@@ -4469,6 +4490,7 @@ app.put('/api/products/:localId', authenticateToken, async (req, res) => {
                         (cleanImageUrl != null && cleanImageUrl !== ''
                             ? cleanImageUrl
                             : oldImage),
+                        reuseCreatedAt,
                         oldFirst.created_at
                     ]
                 );
@@ -4623,8 +4645,47 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
         );
         const returnedAt = returnedAtResult.rows[0]?.returned_at;
 
-        // HAR DOIM yangi product qatori (shu razmer, shu son, yangi QR)
-        const newToken = randomUUID();
+        // ★★★ ESKI QR TOKENNI QAYTA ISHLATISH: omborda shu tovar (local_id+size) bo'lsa,
+        // uning QR tokenini olamiz — chiqarilgan QR kod o'chib ketmaydi
+        let reuseToken = null;
+        let reuseCreatedAt = null;
+
+        if (sale.product_id) {
+            // product_id bo'yicha ombordagi tovarni tekshirish
+            const existingProduct = await client.query(
+                `SELECT qr_token, qr_created_at FROM public.products
+                 WHERE id = $1 AND user_id = $2 AND qr_token IS NOT NULL
+                 LIMIT 1`,
+                [sale.product_id, userId]
+            );
+            if (existingProduct.rows.length && existingProduct.rows[0].qr_token) {
+                reuseToken = existingProduct.rows[0].qr_token;
+                reuseCreatedAt = existingProduct.rows[0].qr_created_at;
+            }
+        }
+
+        // Agar product_id bo'yicha topilmasa, local_id+size bo'yicha qidirish
+        if (!reuseToken && sale.local_id != null) {
+            const siblingProduct = await client.query(
+                `SELECT qr_token, qr_created_at FROM public.products
+                 WHERE user_id = $1
+                   AND local_id = $2
+                   AND COALESCE(NULLIF(TRIM(COALESCE(size, '')), ''), '') = COALESCE(NULLIF(TRIM(COALESCE($3::text, '')), ''), '')
+                   AND qr_token IS NOT NULL
+                 ORDER BY id ASC
+                 LIMIT 1`,
+                [userId, sale.local_id, sale.size || '']
+            );
+            if (siblingProduct.rows.length && siblingProduct.rows[0].qr_token) {
+                reuseToken = siblingProduct.rows[0].qr_token;
+                reuseCreatedAt = siblingProduct.rows[0].qr_created_at;
+            }
+        }
+
+        // Agar eski QR topilmasa — yangi yaratish
+        const finalToken = reuseToken || randomUUID();
+        const finalQrCreatedAt = reuseCreatedAt || null; // null bo'lsa NOW() ishlatiladi
+
         const insertRes = await client.query(
             `
             INSERT INTO public.products
@@ -4636,7 +4697,7 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
             VALUES
             (
                 $1, $2, $3, $4, $5, $6, $7,
-                $8, $9, NOW(), $10, $11,
+                $8, $9, COALESCE($12::timestamp, NOW()), $10, $11,
                 'cash'
             )
             RETURNING id, image_url, size, quantity, local_id, name
@@ -4650,9 +4711,10 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
                 sale.color || null,
                 sale.size || null,
                 qtyToReturn,
-                newToken,
+                finalToken,
                 sale.selling_price != null ? sale.selling_price : null,
-                sale.image_url || null
+                sale.image_url || null,
+                finalQrCreatedAt
             ]
         );
 
