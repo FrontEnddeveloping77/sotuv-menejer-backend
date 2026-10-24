@@ -14,6 +14,12 @@ const {
     verifyBcryptPassword
 } = require('./lib/account-contract');
 const {
+    areReturnsAllowed,
+    calculateTrialExpiry,
+    evaluateSubscriptionLifecycle,
+    getWarningMessage
+} = require('./lib/subscription');
+const {
     formatDateInTimeZone,
     formatDateTimeInTimeZone,
     parseUtcTimestamp
@@ -1468,7 +1474,8 @@ const ensureTables = async () => {
             ALTER TABLE public.users
             ADD COLUMN IF NOT EXISTS max_products INTEGER,
             ADD COLUMN IF NOT EXISTS max_groups INTEGER,
-            ADD COLUMN IF NOT EXISTS tariff_price INTEGER;
+            ADD COLUMN IF NOT EXISTS tariff_price INTEGER,
+            ADD COLUMN IF NOT EXISTS returns_enabled BOOLEAN DEFAULT NULL;
         `);
 
         await pool.query(`
@@ -1651,6 +1658,7 @@ const ensureTables = async () => {
 `);
         await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS paid_now NUMERIC DEFAULT 0;`);
         await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS stock_restored BOOLEAN NOT NULL DEFAULT false;`);
+        await pool.query(`ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS qr_token UUID;`);
         await pool.query(`
             CREATE INDEX IF NOT EXISTS
             idx_sales_user_id
@@ -1662,6 +1670,30 @@ const ensureTables = async () => {
             idx_sales_sold_at
             ON public.sales(sold_at);
         `);
+
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_sales_qr_token
+            ON public.sales(qr_token)
+            WHERE qr_token IS NOT NULL;
+        `);
+
+        try {
+            await pool.query(`
+                UPDATE public.sales s
+                SET qr_token = p.qr_token
+                FROM public.products p
+                WHERE s.product_id = p.id AND s.qr_token IS NULL AND p.qr_token IS NOT NULL;
+            `);
+            await pool.query(`
+                UPDATE public.sales s
+                SET qr_token = dp.qr_token
+                FROM public.deleted_products dp
+                WHERE s.product_id = dp.original_id AND s.qr_token IS NULL AND dp.qr_token IS NOT NULL;
+            `);
+        } catch (backfillErr) {
+            console.error("Sales qr_token backfill xatosi:", backfillErr.message);
+        }
     } catch (err) {
         console.error(
             "⚠️ SALES jadvalini yaratishda xatolik:",
@@ -1800,6 +1832,11 @@ const ensureTables = async () => {
         await pool.query(`
             CREATE INDEX IF NOT EXISTS idx_deleted_products_deleted_at
             ON public.deleted_products(deleted_at);
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_deleted_products_qr_token
+            ON public.deleted_products(qr_token)
+            WHERE qr_token IS NOT NULL;
         `);
     } catch (err) {
         console.error(
@@ -1946,7 +1983,8 @@ app.post('/api/login', async (req, res) => {
             user: {
                 id: user.id,
                 telegram_id: user.telegram_id,
-                login: user.site_login
+                login: user.site_login,
+                returns_enabled: user.returns_enabled
             }
         });
     } catch (err) {
@@ -2162,7 +2200,8 @@ const handleUserProfile = async (req, res) => {
                 expires_at,
                 max_products,
                 max_groups,
-                tariff_price
+                tariff_price,
+                returns_enabled
             FROM public.users
             WHERE id = $1
             LIMIT 1
@@ -2222,9 +2261,11 @@ const handleUserProfile = async (req, res) => {
             telegram_id: user.telegram_id,
             is_paid: Boolean(user.is_paid),
             expires_at: user.expires_at,
+            returns_enabled: user.returns_enabled,
             subscription,
             user: {
                 ...user,
+                returns_enabled: user.returns_enabled,
                 subscription
             }
         };
@@ -2266,6 +2307,7 @@ app.get(
                 SELECT
                     full_name,
                     site_login,
+                    returns_enabled,
                     COALESCE(entered_qty, 0) AS entered_qty,
                     COALESCE(entered_types, 0) AS entered_types,
                     COALESCE(entered_sum, 0) AS entered_sum
@@ -2411,6 +2453,7 @@ app.get(
 
             res.json({
                 storeName,
+                returns_enabled: userResult.rows[0]?.returns_enabled,
                 totalProducts: Number(productStats.rows[0].totalProducts || 0),
                 totalStock: Number(productStats.rows[0].totalStock || 0),
                 totalStockValue: Number(productStats.rows[0].totalStockValue || 0),
@@ -4618,6 +4661,19 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
             return res.status(404).json({ message: "Sotuv topilmadi" });
         }
 
+        const userRes = await client.query(
+            `SELECT returns_enabled FROM public.users WHERE id = $1 LIMIT 1`,
+            [userId]
+        );
+        if (!areReturnsAllowed(userRes.rows[0]?.returns_enabled)) {
+            await client.query('ROLLBACK');
+            console.warn(`[Security] Qaytarish taqiqlangan akkaunt uchun qaytarish so‘rovi rad etildi: userId=${userId}, saleId=${saleId}`);
+            return res.status(403).json({
+                code: 'RETURNS_DISABLED',
+                message: "Do‘kon sozlamalariga ko‘ra tovarlarni qaytarish (vozvrat) o‘chirilgan!"
+            });
+        }
+
         const sale = saleRes.rows[0];
 
         if (sale.returned) {
@@ -4645,12 +4701,12 @@ app.post('/api/sales/:saleId/return', authenticateToken, async (req, res) => {
         );
         const returnedAt = returnedAtResult.rows[0]?.returned_at;
 
-        // ★★★ ESKI QR TOKENNI QAYTA ISHLATISH: omborda shu tovar (local_id+size) bo'lsa,
+        // ★★★ ESKI QR TOKENNI QAYTA ISHLATISH: sotuvdagi qr_token yoki omborda shu tovar (local_id+size) bo'lsa,
         // uning QR tokenini olamiz — chiqarilgan QR kod o'chib ketmaydi
-        let reuseToken = null;
+        let reuseToken = sale.qr_token || null;
         let reuseCreatedAt = null;
 
-        if (sale.product_id) {
+        if (!reuseToken && sale.product_id) {
             // product_id bo'yicha ombordagi tovarni tekshirish
             const existingProduct = await client.query(
                 `SELECT qr_token, qr_created_at FROM public.products
@@ -4889,11 +4945,12 @@ INSERT INTO public.sales
     category,
     color,
     size,
-    image_url
+    image_url,
+    qr_token
 )
 VALUES
 (
-    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
+    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
 )
 RETURNING id
                     `,
@@ -4909,7 +4966,8 @@ RETURNING id
                         product.category,
                         saleColor,
                         product.size,
-                        product.image_url || null
+                        product.image_url || null,
+                        product.qr_token || null
                     ]
                 );
                 if (saleEventId === null) {
@@ -5220,11 +5278,12 @@ INSERT INTO public.sales
     customer_name,
     customer_phone,
     is_credit,
-    paid_now
+    paid_now,
+    qr_token
 )
 VALUES
 (
-    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,true,$15
+    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,true,$15,$16
 )
 RETURNING id
                     `,
@@ -5243,7 +5302,8 @@ RETURNING id
                         product.image_url || null,
                         cleanCustomerName,
                         cleanCustomerPhone,
-                        parsedPaidNow
+                        parsedPaidNow,
+                        product.qr_token || null
                     ]
                 );
                 if (saleEventId === null) {
@@ -5863,7 +5923,7 @@ app.get(
                 FROM public.expenses
                 WHERE user_id = $1
                 ORDER BY created_at DESC
-                LIMIT 200
+                LIMIT 200   
                 `,
                 [req.user.userId]
             );
@@ -6147,6 +6207,7 @@ app.get(
         // ==========================
 
         try {
+            // 1. OMBORDA MAVJUDLIGINI TEKSHIRISH
             const result = await pool.query(
                 `
                 SELECT
@@ -6160,37 +6221,191 @@ app.get(
                 [qrToken]
             );
 
-            if (!result.rows.length) {
-                return res.status(404).json({
-                    message: "QR kodi eskirgan yoki tovar topilmadi!"
-                });
-            }
+            if (result.rows.length) {
+                const product = result.rows[0];
 
-            const product = result.rows[0];
+                // ===== OWNER TEKSHIRUVI =====
+                const isOwner =
+                    String(product.user_id) === String(jwtUserId) ||
+                    (jwtTelegramId && String(product.user_id) === String(jwtTelegramId));
 
-            // ===== OWNER TEKSHIRUVI =====
-            const isOwner =
-                String(product.user_id) === String(jwtUserId) ||
-                (jwtTelegramId && String(product.user_id) === String(jwtTelegramId));
+                if (!isOwner) {
+                    return res.status(403).json({
+                        message: "Bu QR kod sizga tegishli emas! Faqat o'z loginingiz bilan kirishingiz mumkin.",
+                        wrongUser: true
+                    });
+                }
+                // ============================
 
-            if (!isOwner) {
-                return res.status(403).json({
-                    message: "Bu QR kod sizga tegishli emas! Faqat o'z loginingiz bilan kirishingiz mumkin.",
-                    wrongUser: true
-                });
-            }
-            // ============================
+                const quantity = Number(product.quantity) || 0;
 
-            const quantity = Number(product.quantity) || 0;
+                if (quantity > 0) {
+                    return res.json({
+                        status: 'in_stock',
+                        product
+                    });
+                }
 
-            if (quantity <= 0) {
-                return res.status(410).json({
+                // Agar quantity <= 0 bo'lsa — sotilgan holatni tekshiramiz
+                const saleCheck = await pool.query(
+                    `
+                    SELECT *
+                    FROM public.sales
+                    WHERE (qr_token::text = $1 OR product_id = $2)
+                      AND user_id = $3
+                      AND COALESCE(returned, false) = false
+                    ORDER BY sold_at DESC
+                    LIMIT 1
+                    `,
+                    [qrToken, product.id, product.user_id]
+                );
+
+                if (saleCheck.rows.length) {
+                    return res.json({
+                        status: 'sold',
+                        product: { ...product, quantity: 0 },
+                        sale: saleCheck.rows[0],
+                        message: "Bu tovar sotilgan!"
+                    });
+                }
+
+                return res.json({
+                    status: 'sold',
+                    product: { ...product, quantity: 0 },
                     message: "Bu tovar omborda qolmagan!"
                 });
             }
 
-            return res.json({
-                product
+            // 2. O'CHIRILGAN TOVARLARNI TEKSHIRISH (deleted_products)
+            const delResult = await pool.query(
+                `
+                SELECT
+                    id, original_id, user_id, local_id, name, category, color, size,
+                    cost_price, quantity, qr_token, deleted_at,
+                    image_url, selling_price, supplier, supplier_phone
+                FROM public.deleted_products
+                WHERE qr_token::text = $1
+                ORDER BY deleted_at DESC
+                LIMIT 1
+                `,
+                [qrToken]
+            );
+
+            if (delResult.rows.length) {
+                const deletedProd = delResult.rows[0];
+
+                // ===== OWNER TEKSHIRUVI =====
+                const isOwner =
+                    String(deletedProd.user_id) === String(jwtUserId) ||
+                    (jwtTelegramId && String(deletedProd.user_id) === String(jwtTelegramId));
+
+                if (!isOwner) {
+                    return res.status(403).json({
+                        message: "Bu QR kod sizga tegishli emas! Faqat o'z loginingiz bilan kirishingiz mumkin.",
+                        wrongUser: true
+                    });
+                }
+                // ============================
+
+                return res.json({
+                    status: 'deleted',
+                    product: {
+                        id: deletedProd.original_id || deletedProd.id,
+                        deleted_id: deletedProd.id,
+                        user_id: deletedProd.user_id,
+                        local_id: deletedProd.local_id,
+                        name: deletedProd.name,
+                        category: deletedProd.category,
+                        color: deletedProd.color,
+                        size: deletedProd.size,
+                        cost_price: deletedProd.cost_price,
+                        selling_price: deletedProd.selling_price,
+                        quantity: deletedProd.quantity,
+                        qr_token: deletedProd.qr_token,
+                        image_url: deletedProd.image_url,
+                        deleted_at: deletedProd.deleted_at
+                    },
+                    message: "Bu tovar ombordan o'chirilgan."
+                });
+            }
+
+            // 3. SOTILGAN TOVARLARNI TEKSHIRISH (sales jadvalida qr_token bo'yicha)
+            const saleResult = await pool.query(
+                `
+                SELECT *
+                FROM public.sales
+                WHERE qr_token::text = $1
+                ORDER BY sold_at DESC
+                LIMIT 1
+                `,
+                [qrToken]
+            );
+
+            if (saleResult.rows.length) {
+                const sale = saleResult.rows[0];
+
+                // ===== OWNER TEKSHIRUVI =====
+                const isOwner =
+                    String(sale.user_id) === String(jwtUserId) ||
+                    (jwtTelegramId && String(sale.user_id) === String(jwtTelegramId));
+
+                if (!isOwner) {
+                    return res.status(403).json({
+                        message: "Bu QR kod sizga tegishli emas! Faqat o'z loginingiz bilan kirishingiz mumkin.",
+                        wrongUser: true
+                    });
+                }
+                // ============================
+
+                if (sale.returned) {
+                    return res.json({
+                        status: 'already_returned',
+                        product: {
+                            id: sale.product_id,
+                            name: sale.title,
+                            category: sale.category,
+                            color: sale.color,
+                            size: sale.size,
+                            cost_price: sale.cost_price,
+                            selling_price: sale.selling_price,
+                            quantity: sale.quantity,
+                            qr_token: sale.qr_token,
+                            image_url: sale.image_url
+                        },
+                        sale,
+                        message: "Bu tovar allaqachon qaytarilgan."
+                    });
+                }
+
+                const ownerRes = await pool.query(
+                    `SELECT returns_enabled FROM public.users WHERE id = $1 LIMIT 1`,
+                    [sale.user_id]
+                );
+                const returnsEnabled = areReturnsAllowed(ownerRes.rows[0]?.returns_enabled);
+
+                return res.json({
+                    status: 'sold',
+                    returns_enabled: returnsEnabled,
+                    product: {
+                        id: sale.product_id,
+                        name: sale.title,
+                        category: sale.category,
+                        color: sale.color,
+                        size: sale.size,
+                        cost_price: sale.cost_price,
+                        selling_price: sale.selling_price,
+                        quantity: sale.quantity,
+                        qr_token: sale.qr_token,
+                        image_url: sale.image_url
+                    },
+                    sale,
+                    message: "Bu tovar sotilgan."
+                });
+            }
+
+            // 4. Hech qayerdan topilmadi
+            return res.status(404).json({
+                message: "QR kodi eskirgan yoki tovar topilmadi!"
             });
         } catch (err) {
             console.error("QR ma'lumot xatosi:", err);
@@ -6323,11 +6538,12 @@ INSERT INTO public.sales
     category,
     color,
     size,
-    image_url
+    image_url,
+    qr_token
 )
 VALUES
 (
-    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
+    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
 )
 RETURNING id
                 `,
@@ -6343,7 +6559,8 @@ RETURNING id
                     product.category,
                     saleColor,
                     product.size,
-                    product.image_url || null
+                    product.image_url || null,
+                    product.qr_token || token
                 ]
             );
             const saleEventId = createSaleEventId(saleInsert.rows[0].id);
@@ -6569,6 +6786,38 @@ app.post(
             const removeSum = removeQty * (Number(product.cost_price) || 0);
             const localId = product.local_id;
 
+            // Arxivga saqlash (7 kun ichida qaytarish uchun)
+            await client.query(
+                `
+                INSERT INTO public.deleted_products
+                (
+                    original_id, user_id, local_id, category, name, cost_price,
+                    color, size, quantity, payment_type, supplier, paid_amount,
+                    supplier_phone, selling_price, qr_token, image_url, deleted_at
+                )
+                VALUES
+                ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
+                `,
+                [
+                    product.id,
+                    product.user_id,
+                    product.local_id,
+                    product.category,
+                    product.name,
+                    product.cost_price,
+                    product.color,
+                    product.size,
+                    product.quantity,
+                    product.payment_type || 'cash',
+                    product.supplier,
+                    product.paid_amount || 0,
+                    product.supplier_phone,
+                    product.selling_price,
+                    product.qr_token || token,
+                    product.image_url || null
+                ]
+            );
+
             await client.query(
                 `DELETE FROM public.products WHERE id = $1 AND user_id = $2`,
                 [product.id, product.user_id]
@@ -6780,10 +7029,11 @@ app.post(
                 (
                     user_id, product_id, title, quantity, cost_price, selling_price, profit,
                     local_id, category, color, size, image_url,
-                    customer_name, customer_phone, is_credit, paid_now
+                    customer_name, customer_phone, is_credit, paid_now,
+                    qr_token
                 )
                 VALUES
-                ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,true,$15)
+                ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,true,$15,$16)
                 RETURNING id
                 `,
                 [
@@ -6801,7 +7051,8 @@ app.post(
                     product.image_url || null,
                     cleanCustomerName,
                     cleanCustomerPhone,
-                    parsedPaidNow
+                    parsedPaidNow,
+                    product.qr_token || token
                 ]
             );
             const saleEventId = createSaleEventId(saleInsert.rows[0].id);
@@ -6930,6 +7181,467 @@ app.post(
 );
 
 // ====================================================
+// QR ORQALI OMBORGA QAYTARISH (Restore deleted product)
+// ====================================================
+app.post(
+    '/api/qr/:token/restore',
+    async (req, res) => {
+        const qrToken = typeof req.params.token === 'string'
+            ? req.params.token.trim()
+            : '';
+
+        if (!qrToken) {
+            return res.status(400).json({
+                message: "QR token kiritilmagan!"
+            });
+        }
+
+        // ===== JWT TEKSHIRUVI =====
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({
+                message: "Qaytarish uchun tizimga kirishingiz kerak!",
+                requireLogin: true
+            });
+        }
+        let jwtUserId;
+        let jwtTelegramId;
+        try {
+            const jwtToken = authHeader.split(' ')[1];
+            const decoded = jwt.decode(jwtToken, JWT_SECRET);
+            if (!decoded || !decoded.userId) {
+                return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
+            }
+            if (decoded.exp && decoded.exp < Math.floor(Date.now() / 1000)) {
+                return res.status(401).json({ message: "Sessiya muddati tugagan!", requireLogin: true });
+            }
+            jwtUserId = decoded.userId;
+            jwtTelegramId = decoded.telegramId;
+        } catch (e) {
+            return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
+        }
+        // ==========================
+
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            const delRes = await client.query(
+                `SELECT * FROM public.deleted_products
+                 WHERE qr_token::text = $1
+                 ORDER BY deleted_at DESC
+                 LIMIT 1
+                 FOR UPDATE`,
+                [qrToken]
+            );
+
+            if (!delRes.rows.length) {
+                const prodCheck = await client.query(
+                    `SELECT id, name FROM public.products WHERE qr_token::text = $1 LIMIT 1`,
+                    [qrToken]
+                );
+                await client.query('ROLLBACK');
+                if (prodCheck.rows.length) {
+                    return res.status(400).json({
+                        message: "Ushbu tovar allaqachon omborda mavjud!"
+                    });
+                }
+                return res.status(404).json({
+                    message: "O'chirilgan tovar topilmadi!"
+                });
+            }
+
+            const row = delRes.rows[0];
+
+            // Owner tekshiruvi
+            const isOwner =
+                String(row.user_id) === String(jwtUserId) ||
+                (jwtTelegramId && String(row.user_id) === String(jwtTelegramId));
+            if (!isOwner) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({
+                    message: "Bu QR kod sizga tegishli emas!",
+                    wrongUser: true
+                });
+            }
+
+            if (daysSince(row.deleted_at) > DELETED_RESTORE_WINDOW_DAYS) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({
+                    message: `Bu tovar ${DELETED_RESTORE_WINDOW_DAYS} kundan ko'p vaqt oldin o'chirilgan, qaytarib bo'lmaydi!`
+                });
+            }
+
+            const limitCheck = await checkProductLimit(row.user_id, 1);
+            if (!limitCheck.allowed) {
+                await client.query('ROLLBACK');
+                return res.status(limitCheck.status || 403).json(limitCheck);
+            }
+
+            try {
+                await ensureEnteredStatsInitialized(pool, row.user_id);
+            } catch (e) {
+                console.error('ensureEnteredStatsInitialized (qr restore) xatosi:', e.message);
+            }
+
+            const existsBefore = await client.query(
+                `SELECT 1 FROM public.products WHERE user_id = $1 AND local_id = $2 LIMIT 1`,
+                [row.user_id, row.local_id]
+            );
+            let typesDeltaRestore = 0;
+            if (existsBefore.rows.length === 0) {
+                const soldExists = await client.query(
+                    `SELECT 1 FROM public.sales
+                     WHERE user_id = $1 AND local_id = $2
+                       AND COALESCE(returned, false) = false
+                     LIMIT 1`,
+                    [row.user_id, row.local_id]
+                );
+                if (!soldExists.rows.length) typesDeltaRestore = 1;
+            }
+
+            const insertRes = await client.query(
+                `
+                INSERT INTO public.products
+                (
+                    user_id, local_id, category, name, cost_price, color, size,
+                    quantity, qr_token, qr_created_at, payment_type, supplier,
+                    paid_amount, supplier_phone, selling_price, image_url
+                )
+                VALUES
+                ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW(),$10,$11,$12,$13,$14,$15)
+                RETURNING *
+                `,
+                [
+                    row.user_id,
+                    row.local_id,
+                    row.category,
+                    row.name,
+                    row.cost_price,
+                    row.color,
+                    row.size,
+                    row.quantity,
+                    row.qr_token || qrToken,
+                    row.payment_type || 'cash',
+                    row.supplier,
+                    row.paid_amount || 0,
+                    row.supplier_phone,
+                    row.selling_price,
+                    row.image_url || null
+                ]
+            );
+
+            await client.query(
+                `DELETE FROM public.deleted_products WHERE id = $1`,
+                [row.id]
+            );
+
+            try {
+                await adjustEnteredStats(client, row.user_id, {
+                    qtyDelta: Number(row.quantity) || 0,
+                    sumDelta: (Number(row.quantity) || 0) * (Number(row.cost_price) || 0),
+                    typesDelta: typesDeltaRestore
+                });
+            } catch (e) {
+                console.error('adjustEnteredStats (qr restore) xatosi:', e.message);
+            }
+
+            const userRes = await client.query(
+                `SELECT site_login FROM public.users WHERE id = $1`,
+                [row.user_id]
+            );
+            const siteLogin = userRes.rows[0]?.site_login || null;
+
+            const restoredProduct = insertRes.rows[0];
+
+            await client.query('COMMIT');
+
+            if (siteLogin) {
+                try {
+                    const msg =
+                        `♻️ <b>TOVAR OMBORGA QAYTARILDI</b>\n` +
+                        `━━━━━━━━━━━━━━━━━━━━\n` +
+                        `📦 <b>Tovar:</b> ${telegramEscape(row.name)}\n` +
+                        `📏 <b>Razmer:</b> ${telegramEscape(row.size || 'Standart')}\n` +
+                        `🔢 <b>Soni:</b> ${row.quantity} dona\n` +
+                        `💰 <b>Tannarx:</b> ${formatSum(row.cost_price)} so'm\n` +
+                        `━━━━━━━━━━━━━━━━━━━━`;
+                    await queueTelegramNotification(pool, siteLogin, msg, row.image_url || null);
+                } catch (tgErr) {
+                    console.error('[Telegram] QR restore bildirishnomasi xatosi:', tgErr.message);
+                }
+            }
+
+            return res.json({
+                success: true,
+                message: "Tovar omborga muvaffaqiyatli qaytarildi!",
+                product: restoredProduct
+            });
+        } catch (err) {
+            try { await client.query('ROLLBACK'); } catch (e) { }
+            console.error("QR orqali omborga qaytarish xatosi:", err);
+            return res.status(500).json({
+                message: "Serverda xatolik yuz berdi!"
+            });
+        } finally {
+            client.release();
+        }
+    }
+);
+
+// ====================================================
+// QR ORQALI VOZVRAT (Return sold product)
+// ====================================================
+app.post(
+    '/api/qr/:token/return',
+    async (req, res) => {
+        const qrToken = typeof req.params.token === 'string'
+            ? req.params.token.trim()
+            : '';
+
+        if (!qrToken) {
+            return res.status(400).json({
+                message: "QR token kiritilmagan!"
+            });
+        }
+
+        // ===== JWT TEKSHIRUVI =====
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({
+                message: "Qaytarish uchun tizimga kirishingiz kerak!",
+                requireLogin: true
+            });
+        }
+        let jwtUserId;
+        let jwtTelegramId;
+        try {
+            const jwtToken = authHeader.split(' ')[1];
+            const decoded = jwt.decode(jwtToken, JWT_SECRET);
+            if (!decoded || !decoded.userId) {
+                return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
+            }
+            if (decoded.exp && decoded.exp < Math.floor(Date.now() / 1000)) {
+                return res.status(401).json({ message: "Sessiya muddati tugagan!", requireLogin: true });
+            }
+            jwtUserId = decoded.userId;
+            jwtTelegramId = decoded.telegramId;
+        } catch (e) {
+            return res.status(401).json({ message: "Yaroqsiz token!", requireLogin: true });
+        }
+        // ==========================
+
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            // 1. Oxirgi qaytarilmagan sotuvni topish (qr_token bo'yicha)
+            let saleRes = await client.query(
+                `SELECT * FROM public.sales
+                 WHERE qr_token::text = $1
+                   AND COALESCE(returned, false) = false
+                 ORDER BY sold_at DESC
+                 LIMIT 1
+                 FOR UPDATE`,
+                [qrToken]
+            );
+
+            // Agar qr_token bo'yicha topilmasa, products jadvalidagi qr_token orqali bog'langan bo'lishi mumkin
+            if (!saleRes.rows.length) {
+                saleRes = await client.query(
+                    `SELECT s.* FROM public.sales s
+                     JOIN public.products p ON s.product_id = p.id
+                     WHERE p.qr_token::text = $1
+                       AND COALESCE(s.returned, false) = false
+                     ORDER BY s.sold_at DESC
+                     LIMIT 1
+                     FOR UPDATE`,
+                    [qrToken]
+                );
+            }
+
+            // Agar hanuz topilmasa, deleted_products orqali bog'langan bo'lishi mumkin
+            if (!saleRes.rows.length) {
+                saleRes = await client.query(
+                    `SELECT s.* FROM public.sales s
+                     JOIN public.deleted_products dp ON s.product_id = dp.original_id
+                     WHERE dp.qr_token::text = $1
+                       AND COALESCE(s.returned, false) = false
+                     ORDER BY s.sold_at DESC
+                     LIMIT 1
+                     FOR UPDATE`,
+                    [qrToken]
+                );
+            }
+
+            if (!saleRes.rows.length) {
+                const anySale = await client.query(
+                    `SELECT id, returned FROM public.sales WHERE qr_token::text = $1 LIMIT 1`,
+                    [qrToken]
+                );
+                await client.query('ROLLBACK');
+                if (anySale.rows.length) {
+                    return res.status(400).json({
+                        message: "Bu tovar sotuvi allaqachon qaytarilgan!"
+                    });
+                }
+                return res.status(404).json({
+                    message: "Qaytarish uchun sotuv topilmadi!"
+                });
+            }
+
+            const sale = saleRes.rows[0];
+
+            // Owner tekshiruvi
+            const isOwner =
+                String(sale.user_id) === String(jwtUserId) ||
+                (jwtTelegramId && String(sale.user_id) === String(jwtTelegramId));
+            if (!isOwner) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({
+                    message: "Bu QR kod sizga tegishli emas!",
+                    wrongUser: true
+                });
+            }
+
+            const ownerRes = await client.query(
+                `SELECT returns_enabled FROM public.users WHERE id = $1 LIMIT 1`,
+                [sale.user_id]
+            );
+            if (!areReturnsAllowed(ownerRes.rows[0]?.returns_enabled)) {
+                await client.query('ROLLBACK');
+                console.warn(`[Security] Qaytarish taqiqlangan akkaunt uchun QR qaytarish so‘rovi rad etildi: userId=${sale.user_id}, token=${qrToken}`);
+                return res.status(403).json({
+                    code: 'RETURNS_DISABLED',
+                    message: "Do‘kon sozlamalariga ko‘ra tovarlarni qaytarish (vozvrat) o‘chirilgan!"
+                });
+            }
+
+            if (sale.returned) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ message: "Bu sotuv allaqachon qaytarilgan!" });
+            }
+
+            if (daysSince(sale.sold_at) > SALE_RETURN_WINDOW_DAYS) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    message: `Qaytarish muddati (${SALE_RETURN_WINDOW_DAYS} kun) o'tgan.`
+                });
+            }
+
+            const qtyToReturn = Number(sale.quantity) || 1;
+
+            // Sotuvni qaytarilgan deb belgilash
+            const returnedAtResult = await client.query(
+                `UPDATE public.sales
+                 SET returned = true, returned_at = NOW(), stock_restored = true
+                 WHERE id = $1
+                 RETURNING returned_at`,
+                [sale.id]
+            );
+            const returnedAt = returnedAtResult.rows[0]?.returned_at;
+
+            // Tovar omborga qaytariladi: ORIGINAL QR token saqlanadi!
+            const finalToken = sale.qr_token || qrToken;
+
+            // Omborda mavjud bo'lgan tovar bormi tekshiramiz (shu qr_token bo'yicha)
+            const existingInProd = await client.query(
+                `SELECT id, quantity FROM public.products
+                 WHERE qr_token::text = $1 AND user_id = $2
+                 LIMIT 1
+                 FOR UPDATE`,
+                [finalToken, sale.user_id]
+            );
+
+            let restoredProduct;
+            if (existingInProd.rows.length) {
+                const currentQuantity = Number(existingInProd.rows[0].quantity) || 0;
+                const newQuantity = currentQuantity + qtyToReturn;
+                const updRes = await client.query(
+                    `UPDATE public.products
+                     SET quantity = $1
+                     WHERE id = $2
+                     RETURNING *`,
+                    [newQuantity, existingInProd.rows[0].id]
+                );
+                restoredProduct = updRes.rows[0];
+            } else {
+                const insRes = await client.query(
+                    `
+                    INSERT INTO public.products
+                    (
+                        user_id, local_id, category, name, cost_price, color, size,
+                        quantity, qr_token, qr_created_at, selling_price, image_url,
+                        payment_type
+                    )
+                    VALUES
+                    (
+                        $1, $2, $3, $4, $5, $6, $7,
+                        $8, $9, NOW(), $10, $11,
+                        'cash'
+                    )
+                    RETURNING *
+                    `,
+                    [
+                        sale.user_id,
+                        sale.local_id != null ? sale.local_id : 1,
+                        sale.category || null,
+                        sale.title || 'Tovar',
+                        sale.cost_price || 0,
+                        sale.color || null,
+                        sale.size || null,
+                        qtyToReturn,
+                        finalToken,
+                        sale.selling_price != null ? sale.selling_price : null,
+                        sale.image_url || null
+                    ]
+                );
+                restoredProduct = insRes.rows[0];
+            }
+
+            await client.query('COMMIT');
+
+            try {
+                const userRes = await pool.query(
+                    `SELECT site_login FROM public.users WHERE id = $1`,
+                    [sale.user_id]
+                );
+                const siteLogin = userRes.rows[0]?.site_login;
+                if (siteLogin) {
+                    const msg =
+                        `🔄 <b>TOVAR QAYTARILDI (VOZVRAT)</b>\n` +
+                        `━━━━━━━━━━━━━━━━━━━━\n` +
+                        `📦 <b>Tovar:</b> ${telegramEscape(sale.title)}\n` +
+                        `📏 <b>Razmer:</b> ${telegramEscape(sale.size || 'Standart')}\n` +
+                        `🔢 <b>Soni:</b> ${qtyToReturn} dona\n` +
+                        `💰 <b>Qaytarilgan summa:</b> ${formatSum(qtyToReturn * Number(sale.selling_price || 0))} so'm\n` +
+                        `🕒 <b>Vaqt:</b> ${telegramEscape(formatDateTimeInTimeZone(returnedAt, getRequestTimeZone(req)))}\n` +
+                        `━━━━━━━━━━━━━━━━━━━━`;
+                    await queueTelegramNotification(pool, siteLogin, msg, sale.image_url || null);
+                }
+            } catch (tgErr) {
+                console.error('[Telegram] QR vozvrat bildirishnomasida xatolik:', tgErr.message);
+            }
+
+            return res.json({
+                success: true,
+                message: "Tovar muvaffaqiyatli qaytarildi va omborga qo'shildi!",
+                product: restoredProduct,
+                returned_at: returnedAt
+            });
+        } catch (err) {
+            try { await client.query('ROLLBACK'); } catch (e) { }
+            console.error("QR orqali vozvrat xatosi:", err);
+            return res.status(500).json({
+                message: "Serverda xatolik yuz berdi!"
+            });
+        } finally {
+            client.release();
+        }
+    }
+);
+
+// ====================================================
 // BOT PROFITS
 // ====================================================
 
@@ -7044,7 +7756,7 @@ app.get('/api/bot/pricing', requireBotApiToken, async (req, res) => {
     try {
         const userResult = await pool.query(
             `
-            SELECT id, site_login, tariff_price, max_products, max_groups, is_paid, expires_at
+            SELECT id, site_login, tariff_price, max_products, max_groups, is_paid, expires_at, returns_enabled
             FROM public.users
             WHERE site_login = $1
             LIMIT 1
@@ -7083,11 +7795,53 @@ app.get('/api/bot/pricing', requireBotApiToken, async (req, res) => {
             current_products: distinctProductIdCount,
             distinct_product_id_count: distinctProductIdCount,
             is_paid: Boolean(user.is_paid),
-            expires_at: user.expires_at
+            expires_at: user.expires_at,
+            returns_enabled: user.returns_enabled
         });
     } catch (err) {
         console.error('Bot pricing xatosi:', err);
         return res.status(500).json({ message: 'Tarif summasini hisoblab bo‘lmadi.' });
+    }
+});
+
+// Bot orqali foydalanuvchining returns_enabled (tovarlarni qaytarish) sozlamasini o'zgartirish
+app.post('/api/bot/account/returns-setting', requireBotApiToken, async (req, res) => {
+    const siteLogin = typeof req.body?.login === 'string' ? req.body.login.trim() : '';
+    const returnsEnabled = req.body?.returns_enabled;
+
+    if (!siteLogin) {
+        return res.status(400).json({ message: 'login talab qilinadi.' });
+    }
+    if (typeof returnsEnabled !== 'boolean') {
+        return res.status(400).json({
+            message: 'returns_enabled faqat boolean (true yoki false) bo‘lishi shart.'
+        });
+    }
+
+    try {
+        const result = await pool.query(
+            `
+            UPDATE public.users
+            SET returns_enabled = $2
+            WHERE site_login = $1
+            RETURNING site_login, returns_enabled
+            `,
+            [siteLogin, returnsEnabled]
+        );
+
+        if (!result.rows.length) {
+            return res.status(404).json({ message: 'Foydalanuvchi topilmadi.' });
+        }
+
+        console.log(`[Bot API] returns_enabled yangilandi: login=${siteLogin}, returns_enabled=${returnsEnabled}`);
+        return res.json({
+            success: true,
+            site_login: result.rows[0].site_login,
+            returns_enabled: result.rows[0].returns_enabled
+        });
+    } catch (err) {
+        console.error('Bot returns-setting xatosi:', err);
+        return res.status(500).json({ message: 'Qaytarish sozlamasini yangilab bo‘lmadi.' });
     }
 });
 
@@ -7100,7 +7854,8 @@ app.post('/api/bot/account/activate', requireBotApiToken, async (req, res) => {
         paid_amount,
         max_products,
         max_groups,
-        tariff_price
+        tariff_price,
+        returns_enabled
     } = req.body || {};
     const siteLogin = typeof login === 'string' ? login.trim() : '';
     const expiry = parseTimezoneAwareDate(expires_at);
@@ -7141,6 +7896,10 @@ app.post('/api/bot/account/activate', requireBotApiToken, async (req, res) => {
         ? Number(tariff_price)
         : (Number.isSafeInteger(expected_amount) ? expected_amount : null);
 
+    const parsedReturnsEnabled = typeof returns_enabled === 'boolean'
+        ? returns_enabled
+        : null;
+
     try {
         const result = await pool.query(
             `
@@ -7151,13 +7910,14 @@ app.post('/api/bot/account/activate', requireBotApiToken, async (req, res) => {
                 max_products = COALESCE($4, max_products),
                 max_groups = COALESCE($5, max_groups),
                 tariff_price = COALESCE($6, tariff_price),
+                returns_enabled = CASE WHEN $7::boolean IS NOT NULL THEN $7::boolean ELSE returns_enabled END,
                 last_reminder_at = NULL,
                 deletion_warning_count = 0,
                 last_deletion_warning_at = NULL
             WHERE site_login = $1
-            RETURNING site_login, is_paid, expires_at, max_products, max_groups, tariff_price
+            RETURNING site_login, is_paid, expires_at, max_products, max_groups, tariff_price, returns_enabled
             `,
-            [siteLogin, expiry.toISOString(), payment_method.trim(), parsedMaxProducts, parsedMaxGroups, parsedTariffPrice]
+            [siteLogin, expiry.toISOString(), payment_method.trim(), parsedMaxProducts, parsedMaxGroups, parsedTariffPrice, parsedReturnsEnabled]
         );
         if (!result.rows.length) {
             return res.status(404).json({ message: 'Mavjud site_login topilmadi.' });
@@ -7173,15 +7933,13 @@ app.post('/api/bot/account/activate', requireBotApiToken, async (req, res) => {
     }
 });
 
-app.post('/api/bot/account/delete', requireBotApiToken, async (req, res) => {
-    const siteLogin = typeof req.body?.login === 'string' ? req.body.login.trim() : '';
-    if (!siteLogin) {
-        return res.status(400).json({ message: 'login talab qilinadi.' });
-    }
-
+/**
+ * Akkaunt va unga tegishli barcha ma'lumotlarni xavfsiz va to'liq tozalash
+ */
+const deleteAccountByLogin = async (poolInstance, siteLogin) => {
     let client;
     try {
-        client = await pool.connect();
+        client = await poolInstance.connect();
         await client.query('BEGIN');
         const userResult = await client.query(
             `SELECT id FROM public.users WHERE site_login = $1 FOR UPDATE`,
@@ -7293,17 +8051,113 @@ app.post('/api/bot/account/delete', requireBotApiToken, async (req, res) => {
         }
 
         await client.query('COMMIT');
-        return res.json({ success: true, deleted: true });
+        return { success: true, deleted: true, wasPresent: userId != null };
     } catch (err) {
         try {
             await client.query('ROLLBACK');
         } catch (rollbackError) {
             console.error('Account deletion rollback xatosi:', rollbackError);
         }
-        console.error('Bot account deletion xatosi:', err);
-        return res.status(500).json({ message: 'Akkaunt ma’lumotlarini tozalab bo‘lmadi.' });
+        throw err;
     } finally {
         if (client) client.release();
+    }
+};
+
+app.post('/api/bot/account/delete', requireBotApiToken, async (req, res) => {
+    const siteLogin = typeof req.body?.login === 'string' ? req.body.login.trim() : '';
+    if (!siteLogin) {
+        return res.status(400).json({ message: 'login talab qilinadi.' });
+    }
+
+    try {
+        const result = await deleteAccountByLogin(pool, siteLogin);
+        return res.json(result);
+    } catch (err) {
+        console.error('Bot account deletion xatosi:', err);
+        return res.status(500).json({ message: 'Akkaunt ma’lumotlarini tozalab bo‘lmadi.' });
+    }
+});
+
+/**
+ * Obuna tugashi, ogohlantirishlar va o'chirish jarayonini fon rejimida bajaruvchi funksiya
+ */
+const processSubscriptionLifecycle = async (poolInstance) => {
+    try {
+        const usersRes = await poolInstance.query(`
+            SELECT id, site_login, telegram_id, is_paid, expires_at, payment_method,
+                   deletion_warning_count, last_deletion_warning_at, linked_group_chat_id
+            FROM public.users
+            WHERE expires_at IS NOT NULL
+        `);
+
+        const results = {
+            warningsSent: 0,
+            accountsDeleted: 0,
+            skipped: 0
+        };
+
+        const now = new Date();
+
+        for (const user of usersRes.rows) {
+            const evalResult = evaluateSubscriptionLifecycle(user, now);
+
+            if (evalResult.action && evalResult.action.startsWith('send_warning_')) {
+                const warningNumber = evalResult.warningCount;
+                const msg = getWarningMessage(warningNumber, evalResult.isTrial, user.site_login);
+
+                try {
+                    const chatId = user.linked_group_chat_id || user.telegram_id;
+                    if (chatId && bot) {
+                        await bot.sendMessage(chatId, msg, { parse_mode: 'HTML' }).catch(() => {});
+                    } else if (typeof notifyGroup === 'function') {
+                        await notifyGroup(msg).catch(() => {});
+                    }
+                } catch (tgErr) {
+                    // Telegram bildirishnomasi DB yangilanishini to'xtatmasin
+                }
+
+                try {
+                    await poolInstance.query(`
+                        INSERT INTO public.notifications (user_id, message, created_at)
+                        VALUES ($1, $2, NOW())
+                    `, [user.id, msg]);
+                } catch (notifErr) {
+                    // notifications ixtiyoriy
+                }
+
+                await poolInstance.query(`
+                    UPDATE public.users
+                    SET deletion_warning_count = $2,
+                        last_deletion_warning_at = NOW()
+                    WHERE id = $1
+                `, [user.id, warningNumber]);
+
+                console.log(`[Subscription] Foydalanuvchiga ${warningNumber}-ogohlantirish yuborildi: login=${user.site_login}`);
+                results.warningsSent++;
+            } else if (evalResult.action === 'delete_account') {
+                console.warn(`[Subscription] Barcha ogohlantirishlar tugagani sababli akkaunt o‘chirilmoqda: login=${user.site_login}`);
+                await deleteAccountByLogin(poolInstance, user.site_login);
+                results.accountsDeleted++;
+            } else {
+                results.skipped++;
+            }
+        }
+
+        return results;
+    } catch (err) {
+        console.error('Subscription lifecycle xatosi:', err);
+        throw err;
+    }
+};
+
+app.post('/api/bot/subscription/check', requireBotApiToken, async (req, res) => {
+    try {
+        const result = await processSubscriptionLifecycle(pool);
+        res.json({ success: true, result });
+    } catch (err) {
+        console.error('Subscription check route xatosi:', err);
+        res.status(500).json({ message: 'Obuna holatini tekshirishda xatolik yuz berdi.' });
     }
 });
 
@@ -8893,7 +9747,13 @@ app.get('/api/cron/reports', async (req, res) => {
     }
     try {
         const sent = await runScheduledReportsOnce();
-        res.json({ ok: true, sent });
+        let subResults = null;
+        try {
+            subResults = await processSubscriptionLifecycle(pool);
+        } catch (subErr) {
+            console.error('[CRON] Subscription check xatosi:', subErr.message);
+        }
+        res.json({ ok: true, sent, subscriptions: subResults });
     } catch (err) {
         console.error('[CRON] /api/cron/reports xatosi:', err);
         res.status(500).json({ ok: false, message: 'Serverda xatolik yuz berdi!' });
@@ -8950,6 +9810,13 @@ if (process.env.VERCEL) {
     };
 
     setInterval(checkAndSendScheduledReports, 30 * 1000);
+
+    // Har 1 soatda obuna muddati, 3 kunlik ogohlantirishlar va o'chirishni tekshirish
+    setInterval(() => {
+        processSubscriptionLifecycle(pool).catch((e) =>
+            console.error('[CRON] Periodic subscription check xatosi:', e.message)
+        );
+    }, 60 * 60 * 1000);
 
     // Har 6 soatda egasiz (hech qayerda ishlatilmayotgan) rasmlarni Storage'dan tozalash
     setInterval(cleanupOrphanedProductImages, 6 * 60 * 60 * 1000);

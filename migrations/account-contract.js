@@ -16,7 +16,8 @@ const migrateAccountContract = async (pool) => {
                 ADD COLUMN IF NOT EXISTS payment_method TEXT,
                 ADD COLUMN IF NOT EXISTS last_reminder_at TIMESTAMPTZ,
                 ADD COLUMN IF NOT EXISTS deletion_warning_count INTEGER NOT NULL DEFAULT 0,
-                ADD COLUMN IF NOT EXISTS last_deletion_warning_at TIMESTAMPTZ
+                ADD COLUMN IF NOT EXISTS last_deletion_warning_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS returns_enabled BOOLEAN DEFAULT NULL
         `);
 
         for (const columnName of [

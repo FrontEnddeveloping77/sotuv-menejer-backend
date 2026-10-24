@@ -70,11 +70,43 @@ Content-Type: application/json
 }
 ```
 
-The backend rejects unequal/non-integer amounts and non-timezoned or expired dates. It updates the existing login's `is_paid`, `expires_at`, `payment_method`, and sets `max_products`, `max_groups`, `tariff_price` when provided, resets expiry reminders, and never generates or replaces the login or password hash. A trial can be synced with `payment_method: "trial"` and equal zero amounts, using an expiry exactly three days after trial creation.
+The backend rejects unequal/non-integer amounts and non-timezoned or expired dates. It updates the existing login's `is_paid`, `expires_at`, `payment_method`, and sets `max_products`, `max_groups`, `tariff_price` when provided, resets expiry reminders, and never generates or replaces the login or password hash. A trial can be synced with `payment_method: "trial"` and equal zero amounts, using an expiry exactly 7 days after trial creation.
 
-## Expired-account deletion
+`POST /api/bot/account/activate` also accepts an optional `returns_enabled` boolean.
 
-After the bot has sent its three final warnings, it must call the backend as well as deleting data from its own database:
+## Returns policy setting
+
+The bot can query or update the user's returns (vozvrat) setting:
+
+```http
+POST /api/bot/account/returns-setting
+Authorization: Bearer <BOT_API_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{
+  "login": "existing-site-login",
+  "returns_enabled": false
+}
+```
+
+- When `returns_enabled = false`:
+  - Return (vozvrat) buttons are hidden across the website and QR view.
+  - Return API calls (`POST /api/sales/:saleId/return` and `POST /api/qr/:token/return`) are rejected with HTTP 403 (`RETURNS_DISABLED`).
+- When `returns_enabled = true` or `NULL` (legacy users): returns are permitted as normal.
+
+## Subscription lifecycle & Expired-account deletion
+
+- **Trial Accounts (`payment_method: "trial"`):**
+  - Free trial duration is 7 days.
+  - When the 7-day trial expires, 3 daily warnings are sent sequentially (Day 1, Day 2, Day 3). After the 3rd warning (24h cooldown), the account and all associated data are safely deleted.
+- **Paid Subscriptions:**
+  - When paid subscription expires, a 10-day grace period is observed before warnings begin.
+  - After 10 days, 3 daily warnings are sent sequentially (Day 1, Day 2, Day 3). After the 3rd warning (24h cooldown), the account and all associated data are safely deleted.
+- **Re-payment / Renewal:**
+  - Calling `POST /api/bot/account/activate` resets `deletion_warning_count` to 0, clears warning timestamps, and restores full account access.
+- **Bot Endpoint for Deletion:**
 
 ```http
 POST /api/bot/account/delete
@@ -86,7 +118,13 @@ Content-Type: application/json
 { "login": "existing-site-login" }
 ```
 
-The backend transaction removes rows with the account's `user_id` from public user-owned tables, deletes login-linked notifications/payment requests when present, then deletes the user. Repeating the call succeeds. The endpoint does not make the bot's separate database part of this transaction; the bot must finish its own cleanup independently.
+The backend transaction removes rows with the account's `user_id` from public user-owned tables, deletes login-linked notifications/payment requests when present, then deletes the user. Repeating the call succeeds (idempotent). The endpoint does not make the bot's separate database part of this transaction; the bot must finish its own cleanup independently.
+
+```http
+POST /api/bot/subscription/check
+Authorization: Bearer <BOT_API_TOKEN>
+```
+Triggers a lifecycle evaluation pass for expired accounts, sending warnings or deleting expired accounts as appropriate.
 
 ## Timestamps
 
