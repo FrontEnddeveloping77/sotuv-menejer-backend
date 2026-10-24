@@ -8108,10 +8108,8 @@ const processSubscriptionLifecycle = async (poolInstance) => {
 
                 try {
                     const chatId = user.linked_group_chat_id || user.telegram_id;
-                    if (chatId && bot) {
-                        await bot.sendMessage(chatId, msg, { parse_mode: 'HTML' }).catch(() => {});
-                    } else if (typeof notifyGroup === 'function') {
-                        await notifyGroup(msg).catch(() => {});
+                    if (chatId && TELEGRAM_BOT_TOKEN) {
+                        await sendTelegramNow(chatId, msg).catch(() => {});
                     }
                 } catch (tgErr) {
                     // Telegram bildirishnomasi DB yangilanishini to'xtatmasin
